@@ -2,27 +2,26 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
-    - name: Upload Build Artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: linux
-        path: target/debug/caffeinate2
-        if-no-files-found: error
+      - uses: actions/checkout@v3
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux
+          path: target/debug/caffeinate2
+          if-no-files-found: error

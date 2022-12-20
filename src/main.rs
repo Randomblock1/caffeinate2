@@ -2,8 +2,8 @@ extern crate plist;
 extern crate signal_hook;
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use std::process;
 use std::io;
+use std::process;
 
 fn disable_sleep(new_value: bool) {
     let path = "/Library/Preferences/com.apple.PowerManagement.plist";
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(1);
     }
 
-    let mut signals = Signals::new(&[SIGINT])?;
+    let mut signals = Signals::new([SIGINT])?;
 
     std::thread::spawn(move || {
         for _ in signals.forever() {
