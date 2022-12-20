@@ -56,8 +56,12 @@ fn disable_sleep(new_value: bool) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "macos") {
+        eprintln!("This program only works on macOS");
+        process::exit(1);
+    }
+
     let mut signals = Signals::new(&[SIGINT])?;
 
     std::thread::spawn(move || {
@@ -68,7 +72,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let args: Vec<String> = std::env::args().collect();
-    println!("{:?}", args);
 
     if args.len() == 1 {
         // If no arguments are provided, disable sleep until Ctrl+C is pressed
@@ -121,10 +124,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(child.wait()?.code().unwrap_or(1));
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    eprintln!("This program only works on macOS");
-    process::exit(1);
 }
