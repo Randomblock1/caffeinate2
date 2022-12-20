@@ -1,0 +1,18 @@
+[package]
+name = "caffeinate2"
+version = "0.1.0"
+edition = "2021"
+authors = ["Randomblock1 <randomblock1@pm.me>"]
+description = "Caffeinate MacOS utility that actually works"
+license = "MIT"
+repository = "https://github.com/randomblock1/caffeinate2"
+readme = "README.md"
+homepage = "https://randomblock1.com"
+keywords = ["macos", "utility", "caffeinate"]
+categories = ["command-line-utilities"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+plist = "1"
+signal-hook = "0.3"
