@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{}", line?);
         }
 
+        disable_sleep(false);
         process::exit(child.wait()?.code().unwrap_or(1));
     }
     Ok(())
