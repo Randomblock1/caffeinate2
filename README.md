@@ -2,6 +2,10 @@
 
 Caffeinate but it's written in Rust and it actually works. Keeps your Mac wide awake. Even when its lid is closed.
 
+## CURRENTLY DOESN'T WORK BECAUSE IDK HOW TO MAKE MACOS RELOAD
+
+So it writes to the preferences file just fine... but since MacOS's PowerManagement daemon doesn't reload the preferences file, it doesn't actually do anything. I'm not sure how to make it reload the preferences file, so if you know how, please let me know. So for now it just calls pmset to disable sleep, which is not ideal. Eventually I'll figure out how to make it work properly. (Probably by linking to IOKit.)
+
 ## Installation
 
 ### GitHub Releases
@@ -28,7 +32,7 @@ Sleep will be prevented for the specified number of seconds.
 
 ### Anything else
 
-Your computer will attempt to execute the input as a command. Depending on your shell, it might be necessary to wrap the command in quotes.
+Your computer will attempt to execute the input as a command. It is probably necessary to wrap the command in single quotes.
 
 ## License
 
