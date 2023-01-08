@@ -2,9 +2,9 @@
 
 Caffeinate but it's written in Rust and it actually works. Keeps your Mac wide awake. Even when its lid is closed.
 
-## CURRENTLY DOESN'T WORK BECAUSE IDK HOW TO MAKE MACOS RELOAD
+## CURRENTLY ONLY KINDA WORKS
 
-So it writes to the preferences file just fine... but since MacOS's PowerManagement daemon doesn't reload the preferences file, it doesn't actually do anything. I'm not sure how to make it reload the preferences file, so if you know how, please let me know. So for now it just calls pmset to disable sleep, which is not ideal. Eventually I'll figure out how to make it work properly. (Probably by linking to IOKit.)
+It works, but it needs a bunch of headers I'm pretty sure are only in the XNU source tree. It also includes some header files which really shouldn't be included here. So the next step is linking everything properly and somehow using the headers without breaking any copyright.
 
 ## Installation
 

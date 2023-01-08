@@ -1,9 +1,17 @@
+#![cfg(target_os = "macos")]
+
 extern crate plist;
 extern crate signal_hook;
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::process;
+
+#[link(name = "caffeinate2")]
+extern "C" {
+    pub fn disableSleep() -> bool;
+    pub fn enableSleep() -> bool;
+}
 
 fn disable_system_sleep(sleep_disabled: bool) {
     let path = "/Library/Preferences/com.apple.PowerManagement.plist";
@@ -24,17 +32,21 @@ fn disable_system_sleep(sleep_disabled: bool) {
         process::exit(1);
     }
 
-    // TEMPORARILY USE PMSET UNTIL I FIGURE OUT HOW TO PROPERLY TELL POWERMANAGEMENT TO RELOAD
+    let result;
+
     if sleep_disabled {
-        process::Command::new("pmset")
-            .args(["disablesleep", "1"])
-            .output()
-            .expect("failed to disable sleep");
+        unsafe {
+            result = disableSleep();
+        }
     } else {
-        process::Command::new("pmset")
-            .args(["disablesleep", "0"])
-            .output()
-            .expect("failed to enable sleep");
+        unsafe {
+            result = enableSleep();
+        }
+    }
+
+    if !result {
+        eprintln!("Error: Could not disable system sleep");
+        process::exit(1);
     }
 
     // // Get the "SystemPowerSettings" dictionary from the root dictionary
