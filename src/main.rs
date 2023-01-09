@@ -9,7 +9,7 @@ use std::process;
 
 #[link(name = "pmstub")]
 extern "C" {
-    pub fn setSleepDisabled(sleepDisabled: bool) -> std::os::raw::c_uint;
+    pub fn setSleepDisabled(sleepDisabled: bool) -> core::ffi::c_uint;
     pub fn getSleepDisabled() -> bool;
 }
 
