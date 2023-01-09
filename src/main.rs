@@ -6,6 +6,7 @@ extern crate signal_hook;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::process;
+use std::thread;
 
 #[link(name = "pmstub")]
 extern "C" {
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut signals = Signals::new([SIGINT])?;
 
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         for _ in signals.forever() {
             disable_system_sleep(false);
             process::exit(0);
@@ -61,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If no arguments are provided, disable sleep until Ctrl+C is pressed
         disable_system_sleep(true);
         println!("Preventing sleep until Ctrl+C pressed.");
-        std::thread::park();
+        thread::park();
     } else if args.len() == 3 && args[1] == "-t" {
         // If the -t flag is provided, sleep for the given number of seconds
         let secs: u64 = match args[2].parse() {
@@ -75,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let duration = std::time::Duration::from_secs(secs);
         println!("Preventing sleep for {secs} seconds.");
         disable_system_sleep(true);
-        std::thread::sleep(duration);
+        thread::sleep(duration);
         disable_system_sleep(false);
         process::exit(0);
     } else {
