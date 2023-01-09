@@ -2,9 +2,12 @@
 
 Caffeinate but it's written in Rust and it actually works. Keeps your Mac wide awake. Even when its lid is closed.
 
-## CURRENTLY ONLY KINDA WORKS
+## UNDER CONSTRUCTION: NOT COMPLETELY COMPATIBLE WITH CAFFEINATE
 
-It works, but it needs a bunch of headers I'm pretty sure are only in the XNU source tree. It also includes some header files which really shouldn't be included here. So the next step is linking everything properly and somehow using the headers without breaking any copyright.
+Right now, you can only COMPLETELY prevent system sleep for a certain amount of time, indefinitely, or while a command is running.
+It completely disables sleep, meaning that closing the laptop doesn't do anything.
+I still have to add support for preventing other types of sleep, like display, disk, or idle sleep.
+See `man caffeinate` for the flags I need to be compatible with.
 
 ## Installation
 
@@ -18,7 +21,7 @@ _This is not yet available._
 
 ### Cargo
 
-`cargo install caffeinate2`
+_This is not yet available._
 
 ## Usage
 
@@ -32,11 +35,11 @@ Sleep will be prevented for the specified number of seconds.
 
 ### Anything else
 
-Your computer will attempt to execute the input as a command. It is probably necessary to wrap the command in single quotes.
+Your computer will attempt to execute the input as a command. It is necessary to wrap the command in single quotes if you're going to use shell commands, like `&&`. This is just how the shell works.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE.txt) file for details
+This project is licensed under the MIT License - see [the license file](LICENSE.txt) for details.
 
 ## TODO
 
