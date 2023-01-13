@@ -1,13 +1,12 @@
 # caffeinate2
 
-Caffeinate but it's written in Rust and it actually works. Keeps your Mac wide awake. Even when its lid is closed.
+`Caffeinate` but it's written in Rust and has more options. Keeps your Mac wide awake.
 
-## UNDER CONSTRUCTION: NOT COMPLETELY COMPATIBLE WITH CAFFEINATE
+## UNDER CONSTRUCTION: MOST OPTIONS DON'T WORK
 
 Right now, you can only COMPLETELY prevent system sleep for a certain amount of time, indefinitely, or while a command is running.
 It completely disables sleep, meaning that closing the laptop doesn't do anything.
 I still have to add support for preventing other types of sleep, like display, disk, or idle sleep.
-See `man caffeinate` for the flags I need to be compatible with.
 
 ## Installation
 
@@ -35,7 +34,7 @@ Sleep will be prevented for the specified number of seconds.
 
 ### Anything else
 
-Your computer will attempt to execute the input as a command. It is necessary to wrap the command in single quotes if you're going to use shell commands, like `&&`. This is just how the shell works.
+Your computer will attempt to execute the input as a command. It is necessary to wrap the command in single quotes if you're going to use shell scripting, like `&&` or `||`. This is just how the shell works.
 
 ## License
 
