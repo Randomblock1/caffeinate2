@@ -13,12 +13,11 @@ extern "C" {
 }
 
 fn disable_system_sleep(sleep_disabled: bool) {
-    let result;
-    if sleep_disabled {
-        result = unsafe { setSleepDisabled(true) };
+    let result = if sleep_disabled {
+        unsafe { setSleepDisabled(true) }
     } else {
-        result = unsafe { setSleepDisabled(false) };
-    }
+        unsafe { setSleepDisabled(false) }
+    };
 
     // See IOKit/IOReturn.h for error codes.
     if result == 0xE00002C1 {
@@ -101,9 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.command.is_some() {
         // If command is passed, it takes priority over everything else
         let command = args.command.unwrap();
-        // Otherwise, disable sleep while running the given command
-        disable_system_sleep(true);
+        // Disable sleep while running the given command
         println!("Preventing sleep until command finishes.");
+        disable_system_sleep(true);
 
         let mut child = process::Command::new("/bin/sh")
             .arg("-c")
@@ -132,8 +131,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If timeout or waitfor is used, wait appropriately
         // The original caffeinate treats arg position as priority
         let args_vec = std::env::args().collect::<Vec<_>>();
-        let timeout_index = args_vec.iter().position(|x| x == "--timeout" || x == "-t");
-        let waitfor_index = args_vec.iter().position(|x| x == "--waitfor" || x == "-w");
+        let timeout_index = args_vec
+            .iter()
+            .position(|x| x == "--timeout" || x == "-t")
+            .unwrap_or(std::usize::MAX);
+        let waitfor_index = args_vec
+            .iter()
+            .position(|x| x == "--waitfor" || x == "-w")
+            .unwrap_or(std::usize::MAX);
         if timeout_index < waitfor_index {
             let secs = args.timeout.unwrap();
             let duration = std::time::Duration::from_secs(secs);
