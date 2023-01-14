@@ -16,7 +16,9 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.0.32", features = ["derive"] }
+clap = { version = "4.1.1", features = ["derive"] }
+core-foundation = "0.9.3"
+libloading = "0.7.4"
 signal-hook = "0.3.14"
 
 [build-dependencies]

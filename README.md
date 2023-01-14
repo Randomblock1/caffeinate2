@@ -2,11 +2,9 @@
 
 `Caffeinate` but it's written in Rust and has more options. Keeps your Mac wide awake.
 
-## UNDER CONSTRUCTION: MOST OPTIONS DON'T WORK
+## UNDER CONSTRUCTION: KINDA WORKS
 
-Right now, you can only COMPLETELY prevent system sleep for a certain amount of time, indefinitely, or while a command is running.
-It completely disables sleep, meaning that closing the laptop doesn't do anything.
-I still have to add support for preventing other types of sleep, like display, disk, or idle sleep.
+Not done, but it mostly works.
 
 ## Installation
 
@@ -24,17 +22,28 @@ _This is not yet available._
 
 ## Usage
 
+```plaintext
+Usage: caffeinate2 [OPTIONS] [COMMAND]...
+
+Arguments:
+  [COMMAND]...  Wait for given command to complete (takes priority above timeout and pid)
+
+Options:
+  -d, --display            Disable display sleep
+  -m, --disk               Disable disk idle sleep
+  -i, --system             Disable idle system sleep. Default if no other options are specified
+  -s, --system-on-ac       Disable system sleep while not on battery
+  -e, --entirely           Disable system sleep entirely (ignores lid closing)
+  -u, --user-active        Declare the user is active. If the display is off, this option turns the display on and prevents the display from going into idle sleep. If a timeout is not specified with '-t' option, then this assertion is taken with a default of 5 second timeout
+  -t, --timeout <SECONDS>  Wait for X seconds
+  -w, --waitfor <PID>      Wait for program with PID X to complete
+  -h, --help               Print help information
+  -V, --version            Print version information
+```
+
 ### No arguments
 
 Sleep will be disabled until you press `Ctrl+C`.
-
-### `-t` followed by a number
-
-Sleep will be prevented for the specified number of seconds.
-
-### Anything else
-
-Your computer will attempt to execute the input as a command. It is necessary to wrap the command in single quotes if you're going to use shell scripting, like `&&` or `||`. This is just how the shell works.
 
 ## License
 
