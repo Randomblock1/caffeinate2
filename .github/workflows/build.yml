@@ -11,19 +11,17 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v3
-      - name: Get MacOS toolchain
-        run: rustup target add x86_64-apple-darwin
       - name: Build
-        run: cargo build --target x86_64-apple-darwin --verbose
+        run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: caffeinate2
+          name: debug build
           path: target/debug/caffeinate2
           if-no-files-found: error
