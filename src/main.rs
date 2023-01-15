@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-pub mod power_management;
+mod power_management;
 
 use clap::Parser;
 use power_management::*;
@@ -9,13 +9,8 @@ use std::io;
 use std::process;
 use std::thread;
 
-#[link(name = "pmstub")]
-extern "C" {
-    pub fn getSleepDisabled() -> bool;
-}
-
 fn disable_system_sleep(sleep_disabled: bool) {
-    let result = disable_sleep(sleep_disabled);
+    let result = set_sleep_disabled(sleep_disabled);
 
     // See IOKit/IOReturn.h for error codes.
     if result == 0xE00002C1 {
@@ -56,7 +51,7 @@ fn set_assertions(args: &Args, state: bool) -> Vec<u32> {
     }
     if args.user_active {
         // Declares the user is active.
-        assertions.push(declare_user_activity());
+        assertions.push(declare_user_activity(true));
     }
 
     #[cfg(debug_assertions)]
@@ -69,7 +64,7 @@ fn release_assertions(assertions: Vec<u32>) {
     for assertion in assertions {
         release_assertion(assertion);
     }
-    if unsafe { getSleepDisabled() } {
+    if get_sleep_disabled() {
         disable_system_sleep(false);
     }
 }
