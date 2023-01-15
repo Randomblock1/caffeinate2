@@ -3,55 +3,36 @@
 mod power_management;
 
 use clap::Parser;
-use power_management::*;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::process;
 use std::thread;
 
-fn disable_system_sleep(sleep_disabled: bool) {
-    let result = set_sleep_disabled(sleep_disabled);
-
-    // See IOKit/IOReturn.h for error codes.
-    if result == 0xE00002C1 {
-        eprintln!(
-            "Error: Could not modify system sleep: Permission denied. Try running with sudo."
-        );
-        process::exit(1);
-    } else if result != 0 {
-        eprintln!(
-            "Error: Could not modify system sleep: IOReturn code {:X}",
-            result
-        );
-        process::exit(1);
-    }
-}
-
-fn set_assertions(args: &Args, state: bool) -> Vec<u32> {
+fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
     let mut assertions = Vec::new();
     if args.display {
         // Prevents the display from dimming automatically.
-        assertions.push(create_assertion("PreventUserIdleDisplaySleep", state));
+        assertions.push(iokit.create_assertion("PreventUserIdleDisplaySleep", state));
     }
     if args.disk {
         // Prevents the disk from stopping when idle.
-        assertions.push(create_assertion("PreventDiskIdle", state));
+        assertions.push(iokit.create_assertion("PreventDiskIdle", state));
     }
     if args.system {
         // Prevents the system from sleeping automatically.
-        assertions.push(create_assertion("PreventUserIdleSystemSleep", state));
+        assertions.push(iokit.create_assertion("PreventUserIdleSystemSleep", state));
     }
     if args.system_on_ac {
         // Prevents the system from sleeping when on AC power.
-        assertions.push(create_assertion("PreventSystemSleep", state));
+        assertions.push(iokit.create_assertion("PreventSystemSleep", state));
     }
     if args.entirely {
         // Prevents the system from sleeping entirely.
-        disable_system_sleep(true);
+        iokit.set_sleep_disabled(true);
     }
     if args.user_active {
         // Declares the user is active.
-        assertions.push(declare_user_activity(true));
+        assertions.push(iokit.declare_user_activity(true));
     }
 
     #[cfg(debug_assertions)]
@@ -60,12 +41,12 @@ fn set_assertions(args: &Args, state: bool) -> Vec<u32> {
     assertions
 }
 
-fn release_assertions(assertions: Vec<u32>) {
+fn release_assertions(iokit: &power_management::IOKit, assertions: Vec<u32>) {
     for assertion in assertions {
-        release_assertion(assertion);
+        iokit.release_assertion(assertion);
     }
-    if get_sleep_disabled() {
-        disable_system_sleep(false);
+    if power_management::IOKit::get_sleep_disabled() {
+        iokit.set_sleep_disabled(false);
     }
 }
 
@@ -125,22 +106,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.system = true;
     }
 
-    let assertions = set_assertions(&args, true);
+    if !cfg!(target_os = "macos") {
+        panic!("This program only works on macOS.");
+    }
 
+    let iokit = power_management::IOKit::new();
+
+    let assertions = set_assertions(&iokit, &args, true);
     #[cfg(debug_assertions)]
     println!("DEBUG {:#?}", &args);
-
-    if !cfg!(target_os = "macos") {
-        eprintln!("This program only works on macOS");
-        process::exit(1);
-    }
 
     let mut signals = Signals::new([SIGINT])?;
 
     let assertions_clone = assertions.clone();
     thread::spawn(move || {
         for _ in signals.forever() {
-            release_assertions(assertions_clone);
+            release_assertions(&power_management::IOKit::new(), assertions_clone);
             process::exit(0);
         }
     });
@@ -172,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{}", line?);
         }
 
-        release_assertions(assertions);
+        release_assertions(&iokit, assertions);
         process::exit(child.wait()?.code().unwrap_or(1));
     } else if args.timeout.is_some() || args.waitfor.is_some() {
         // If timeout or waitfor is used, wait appropriately
@@ -191,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let duration = std::time::Duration::from_secs(secs);
             println!("Preventing sleep for {secs} seconds.");
             thread::sleep(duration);
-            release_assertions(assertions);
+            release_assertions(&iokit, assertions);
             process::exit(0);
         } else {
             let pid = args.waitfor.unwrap();
@@ -200,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // If no arguments are provided, disable sleep until Ctrl+C is pressed
-        set_assertions(&args, true);
+        set_assertions(&iokit, &args, true);
         println!("Preventing sleep until Ctrl+C pressed.");
         thread::park();
     }
