@@ -9,6 +9,14 @@ use std::process;
 use std::thread;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
+    if args.entirely {
+        // Prevents the system from sleeping entirely.
+        iokit.set_sleep_disabled(true).unwrap_or_else(|_| {
+            eprintln!("Error: Insufficient privileges to disable sleep. Try running with sudo.");
+            process::exit(1);
+        });
+    }
+
     let mut assertions = Vec::new();
     if args.display {
         // Prevents the display from dimming automatically.
@@ -26,10 +34,7 @@ fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> 
         // Prevents the system from sleeping when on AC power.
         assertions.push(iokit.create_assertion("PreventSystemSleep", state));
     }
-    if args.entirely {
-        // Prevents the system from sleeping entirely.
-        iokit.set_sleep_disabled(true);
-    }
+
     if args.user_active {
         // Declares the user is active.
         assertions.push(iokit.declare_user_activity(true));
@@ -46,7 +51,10 @@ fn release_assertions(iokit: &power_management::IOKit, assertions: Vec<u32>) {
         iokit.release_assertion(assertion);
     }
     if power_management::IOKit::get_sleep_disabled() {
-        iokit.set_sleep_disabled(false);
+        iokit.set_sleep_disabled(false).unwrap_or_else(|_| {
+            eprintln!("Error: Insufficient privileges to disable sleep. Try running with sudo.");
+            process::exit(1);
+        });
     }
 }
 

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::{CFString, CFStringRef};
@@ -75,7 +73,7 @@ impl IOKit {
         id
     }
 
-    pub fn release_assertion(&self, assertion_id: u32) -> i32 {
+    pub fn release_assertion(&self, assertion_id: u32) {
         let iokit = &self.library;
         let iopmassertion_release: Symbol<unsafe extern "C" fn(IOPMAssertionID) -> i32> =
             unsafe { iokit.get(b"IOPMAssertionRelease") }.unwrap();
@@ -93,7 +91,6 @@ impl IOKit {
                 status
             );
         }
-        status
     }
 
     pub fn declare_user_activity(&self, state: bool) -> u32 {
@@ -128,33 +125,7 @@ impl IOKit {
         id
     }
 
-    pub fn check_assertion_status(&self, assertion_id: u32) -> i32 {
-        let iokit = &self.library;
-        let iopmassertion_getvalue: Symbol<
-            unsafe extern "C" fn(IOPMAssertionID, CFStringRef, *mut i32) -> i32,
-        > = unsafe { iokit.get(b"IOPMAssertionGetValue") }.unwrap();
-
-        let mut status = MaybeUninit::uninit();
-        let status = unsafe {
-            iopmassertion_getvalue(
-                assertion_id,
-                self.assertion_name.as_concrete_TypeRef(),
-                status.as_mut_ptr(),
-            )
-        };
-        if status == 0 {
-            #[cfg(debug_assertions)]
-            println!(
-                "Successfully checked assertion status with ID: {}",
-                assertion_id
-            );
-        } else {
-            panic!("Failed to check assertion status with code: {:X}", status);
-        }
-        status
-    }
-
-    pub fn set_sleep_disabled(&self, sleep_disabled: bool) -> u32 {
+    pub fn set_sleep_disabled(&self, sleep_disabled: bool) -> Result<(), u32> {
         let iokit = &self.library;
         let iopm_set_system_power_setting: libloading::Symbol<
             unsafe extern "C" fn(CFString, CFBoolean) -> u32,
@@ -185,16 +156,18 @@ impl IOKit {
         );
 
         // See IOKit/IOReturn.h for error codes.
-        if result == 0xE00002C1 {
-            panic!("Error: Insufficient privileges to modify system sleep. Try running as root.")
-        } else if result != 0 {
+        if result == 0 {
+            // Success
+            Ok(())
+        } else if result == 0xE00002C1 {
+            // Insufficient privileges
+            Err(result)
+        } else {
             panic!(
                 "Error: Failed to modify system sleep with code: {:X}",
                 result
             );
         }
-
-        result
     }
 
     pub fn get_sleep_disabled() -> bool {
@@ -227,7 +200,7 @@ impl IOKit {
 
         #[cfg(debug_assertions)]
         println!(
-            "Sleep is currently {}",
+            "System sleep is currently {}",
             if sleep_disabled {
                 "disabled"
             } else {
