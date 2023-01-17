@@ -75,21 +75,33 @@ impl IOKit {
 
     pub fn release_assertion(&self, assertion_id: u32) {
         let iokit = &self.library;
-        let iopmassertion_release: Symbol<unsafe extern "C" fn(IOPMAssertionID) -> i32> =
+        let iopmassertion_release: Symbol<unsafe extern "C" fn(IOPMAssertionID) -> u32> =
             unsafe { iokit.get(b"IOPMAssertionRelease") }.unwrap();
 
+        #[cfg(debug_assertions)]
+        println!(
+            "Releasing power management assertion with ID: {}",
+            assertion_id
+        );
+
         let status = unsafe { iopmassertion_release(assertion_id) };
-        if status == 0 {
-            #[cfg(debug_assertions)]
-            println!(
-                "Successfully released power management assertion with ID: {}",
-                assertion_id
-            );
-        } else {
-            panic!(
+
+        match status {
+            0 => {
+                #[cfg(debug_assertions)]
+                println!(
+                    "Successfully released power management assertion with ID: {}",
+                    assertion_id
+                );
+            }
+            0xE00002C2 => {
+                #[cfg(debug_assertions)]
+                println!("Assertion {} already released", assertion_id);
+            }
+            _ => panic!(
                 "Failed to release power management assertion with code: {:X}",
                 status
-            );
+            ),
         }
     }
 

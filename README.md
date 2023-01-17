@@ -2,9 +2,9 @@
 
 `Caffeinate` but it's written in Rust and has more options. Keeps your Mac wide awake.
 
-## UNDER CONSTRUCTION: KINDA WORKS
+## UNDER CONSTRUCTION
 
-Not done, but it mostly works.
+There are probably some bugs hiding somewhere, but regardless, it works.
 
 ## Installation
 

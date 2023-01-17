@@ -124,6 +124,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
     println!("DEBUG {:#?}", &args);
 
+    // Print types of sleep prevented
+    print!("Preventing sleep types: [ ");
+    if args.display {
+        print!("Display ");
+    }
+    if args.disk {
+        print!("Disk ");
+    }
+    if args.system {
+        print!("System ");
+    }
+    if args.system_on_ac {
+        print!("System (if on AC) ");
+    }
+    if args.entirely {
+        print!("Entirely ");
+    }
+    if args.user_active {
+        print!("User active ");
+    }
+    print!("] ");
+
     let mut signals = Signals::new([SIGINT])?;
 
     let assertions_clone = assertions.clone();
@@ -138,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If command is passed, it takes priority over everything else
         let command = args.command.unwrap();
         // Disable sleep while running the given command
-        println!("Preventing sleep until command finishes.");
+        println!("until command finishes.");
 
         let mut child = process::Command::new("/bin/sh")
             .arg("-c")
@@ -178,19 +200,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if timeout_index < waitfor_index {
             let secs = args.timeout.unwrap();
             let duration = std::time::Duration::from_secs(secs);
-            println!("Preventing sleep for {secs} seconds.");
+            println!("for {secs} seconds.");
+            let time = chrono::Local::now() + chrono::Duration::from_std(duration).unwrap();
+            println!("Resuming at {}.", time.format("%X"));
             thread::sleep(duration);
             release_assertions(&iokit, assertions);
             process::exit(0);
         } else {
             let pid = args.waitfor.unwrap();
-            println!("Sleeping until PID {pid} finishes.");
-            // TODO
+            println!("until PID {pid} finishes.");
+
+            let mut child = process::Command::new("lsof")
+                .arg("-p")
+                .arg(pid.to_string())
+                .arg("+r")
+                .arg("1")
+                .stdout(process::Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let status = child.wait().unwrap();
+
+            if status.code() == Some(1) {
+                eprintln!("PID {} does not exist.", pid);
+                process::exit(1);
+            }
+
+            release_assertions(&iokit, assertions);
+            process::exit(0);
         }
     } else {
         // If no arguments are provided, disable sleep until Ctrl+C is pressed
         set_assertions(&iokit, &args, true);
-        println!("Preventing sleep until Ctrl+C pressed.");
+        println!("until Ctrl+C pressed.");
         thread::park();
     }
     Ok(())
