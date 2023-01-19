@@ -1,5 +1,7 @@
 # caffeinate2
 
+![logo](https://randomblock1.com/assets/images/caffeinate2.svg)
+
 `Caffeinate` but it's written in Rust and has more options. Keeps your Mac wide awake.
 
 ## UNDER CONSTRUCTION
