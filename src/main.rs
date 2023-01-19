@@ -83,8 +83,7 @@ struct Args {
     entirely: bool,
 
     /// Declare the user is active.
-    /// If the display is off, this option turns the display on and prevents the display from going into idle sleep.
-    /// If a timeout is not specified with '-t' option, then this assertion is taken with a default of 5 second timeout.
+    /// If the display is off, this option turns it on and prevents it from going into idle sleep.
     #[arg(short, long)]
     user_active: bool,
 

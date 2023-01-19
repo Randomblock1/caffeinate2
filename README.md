@@ -36,21 +36,27 @@ Options:
   -i, --system             Disable idle system sleep. Default if no other options are specified
   -s, --system-on-ac       Disable system sleep while not on battery
   -e, --entirely           Disable system sleep entirely (ignores lid closing)
-  -u, --user-active        Declare the user is active. If the display is off, this option turns the display on and prevents the display from going into idle sleep. If a timeout is not specified with '-t' option, then this assertion is taken with a default of 5 second timeout
+  -u, --user-active        Declare the user is active. If the display is off, this option turns it on and prevents it from going into idle sleep
   -t, --timeout <SECONDS>  Wait for X seconds
   -w, --waitfor <PID>      Wait for program with PID X to complete
-  -h, --help               Print help information
-  -V, --version            Print version information
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 
-### No arguments
+## Sleep Timers (in order of priority)
+
+### Command
+
+Sleep disabled until the command completes. Timeout and PID will be ignored if a command is specified.
+
+### Timeout and PID
+
+Sleep disabled for X seconds or until program with PID X completes. If both timeout and PID are specified, whichever was specified first will be used.
+
+### None of the above
 
 Sleep will be disabled until you press `Ctrl+C`.
 
 ## License
 
 This project is licensed under the MIT License - see [the license file](LICENSE.txt) for details.
-
-## TODO
-
-Use MacOS assertions to prevent various types of sleep instead of completely disabling it.
