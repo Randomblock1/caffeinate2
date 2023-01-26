@@ -197,15 +197,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .position(|x| x == "--waitfor" || x == "-w")
             .unwrap_or(std::usize::MAX);
         if timeout_index < waitfor_index {
-            let secs = args.timeout.unwrap();
-            let duration = std::time::Duration::from_secs(secs);
-            println!("for {secs} seconds.");
-            let time = chrono::Local::now() + chrono::Duration::from_std(duration).unwrap();
-            println!("Resuming at {}.", time.format("%X"));
+            // Timeout selected
+            // Print how long we're waiting for
+            let duration = std::time::Duration::from_secs(args.timeout.unwrap());
+            let end_time = chrono::Local::now() + chrono::Duration::from_std(duration).unwrap();
+            let secs = duration.as_secs() % 60;
+            let minutes = (duration.as_secs() % 3600) / 60;
+            let hours = (duration.as_secs() % 86400) / 3600;
+            let days = duration.as_secs() / 86400;
+            println!(
+                "for {}{}{}{}.",
+                if days > 0 {
+                    format!("{} day{} ", days, if days != 1 { "s" } else { "" })
+                } else {
+                    String::from("")
+                },
+                if hours > 0 {
+                    format!("{} hour{} ", hours, if hours != 1 { "s" } else { "" })
+                } else {
+                    String::from("")
+                },
+                if minutes > 0 {
+                    format!("{} minute{} ", minutes, if minutes != 1 { "s" } else { "" })
+                } else {
+                    String::from("")
+                },
+                if secs % 60 > 0 || secs == 0 {
+                    format!("{} second{}", secs, if secs % 60 != 1 { "s" } else { "" })
+                } else {
+                    String::from("")
+                }
+            );
+            // Print when we're resuming
+            println!(
+                "Resuming {}.",
+                if secs > 60 * 60 * 24 {
+                    end_time.format("on %c")
+                } else {
+                    end_time.format("at %X")
+                }
+            );
             thread::sleep(duration);
             release_assertions(&iokit, assertions);
             process::exit(0);
         } else {
+            // Wait for PID selected
             let pid = args.waitfor.unwrap();
             println!("until PID {pid} finishes.");
 
