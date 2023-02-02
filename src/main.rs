@@ -40,8 +40,9 @@ fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> 
         assertions.push(iokit.declare_user_activity(true));
     }
 
-    #[cfg(debug_assertions)]
-    println!("Assertions: {:?}", assertions);
+    if args.verbose {
+        println!("Assertions: {:?}", assertions);
+    }
 
     assertions
 }
@@ -62,6 +63,10 @@ fn release_assertions(iokit: &power_management::IOKit, assertions: Vec<u32>) {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Verbose mode
+    #[arg(short, long)]
+    verbose: bool,
+
     /// Disable display sleep
     #[arg(short, long)]
     display: bool,
@@ -88,6 +93,7 @@ struct Args {
     user_active: bool,
 
     /// Wait for X seconds.
+    /// TODO Support for time units (e.g. 1m, 1h, 1d)
     #[arg(short, long, name = "SECONDS")]
     timeout: Option<u64>,
 
@@ -120,8 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iokit = power_management::IOKit::new();
 
     let assertions = set_assertions(&iokit, &args, true);
-    #[cfg(debug_assertions)]
-    println!("DEBUG {:#?}", &args);
+    if args.verbose {
+        println!("DEBUG {:#?}", &args);
+    }
 
     // Print types of sleep prevented
     print!("Preventing sleep types: [ ");
