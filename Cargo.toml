@@ -1,6 +1,6 @@
 [package]
 name = "caffeinate2"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Randomblock1 <randomblock1@pm.me>"]
 description = "Caffeinate MacOS utility with more options. Temporarily prevent your system from sleeping."
@@ -19,4 +19,5 @@ clap = { version = "4.1.4", features = ["derive"] }
 core-foundation = "0.9.3"
 libloading = "0.7.4"
 plist = "1.4.0"
+regex = "1.7.1"
 signal-hook = "0.3.14"

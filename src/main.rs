@@ -93,9 +93,9 @@ struct Args {
     user_active: bool,
 
     /// Wait for X seconds.
-    /// TODO Support for time units (e.g. 1m, 1h, 1d)
-    #[arg(short, long, name = "SECONDS")]
-    timeout: Option<u64>,
+    /// Also supports time units (e.g. 1s, 1m, 1h, 1d).
+    #[arg(short, long, name = "DURATION")]
+    timeout: Option<String>,
 
     /// Wait for program with PID X to complete.
     #[arg(short, long, name = "PID")]
@@ -104,6 +104,39 @@ struct Args {
     /// Wait for given command to complete (takes priority above timeout and pid)
     #[arg()]
     command: Option<Vec<String>>,
+}
+
+fn parse_duration(duration: String) -> u64 {
+    // Use regex to split the duration into a bunch of number and unit pairs
+    let mut total_seconds = 0;
+    let re =
+        regex::Regex::new(r"(\d+)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)")
+            .unwrap();
+
+    for captures in re.captures_iter(&duration) {
+        let number = captures[1]
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("invalid timeout"));
+        let unit = &captures[2];
+
+        match unit {
+            "s" | "sec" | "secs" | "second" | "seconds" => total_seconds += number,
+            "m" | "min" | "mins" | "minute" | "minutes" => total_seconds += number * 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => total_seconds += number * 3600,
+            "d" | "day" | "days" => total_seconds += number * 86400,
+            _ => panic!("invalid duration"),
+        }
+    }
+
+    // If no units were specified, assume seconds
+    if total_seconds == 0 {
+        total_seconds = duration.parse().unwrap_or_else(|_| {
+            eprintln!("Error: Timeout isn't a valid duration or number!");
+            process::exit(1)
+        });
+    }
+
+    total_seconds
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -206,9 +239,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if timeout_index < waitfor_index {
             // Timeout selected
             // Print how long we're waiting for
-            let duration = std::time::Duration::from_secs(args.timeout.unwrap());
+            let duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
             let end_time = chrono::Local::now() + chrono::Duration::from_std(duration).unwrap();
-            let secs = duration.as_secs() % 60;
+            let seconds = duration.as_secs() % 60;
             let minutes = (duration.as_secs() % 3600) / 60;
             let hours = (duration.as_secs() % 86400) / 3600;
             let days = duration.as_secs() / 86400;
@@ -229,8 +262,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     String::from("")
                 },
-                if secs % 60 > 0 || secs == 0 {
-                    format!("{} second{}", secs, if secs % 60 != 1 { "s" } else { "" })
+                if seconds % 60 > 0 || seconds == 0 {
+                    format!(
+                        "{} second{}",
+                        seconds,
+                        if seconds % 60 != 1 { "s" } else { "" }
+                    )
                 } else {
                     String::from("")
                 }
@@ -238,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Print when we're resuming
             println!(
                 "Resuming {}.",
-                if secs > 60 * 60 * 24 {
+                if seconds > 60 * 60 * 24 {
                     end_time.format("on %c")
                 } else {
                     end_time.format("at %X")
