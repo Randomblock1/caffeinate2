@@ -20,7 +20,7 @@ _This is not yet available._
 
 ### Cargo
 
-_This is not yet available._
+`cargo install caffeinate2`
 
 ## Usage
 
