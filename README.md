@@ -4,10 +4,6 @@
 
 `caffeinate` but it's written in Rust and has more options. Keeps your Mac wide awake.
 
-## UNDER CONSTRUCTION
-
-There are probably some bugs hiding somewhere, but regardless, it works.
-
 ## Installation
 
 ### GitHub Releases

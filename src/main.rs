@@ -9,6 +9,11 @@ use std::process;
 use std::thread;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
+    if args.dry_run {
+        // Don't actually sleep
+        return Vec::new();
+    }
+
     if args.entirely {
         // Prevents the system from sleeping entirely.
         iokit.set_sleep_disabled(true).unwrap_or_else(|_| {
@@ -92,6 +97,11 @@ struct Args {
     #[arg(short, long)]
     user_active: bool,
 
+    /// Dry run. Don't actually sleep.
+    /// Useful for testing.
+    #[arg(long)]
+    dry_run: bool,
+
     /// Wait for X seconds.
     /// Also supports time units (e.g. 1s, 1m, 1h, 1d).
     #[arg(short, long, name = "DURATION")]
@@ -141,12 +151,12 @@ fn parse_duration(duration: String) -> u64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
-    if !args.display
-        && !args.disk
-        && !args.system
-        && !args.system_on_ac
-        && !args.entirely
-        && !args.user_active
+    if !(args.display
+        || args.disk
+        || args.system
+        || args.system_on_ac
+        || args.entirely
+        || args.user_active)
     {
         // Default to system sleep if no other options are specified
         args.system = true;
@@ -156,9 +166,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("This program only works on macOS.");
     }
 
-    let iokit = power_management::IOKit::new();
-
-    let assertions = set_assertions(&iokit, &args, true);
     if args.verbose {
         println!("DEBUG {:#?}", &args);
     }
@@ -185,8 +192,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     print!("] ");
 
-    let mut signals = Signals::new([SIGINT])?;
+    let iokit = power_management::IOKit::new();
+    let assertions = set_assertions(&iokit, &args, true);
 
+    let mut signals = Signals::new([SIGINT])?;
     let assertions_clone = assertions.clone();
     thread::spawn(move || {
         for _ in signals.forever() {
@@ -309,10 +318,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(0);
         }
     } else {
-        // If no arguments are provided, disable sleep until Ctrl+C is pressed
+        // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
         set_assertions(&iokit, &args, true);
         println!("until Ctrl+C pressed.");
         thread::park();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_parse_duration() {
+        let duration = "1d2h3m4s".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result, 93784);
+
+        let duration = "1day 2hrs3m".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result, 93780);
+
+        let duration = "3 minutes 17 hours 2 seconds".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result, 61382);
+
+        let duration = "45323".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result, 45323);
+    }
 }
