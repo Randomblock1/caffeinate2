@@ -7,6 +7,7 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::process;
 use std::thread;
+use std::os::unix::process::CommandExt;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
     if args.dry_run {
@@ -52,9 +53,9 @@ fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> 
     assertions
 }
 
-fn release_assertions(iokit: &power_management::IOKit, assertions: Vec<u32>) {
+fn release_assertions(iokit: &power_management::IOKit, assertions: &Vec<u32>) {
     for assertion in assertions {
-        iokit.release_assertion(assertion);
+        iokit.release_assertion(*assertion);
     }
     if power_management::IOKit::get_sleep_disabled() {
         iokit.set_sleep_disabled(false).unwrap_or_else(|_| {
@@ -71,6 +72,17 @@ struct Args {
     /// Verbose mode
     #[arg(short, long)]
     verbose: bool,
+
+    /// Dry run. Don't actually sleep.
+    /// Useful for testing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Drop root privileges in command.
+    /// Some programs don't want to work as root,
+    /// but you need root to disable sleep entirely.
+    #[arg(long)]
+    drop_root: bool,
 
     /// Disable display sleep
     #[arg(short, long)]
@@ -97,13 +109,8 @@ struct Args {
     #[arg(short, long)]
     user_active: bool,
 
-    /// Dry run. Don't actually sleep.
-    /// Useful for testing.
-    #[arg(long)]
-    dry_run: bool,
-
     /// Wait for X seconds.
-    /// Also supports time units (e.g. 1s, 1m, 1h, 1d).
+    /// Also supports time units (like "1 day 2 hours 3mins 4s").
     #[arg(short, long, name = "DURATION")]
     timeout: Option<String>,
 
@@ -149,7 +156,7 @@ fn parse_duration(duration: String) -> u64 {
     total_seconds
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let mut args = Args::parse();
     if !(args.display
         || args.disk
@@ -170,37 +177,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("DEBUG {:#?}", &args);
     }
 
+    let mut sleep_str = "Preventing sleep types: ".to_string();
+
+    sleep_str += "[ ";
+
     // Print types of sleep prevented
-    print!("Preventing sleep types: [ ");
     if args.display {
-        print!("Display ");
+        sleep_str += "Display ";
     }
     if args.disk {
-        print!("Disk ");
+        sleep_str += "Disk ";
     }
     if args.system {
-        print!("System ");
+        sleep_str += "System ";
     }
     if args.system_on_ac {
-        print!("System (if on AC) ");
+        sleep_str += "System (if on AC) ";
     }
     if args.entirely {
-        print!("Entirely ");
+        sleep_str += "Entirely ";
     }
     if args.user_active {
-        print!("User active ");
+        sleep_str += "User active ";
     }
-    print!("] ");
+    sleep_str += "] ";
 
     let iokit = power_management::IOKit::new();
     let assertions = set_assertions(&iokit, &args, true);
 
-    let mut signals = Signals::new([SIGINT])?;
+    let mut exit_code = 0;
+
+    let mut signals = Signals::new([SIGINT]).unwrap();
     let assertions_clone = assertions.clone();
     thread::spawn(move || {
         for _ in signals.forever() {
-            release_assertions(&power_management::IOKit::new(), assertions_clone);
-            process::exit(0);
+            release_assertions(&power_management::IOKit::new(), &assertions_clone);
+            process::exit(exit_code);
         }
     });
 
@@ -208,14 +220,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If command is passed, it takes priority over everything else
         let command = args.command.unwrap();
         // Disable sleep while running the given command
-        println!("until command finishes.");
+        sleep_str += "until command finishes.";
+        println!("{sleep_str}");
+
+        let uid;
+        let gid;
+
+        if args.drop_root {
+            let uid_str =
+                std::env::var("SUDO_UID").unwrap_or_else(|_| nix::unistd::getuid().to_string());
+            let gid_str =
+                std::env::var("SUDO_GID").unwrap_or_else(|_| nix::unistd::getgid().to_string());
+
+            uid = uid_str.parse::<u32>().unwrap();
+            gid = gid_str.parse::<u32>().unwrap();
+        } else {
+            uid = nix::unistd::getuid().into();
+            gid = nix::unistd::getgid().into();
+        }
+
+        if args.verbose {
+            println!("uid: {uid}, gid: {gid}");
+        }
 
         let mut child = process::Command::new("/bin/sh")
             .arg("-c")
             .arg(command.join(" "))
             .stdout(process::Stdio::piped())
             .stderr(process::Stdio::piped())
-            .spawn()?;
+            .uid(uid)
+            .gid(gid)
+            .spawn()
+            .unwrap();
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -224,15 +260,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stderr_reader = io::BufReader::new(stderr);
 
         for line in io::BufRead::lines(stdout_reader) {
-            println!("{}", line?);
+            println!("{}", line.unwrap());
         }
 
         for line in io::BufRead::lines(stderr_reader) {
-            eprintln!("{}", line?);
+            eprintln!("{}", line.unwrap());
         }
 
-        release_assertions(&iokit, assertions);
-        process::exit(child.wait()?.code().unwrap_or(1));
+        exit_code = child.wait().unwrap().code().unwrap_or(0);
     } else if args.timeout.is_some() || args.waitfor.is_some() {
         // If timeout or waitfor is used, wait appropriately
         // The original caffeinate treats arg position as priority
@@ -254,7 +289,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let minutes = (duration.as_secs() % 3600) / 60;
             let hours = (duration.as_secs() % 86400) / 3600;
             let days = duration.as_secs() / 86400;
-            println!(
+
+            sleep_str += &format!(
                 "for {}{}{}{}.",
                 if days > 0 {
                     format!("{} day{} ", days, if days != 1 { "s" } else { "" })
@@ -281,6 +317,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     String::from("")
                 }
             );
+            println!("{sleep_str}");
+
             // Print when we're resuming
             println!(
                 "Resuming {}.",
@@ -291,12 +329,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             );
             thread::sleep(duration);
-            release_assertions(&iokit, assertions);
-            process::exit(0);
         } else {
             // Wait for PID selected
             let pid = args.waitfor.unwrap();
-            println!("until PID {pid} finishes.");
+            sleep_str += "until PID {pid} finishes.";
+            println!("{sleep_str}");
 
             let mut child = process::Command::new("lsof")
                 .arg("-p")
@@ -311,19 +348,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if status.code() == Some(1) {
                 eprintln!("PID {} does not exist.", pid);
-                process::exit(1);
+                exit_code = 1;
             }
-
-            release_assertions(&iokit, assertions);
-            process::exit(0);
         }
     } else {
         // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
-        set_assertions(&iokit, &args, true);
-        println!("until Ctrl+C pressed.");
+        sleep_str += "until Ctrl+C pressed.";
+        println!("{}", sleep_str);
         thread::park();
     }
-    Ok(())
+    release_assertions(&iokit, &assertions);
+    process::exit(exit_code);
 }
 
 #[cfg(test)]
