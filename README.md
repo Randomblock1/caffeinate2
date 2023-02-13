@@ -58,7 +58,7 @@ Sleep disabled until the command completes. You should enclose the command in qu
 
 Sleep disabled for a certain amount of time or until program with the specified PID completes. If both timeout and PID are specified, whichever was specified first will be used.
 
-Timeout can either be a number of seconds or a duration string. For example you can pass `-t 600` or `-t 10m` to wait for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`. Anything that's not a number followed by a unit will be ignored (the "and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise it will try to parse anything that's past the space as a command, and ignore the timeout.
+Timeout can either be a number of seconds or a duration string. For example you can pass `-t 600` or `-t 10m` to wait for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`, but it only looks at the first letter (so "3 movies" is just 3 minutes). Anything that's not a number followed by a letter will be ignored (the "and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise it will try to parse anything that's past the space as a command, and ignore the timeout.
 
 `caffeinate2 -t 600`
 
@@ -81,3 +81,4 @@ This project is licensed under the MIT License - see [the license file](LICENSE.
 - [ ] Treat timeout like a timeout, and not a timer.
 - [ ] Figure out if I can get commands to support color (for example, `caffeinate2 brew` is uncolored)
 - [ ] Print sleep types better
+- [ ] Get system sleep status without reading a plist

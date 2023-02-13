@@ -5,9 +5,10 @@ mod power_management;
 use clap::Parser;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::process;
 use std::thread;
-use std::os::unix::process::CommandExt;
+use time::macros::format_description;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
     if args.dry_run {
@@ -126,9 +127,7 @@ struct Args {
 fn parse_duration(duration: String) -> u64 {
     // Use regex to split the duration into a bunch of number and unit pairs
     let mut total_seconds = 0;
-    let re =
-        regex::Regex::new(r"(\d+)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)")
-            .unwrap();
+    let re = regex::Regex::new(r"(\d+)\s*(s|m|h|d)").unwrap();
 
     for captures in re.captures_iter(&duration) {
         let number = captures[1]
@@ -137,10 +136,10 @@ fn parse_duration(duration: String) -> u64 {
         let unit = &captures[2];
 
         match unit {
-            "s" | "sec" | "secs" | "second" | "seconds" => total_seconds += number,
-            "m" | "min" | "mins" | "minute" | "minutes" => total_seconds += number * 60,
-            "h" | "hr" | "hrs" | "hour" | "hours" => total_seconds += number * 3600,
-            "d" | "day" | "days" => total_seconds += number * 86400,
+            "s" => total_seconds += number,
+            "m" => total_seconds += number * 60,
+            "h" => total_seconds += number * 3600,
+            "d" => total_seconds += number * 86400,
             _ => panic!("invalid duration"),
         }
     }
@@ -284,7 +283,7 @@ fn main() {
             // Timeout selected
             // Print how long we're waiting for
             let duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
-            let end_time = chrono::Local::now() + chrono::Duration::from_std(duration).unwrap();
+            let end_time = time::OffsetDateTime::now_utc() + duration;
             let seconds = duration.as_secs() % 60;
             let minutes = (duration.as_secs() % 3600) / 60;
             let hours = (duration.as_secs() % 86400) / 3600;
@@ -319,20 +318,25 @@ fn main() {
             );
             println!("{sleep_str}");
 
+            let short_fmt = format_description!("at [hour]:[minute]:[second][period]");
+            let long_fmt = format_description!(
+                "on [month repr:long] [day] at [hour]:[minute]:[second][period]"
+            );
+
             // Print when we're resuming
             println!(
                 "Resuming {}.",
-                if seconds > 60 * 60 * 24 {
-                    end_time.format("on %c")
+                if duration.as_secs() > (60 * 60 * 24) {
+                    end_time.format(&long_fmt).unwrap()
                 } else {
-                    end_time.format("at %X")
+                    end_time.format(&short_fmt).unwrap()
                 }
             );
             thread::sleep(duration);
         } else {
             // Wait for PID selected
             let pid = args.waitfor.unwrap();
-            sleep_str += "until PID {pid} finishes.";
+            sleep_str += &format!("until PID {pid} finishes.");
             println!("{sleep_str}");
 
             let mut child = process::Command::new("lsof")
