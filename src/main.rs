@@ -283,7 +283,7 @@ fn main() {
             // Timeout selected
             // Print how long we're waiting for
             let duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
-            let end_time = time::OffsetDateTime::now_utc() + duration;
+            let end_time = time::OffsetDateTime::now_local().unwrap() + duration;
             let seconds = duration.as_secs() % 60;
             let minutes = (duration.as_secs() % 3600) / 60;
             let hours = (duration.as_secs() % 86400) / 3600;
@@ -318,9 +318,9 @@ fn main() {
             );
             println!("{sleep_str}");
 
-            let short_fmt = format_description!("at [hour]:[minute]:[second][period]");
+            let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
             let long_fmt = format_description!(
-                "on [month repr:long] [day] at [hour]:[minute]:[second][period]"
+                "on [month repr:long] [day] at [hour repr:12]:[minute]:[second] [period]"
             );
 
             // Print when we're resuming
@@ -353,6 +353,11 @@ fn main() {
             if status.code() == Some(1) {
                 eprintln!("PID {} does not exist.", pid);
                 exit_code = 1;
+            } else {
+                print!("PID {pid} finished ");
+                let now = time::OffsetDateTime::now_local().unwrap();
+                let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
+                println!("{}", now.format(&short_fmt).unwrap());
             }
         }
     } else {

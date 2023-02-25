@@ -82,3 +82,4 @@ This project is licensed under the MIT License - see [the license file](LICENSE.
 - [ ] Figure out if I can get commands to support color (for example, `caffeinate2 brew` is uncolored)
 - [ ] Print sleep types better
 - [ ] Get system sleep status without reading a plist
+- [ ] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack
