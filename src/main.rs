@@ -58,7 +58,7 @@ fn release_assertions(iokit: &power_management::IOKit, assertions: &Vec<u32>) {
     for assertion in assertions {
         iokit.release_assertion(*assertion);
     }
-    if power_management::IOKit::get_sleep_disabled() {
+    if power_management::IOKit::get_sleep_disabled(iokit) {
         iokit.set_sleep_disabled(false).unwrap_or_else(|_| {
             eprintln!("Error: Insufficient privileges to disable sleep. Try running with sudo.");
             process::exit(1);

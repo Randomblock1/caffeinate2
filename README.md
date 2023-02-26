@@ -79,7 +79,7 @@ This project is licensed under the MIT License - see [the license file](LICENSE.
 ## TODO
 
 - [ ] Treat timeout like a timeout, and not a timer.
-- [ ] Figure out if I can get commands to support color (for example, `caffeinate2 brew` is uncolored)
+- [ ] Figure out how to fake a tty (for example, `caffeinate2 brew list` is uncolored)
 - [ ] Print sleep types better
-- [ ] Get system sleep status without reading a plist
-- [ ] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack
+- [x] Get system sleep status without reading a plist
+- [x] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack - POSTPONED because it's a mess and it currently Just Works™️

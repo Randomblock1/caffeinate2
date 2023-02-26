@@ -1,5 +1,7 @@
-use core_foundation::base::TCFType;
+use core_foundation::base::{TCFType, TCFTypeRef};
 use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef};
+use core_foundation::number::CFBooleanRef;
 use core_foundation::string::{CFString, CFStringRef};
 use libloading::{Library, Symbol};
 use std::mem::MaybeUninit;
@@ -26,6 +28,13 @@ impl IOKit {
             library,
             assertion_name,
         }
+    }
+
+    fn iopm_copy_power_settings(&self) -> CFDictionaryRef {
+        let iokit = &self.library;
+        let iopm_copy_power_settings: Symbol<unsafe extern "C" fn() -> CFDictionaryRef> =
+            unsafe { iokit.get(b"IOPMCopySystemPowerSettings") }.unwrap();
+        unsafe { iopm_copy_power_settings() }
     }
 
     pub fn create_assertion(&self, assertion_type: &str, state: bool) -> u32 {
@@ -182,43 +191,21 @@ impl IOKit {
         }
     }
 
-    pub fn get_sleep_disabled() -> bool {
-        const PATH: &str = "/Library/Preferences/com.apple.PowerManagement.plist";
+    pub fn get_sleep_disabled(&self) -> bool {
+        let mut ptr: *const std::os::raw::c_void = std::ptr::null();
 
-        // Open the file
-        let value: plist::Value = match plist::from_file(PATH) {
-            Ok(v) => v,
-            Err(e) => {
-                panic!("Failed to open {}: {}", PATH, e);
-            }
+        let result = unsafe {
+            CFDictionaryGetValueIfPresent(
+                self.iopm_copy_power_settings(),
+                CFString::new("SleepDisabled").as_CFTypeRef().as_void_ptr(),
+                &mut ptr,
+            )
         };
 
-        // Get the "SystemPowerSettings" dictionary from the root dictionary
-        let system_power_settings = value
-            .as_dictionary()
-            .and_then(|dict| dict.get("SystemPowerSettings"))
-            .and_then(|dict| dict.as_dictionary())
-            .unwrap_or_else(|| {
-                panic!("Failed to get SystemPowerSettings dictionary from {}", PATH);
-            });
+        if result == 0 {
+            panic!("Failed to get SleepDisabled value!");
+        }
 
-        // Get the "SleepDisabled" key from the "SystemPowerSettings" dictionary
-        let sleep_disabled = system_power_settings
-            .get("SleepDisabled")
-            .and_then(|val| val.as_boolean())
-            .unwrap_or_else(|| {
-                panic!("Failed to get SleepDisabled value from {}", PATH);
-            });
-
-        #[cfg(debug_assertions)]
-        println!(
-            "System sleep is currently {}",
-            if sleep_disabled {
-                "disabled"
-            } else {
-                "enabled"
-            }
-        );
-        sleep_disabled
+        ptr as CFBooleanRef == unsafe { core_foundation::number::kCFBooleanTrue }
     }
 }
