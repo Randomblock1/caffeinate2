@@ -6,7 +6,8 @@
 
 ## Current Status
 
-In development. Works fine, but I want to add more features and document the different types of sleep before version 1.0.0.
+In development. Works fine, but I want to add more features and document the different types of sleep before version
+1.0.0.
 
 ## Installation
 
@@ -16,7 +17,7 @@ Download the latest release from [here](https://github.com/randomblock1/caffeina
 
 ### Homebrew
 
-_This won't be availible until version 1.0.0._
+_This won't be available until version 1.0.0._
 
 ### Cargo
 
@@ -50,21 +51,29 @@ Options:
 
 ### Command
 
-Sleep disabled until the command completes. You should enclose the command in quotes. Timeout and PID will be ignored if a command is specified.
+Sleep disabled until the command completes. You should enclose the command in quotes, although sometimes it isn't
+required. Timeout and PID will be ignored if a command is specified.
 
-`caffeinate2 "echo hello"`
+`caffeinate2 "sleep 5"`
 
 ### Timeout and PID
 
-Sleep disabled for a certain amount of time or until program with the specified PID completes. If both timeout and PID are specified, whichever was specified first will be used.
+Sleep is disabled for a certain amount of time or until the program with the specified PID completes. If both are
+specified, it waits until one of them completes.
 
-Timeout can either be a number of seconds or a duration string. For example you can pass `-t 600` or `-t 10m` to wait for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`, but it only looks at the first letter (so "3 movies" is just 3 minutes). Anything that's not a number followed by a letter will be ignored (the "and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise it will try to parse anything that's past the space as a command, and ignore the timeout.
+Timeout can either be a number of seconds or a duration string. For example, you can pass `-t 600` or `-t 10m` to wait
+for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`, but it only looks at the
+first letter (so "3 movies" is just 3 minutes). Anything that's not a number followed by a letter will be ignored (the "
+and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise, it will try to parse
+anything that's past the space as a command, and ignore the timeout.
 
 `caffeinate2 -t 600`
 
 `caffeinate2 -t "1 hour and 30 minutes"`
 
 `caffeinate2 -w 1234`
+
+`caffeinate2 -t 600 -w 1234`
 
 ### None of the above
 
@@ -78,8 +87,10 @@ This project is licensed under the MIT License - see [the license file](LICENSE.
 
 ## TODO
 
-- [ ] Treat timeout like a timeout, and not a timer.
+- [x] Make timeout and PID work together
 - [ ] Figure out how to fake a tty (for example, `caffeinate2 brew list` is uncolored)
 - [ ] Print sleep types better
+- [ ] Document all the sleep types (they are somewhat vague)
 - [x] Get system sleep status without reading a plist
-- [x] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack - POSTPONED because it's a mess and it currently Just Works™️
+- [x] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack - POSTPONED because it's a mess, and
+  it currently Just Works™️

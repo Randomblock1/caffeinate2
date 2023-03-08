@@ -7,6 +7,7 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process;
+use std::sync::mpsc::channel;
 use std::thread;
 use time::macros::format_description;
 
@@ -269,28 +270,27 @@ fn main() {
         exit_code = child.wait().unwrap().code().unwrap_or(0);
     } else if args.timeout.is_some() || args.waitfor.is_some() {
         // If timeout or waitfor is used, wait appropriately
-        // The original caffeinate treats arg position as priority
-        let args_vec = std::env::args().collect::<Vec<_>>();
-        let timeout_index = args_vec
-            .iter()
-            .position(|x| x == "--timeout" || x == "-t")
-            .unwrap_or(std::usize::MAX);
-        let waitfor_index = args_vec
-            .iter()
-            .position(|x| x == "--waitfor" || x == "-w")
-            .unwrap_or(std::usize::MAX);
-        if timeout_index < waitfor_index {
+        // TODO Major Refactor Needed: They can be used at the same time, but the code is a mess
+
+        let (sender, receiver) = channel();
+
+        let mut duration = std::time::Duration::from_secs(0);
+        let mut end_time = time::OffsetDateTime::now_local().unwrap();
+
+        let timeout = args.timeout.is_some();
+        let waitfor = args.waitfor.is_some();
+        if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            let duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
-            let end_time = time::OffsetDateTime::now_local().unwrap() + duration;
+            duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
+            end_time = time::OffsetDateTime::now_local().unwrap() + duration;
             let seconds = duration.as_secs() % 60;
             let minutes = (duration.as_secs() % 3600) / 60;
             let hours = (duration.as_secs() % 86400) / 3600;
             let days = duration.as_secs() / 86400;
 
             sleep_str += &format!(
-                "for {}{}{}{}.",
+                "for {}{}{}{}",
                 if days > 0 {
                     format!("{} day{} ", days, if days != 1 { "s" } else { "" })
                 } else {
@@ -316,8 +316,19 @@ fn main() {
                     String::from("")
                 }
             );
-            println!("{sleep_str}");
+        }
 
+        print!("{sleep_str}");
+
+        if timeout && waitfor {
+            print!(" or ");
+        }
+        if waitfor {
+            print!("until PID {} finishes", args.waitfor.unwrap());
+        }
+        println!(".");
+
+        if timeout {
             let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
             let long_fmt = format_description!(
                 "on [month repr:long] [day] at [hour repr:12]:[minute]:[second] [period]"
@@ -332,12 +343,18 @@ fn main() {
                     end_time.format(&short_fmt).unwrap()
                 }
             );
-            thread::sleep(duration);
-        } else {
+
+            // Spawn a new thread to handle the timeout
+            let timeout_sender = sender.clone();
+            thread::spawn(move || {
+                thread::sleep(duration);
+                timeout_sender.send(0).unwrap();
+            });
+        }
+
+        if waitfor {
             // Wait for PID selected
             let pid = args.waitfor.unwrap();
-            sleep_str += &format!("until PID {pid} finishes.");
-            println!("{sleep_str}");
 
             let mut child = process::Command::new("lsof")
                 .arg("-p")
@@ -345,21 +362,32 @@ fn main() {
                 .arg("+r")
                 .arg("1")
                 .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
                 .spawn()
                 .unwrap();
 
-            let status = child.wait().unwrap();
+            // Spawn a new thread to handle the timeout
+            let waitpid_sender = sender.clone();
+            thread::spawn(move || {
+                let status = child.wait().unwrap();
+                let exit_code;
 
-            if status.code() == Some(1) {
-                eprintln!("PID {} does not exist.", pid);
-                exit_code = 1;
-            } else {
-                print!("PID {pid} finished ");
-                let now = time::OffsetDateTime::now_local().unwrap();
-                let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
-                println!("{}", now.format(&short_fmt).unwrap());
-            }
+                if status.code() == Some(1) {
+                    eprintln!("PID {} does not exist.", pid);
+                    exit_code = 1;
+                } else {
+                    print!("PID {pid} finished ");
+                    exit_code = 0;
+                    let now = time::OffsetDateTime::now_local().unwrap();
+                    let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
+                    println!("{}", now.format(&short_fmt).unwrap());
+                }
+                waitpid_sender.send(exit_code).unwrap();
+            });
         }
+
+        // Wait for either the timeout or the process to finish
+        exit_code = receiver.recv().unwrap();
     } else {
         // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
         sleep_str += "until Ctrl+C pressed.";
