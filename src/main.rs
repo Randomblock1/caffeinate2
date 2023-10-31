@@ -379,7 +379,8 @@ fn main() {
                     print!("PID {pid} finished ");
                     exit_code = 0;
                     let now = time::OffsetDateTime::now_local().unwrap();
-                    let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
+                    let short_fmt =
+                        format_description!("at [hour repr:12]:[minute]:[second] [period]");
                     println!("{}", now.format(&short_fmt).unwrap());
                 }
                 waitpid_sender.send(exit_code).unwrap();
