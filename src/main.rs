@@ -9,7 +9,6 @@ use std::os::unix::process::CommandExt;
 use std::process;
 use std::sync::mpsc::channel;
 use std::thread;
-use time::macros::format_description;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
     if args.dry_run {
@@ -75,14 +74,14 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Dry run. Don't actually sleep.
+    /// Dry run. Don't actually prevent sleep.
     /// Useful for testing.
     #[arg(long)]
     dry_run: bool,
 
     /// Drop root privileges in command.
-    /// Some programs don't want to work as root,
-    /// but you need root to disable sleep entirely.
+    /// You need root to disable sleep entirely,
+    /// but some programs don't want to run as root.
     #[arg(long)]
     drop_root: bool,
 
@@ -125,14 +124,14 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-fn parse_duration(duration: String) -> u64 {
+fn parse_duration(duration: String) -> i64 {
     // Use regex to split the duration into a bunch of number and unit pairs
     let mut total_seconds = 0;
     let re = regex::Regex::new(r"(\d+)\s*(s|m|h|d)").unwrap();
 
     for captures in re.captures_iter(&duration) {
         let number = captures[1]
-            .parse::<u64>()
+            .parse::<i64>()
             .unwrap_or_else(|_| panic!("invalid timeout"));
         let unit = &captures[2];
 
@@ -210,7 +209,7 @@ fn main() {
     let mut signals = Signals::new([SIGINT]).unwrap();
     let assertions_clone = assertions.clone();
     thread::spawn(move || {
-        for _ in signals.forever() {
+        if signals.forever().next().is_some() {
             release_assertions(&power_management::IOKit::new(), &assertions_clone);
             process::exit(exit_code);
         }
@@ -274,20 +273,20 @@ fn main() {
 
         let (sender, receiver) = channel();
 
-        let mut duration = std::time::Duration::from_secs(0);
-        let mut end_time = time::OffsetDateTime::now_local().unwrap();
+        let mut duration = chrono::Duration::try_seconds(0).unwrap();
+        let mut end_time = chrono::Local::now();
 
         let timeout = args.timeout.is_some();
         let waitfor = args.waitfor.is_some();
         if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            duration = std::time::Duration::from_secs(parse_duration(args.timeout.unwrap()));
-            end_time = time::OffsetDateTime::now_local().unwrap() + duration;
-            let seconds = duration.as_secs() % 60;
-            let minutes = (duration.as_secs() % 3600) / 60;
-            let hours = (duration.as_secs() % 86400) / 3600;
-            let days = duration.as_secs() / 86400;
+            duration = chrono::Duration::try_seconds(parse_duration(args.timeout.unwrap())).unwrap();
+            end_time += duration;
+            let seconds = duration.num_seconds() % 60;
+            let minutes = duration.num_minutes() % 60;
+            let hours = duration.num_hours() % 24;
+            let days = duration.num_days();
 
             sleep_str += &format!(
                 "for {}{}{}{}",
@@ -328,32 +327,30 @@ fn main() {
         }
         println!(".");
 
-        if timeout {
-            let short_fmt = format_description!("at [hour repr:12]:[minute]:[second] [period]");
-            let long_fmt = format_description!(
-                "on [month repr:long] [day] at [hour repr:12]:[minute]:[second] [period]"
-            );
+        const SHORT_FMT: &str = "at %-I:%M:%S %p";
+        const LONG_FMT: &str = "on %B %-d at %-I:%M:%S %p";
 
+        if timeout {
             // Print when we're resuming
             println!(
                 "Resuming {}.",
-                if duration.as_secs() > (60 * 60 * 24) {
-                    end_time.format(&long_fmt).unwrap()
+                if duration.num_seconds() > (60 * 60 * 24) {
+                    end_time.format(LONG_FMT)
                 } else {
-                    end_time.format(&short_fmt).unwrap()
+                    end_time.format(SHORT_FMT)
                 }
             );
 
             // Spawn a new thread to handle the timeout
             let timeout_sender = sender.clone();
             thread::spawn(move || {
-                thread::sleep(duration);
+                thread::sleep(duration.to_std().unwrap());
                 timeout_sender.send(0).unwrap();
             });
         }
 
         if waitfor {
-            // Wait for PID selected
+            // Wait for PID to complete
             let pid = args.waitfor.unwrap();
 
             let mut child = process::Command::new("lsof")
@@ -378,10 +375,8 @@ fn main() {
                 } else {
                     print!("PID {pid} finished ");
                     exit_code = 0;
-                    let now = time::OffsetDateTime::now_local().unwrap();
-                    let short_fmt =
-                        format_description!("at [hour repr:12]:[minute]:[second] [period]");
-                    println!("{}", now.format(&short_fmt).unwrap());
+                    let now = chrono::Local::now();
+                    println!("{}", now.format(SHORT_FMT));
                 }
                 waitpid_sender.send(exit_code).unwrap();
             });

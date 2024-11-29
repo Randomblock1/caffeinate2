@@ -14,7 +14,7 @@ fn main() {
     let mut signals = Signals::new([SIGINT]).unwrap();
     let sleep_arr_clone = sleep_arr.clone();
     thread::spawn(move || {
-        for _ in signals.forever() {
+        if signals.forever().next().is_some() {
             let len = sleep_arr_clone.lock().unwrap().len();
             if len != 0 {
                 println!("\nSleep was detected {} times", len);
@@ -39,10 +39,12 @@ fn main() {
         // Sleep function isn't exactly accurate, but if it's off by more than 2x, it's probably because computer slept
         if elapsed > SLEEP_THRESHOLD {
             let elapsed_secs = elapsed.as_secs();
-            sleep_arr.lock().unwrap().push(elapsed_secs);
+            sleep_arr.lock().unwrap().push(elapsed_secs - SLEEP_TIME);
+            let now = chrono::Local::now();
             println!(
-                "Sleep detected! Slept for {} seconds",
-                elapsed_secs - SLEEP_TIME
+                "Sleep detected! Slept for {} seconds, woke at {}",
+                elapsed_secs - SLEEP_TIME,
+                now.format("%Y-%m-%d %-I:%M:%S %p")
             );
         }
     }
