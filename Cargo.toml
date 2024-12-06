@@ -1,6 +1,6 @@
 [package]
 name = "caffeinate2"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 authors = ["Randomblock1 <randomblock1@pm.me>"]
 description = "Caffeinate MacOS utility with more options. Temporarily prevent your system from sleeping."

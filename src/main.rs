@@ -3,8 +3,8 @@
 mod power_management;
 
 use clap::Parser;
+use nix::{sys::event, unistd};
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use std::io;
 use std::os::unix::process::CommandExt;
 use std::process;
 use std::thread;
@@ -171,11 +171,6 @@ fn main() {
         panic!("This program only works on macOS.");
     }
 
-    #[cfg(debug_assertions)]
-    {
-        args.verbose = true;
-    }
-
     if args.verbose {
         println!("DEBUG {:#?}", &args);
     }
@@ -231,15 +226,15 @@ fn main() {
 
         if args.drop_root {
             let uid_str =
-                std::env::var("SUDO_UID").unwrap_or_else(|_| nix::unistd::getuid().to_string());
+                std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
             let gid_str =
-                std::env::var("SUDO_GID").unwrap_or_else(|_| nix::unistd::getgid().to_string());
+                std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
 
             uid = uid_str.parse::<u32>().unwrap();
             gid = gid_str.parse::<u32>().unwrap();
         } else {
-            uid = nix::unistd::getuid().into();
-            gid = nix::unistd::getgid().into();
+            uid = unistd::getuid().into();
+            gid = unistd::getgid().into();
         }
 
         if args.verbose {
@@ -249,26 +244,12 @@ fn main() {
         let mut child = process::Command::new("/bin/sh")
             .arg("-c")
             .arg(command.join(" "))
-            .stdout(process::Stdio::piped())
-            .stderr(process::Stdio::piped())
+            .stdout(process::Stdio::inherit())
+            .stderr(process::Stdio::inherit())
             .uid(uid)
             .gid(gid)
             .spawn()
             .unwrap();
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        let stdout_reader = io::BufReader::new(stdout);
-        let stderr_reader = io::BufReader::new(stderr);
-
-        for line in io::BufRead::lines(stdout_reader) {
-            println!("{}", line.unwrap());
-        }
-
-        for line in io::BufRead::lines(stderr_reader) {
-            eprintln!("{}", line.unwrap());
-        }
 
         exit_code = child.wait().unwrap().code().unwrap_or(0);
     } else if args.timeout.is_some() || args.waitfor.is_some() {
@@ -314,7 +295,7 @@ fn main() {
                         if seconds % 60 != 1 { "s" } else { "" }
                     )
                 } else {
-                    String::from("")
+                    String::new()
                 }
             );
         }
@@ -349,15 +330,15 @@ fn main() {
             let pid = args.waitfor.unwrap();
 
             // wait without polling using kevent
-            let kq = nix::sys::event::Kqueue::new().unwrap();
-            let kev = nix::sys::event::KEvent::new(
+            let kq = event::Kqueue::new().unwrap();
+            let kev = event::KEvent::new(
                 pid as usize,
-                nix::sys::event::EventFilter::EVFILT_PROC,
-                nix::sys::event::EventFlag::EV_ADD
-                    | nix::sys::event::EventFlag::EV_ENABLE
-                    | nix::sys::event::EventFlag::EV_ONESHOT
-                    | nix::sys::event::EventFlag::EV_ERROR,
-                nix::sys::event::FilterFlag::NOTE_EXITSTATUS,
+                event::EventFilter::EVFILT_PROC,
+                event::EventFlag::EV_ADD
+                    | event::EventFlag::EV_ENABLE
+                    | event::EventFlag::EV_ONESHOT
+                    | event::EventFlag::EV_ERROR,
+                event::FilterFlag::NOTE_EXITSTATUS,
                 0,
                 0,
             );
@@ -369,10 +350,7 @@ fn main() {
                 println!("{:#?}", kev)
             };
 
-            if eventlist[0]
-                .flags()
-                .contains(nix::sys::event::EventFlag::EV_ERROR)
-            {
+            if eventlist[0].flags().contains(event::EventFlag::EV_ERROR) {
                 if eventlist[0].data() == nix::Error::ESRCH as isize {
                     println!("PID {} not found", pid);
                 } else {

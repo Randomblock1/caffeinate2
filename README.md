@@ -90,7 +90,7 @@ This project is licensed under the [MIT License](LICENSE.txt).
 ## TODO
 
 - [x] Make timeout and PID work together
-- [ ] Figure out how to fake a tty (for example, `caffeinate2 brew list` is uncolored)
+- [x] Figure out how to fix command output (for example, `caffeinate2 brew list` is uncolored)
 - [ ] Document & experiemtn on all the sleep types (they are somewhat vague)
 - [x] Get system sleep status without reading a plist
 - [x] Get PID info & wait by using syscalls instead of a weird `lsof` hack
