@@ -7,7 +7,6 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process;
-use std::sync::mpsc::channel;
 use std::thread;
 
 fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
@@ -93,7 +92,7 @@ struct Args {
     #[arg(short = 'm', long)]
     disk: bool,
 
-    /// Disable idle system sleep. Default if no other options are specified.
+    /// Disable idle system sleep. [DEFAULT]
     #[arg(short = 'i', long)]
     system: bool,
 
@@ -115,7 +114,7 @@ struct Args {
     #[arg(short, long, name = "DURATION")]
     timeout: Option<String>,
 
-    /// Wait for program with PID X to complete.
+    /// Wait for program with PID X to complete and pass its exit code.
     #[arg(short, long, name = "PID")]
     waitfor: Option<i32>,
 
@@ -170,6 +169,11 @@ fn main() {
 
     if !cfg!(target_os = "macos") {
         panic!("This program only works on macOS.");
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        args.verbose = true;
     }
 
     if args.verbose {
@@ -269,9 +273,6 @@ fn main() {
         exit_code = child.wait().unwrap().code().unwrap_or(0);
     } else if args.timeout.is_some() || args.waitfor.is_some() {
         // If timeout or waitfor is used, wait appropriately
-        // TODO Major Refactor Needed: They can be used at the same time, but the code is a mess
-
-        let (sender, receiver) = channel();
 
         let mut duration = chrono::Duration::try_seconds(0).unwrap();
         let mut end_time = chrono::Local::now();
@@ -281,7 +282,8 @@ fn main() {
         if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            duration = chrono::Duration::try_seconds(parse_duration(args.timeout.unwrap())).unwrap();
+            duration =
+                chrono::Duration::try_seconds(parse_duration(args.timeout.unwrap())).unwrap();
             end_time += duration;
             let seconds = duration.num_seconds() % 60;
             let minutes = duration.num_minutes() % 60;
@@ -340,50 +342,58 @@ fn main() {
                     end_time.format(SHORT_FMT)
                 }
             );
-
-            // Spawn a new thread to handle the timeout
-            let timeout_sender = sender.clone();
-            thread::spawn(move || {
-                thread::sleep(duration.to_std().unwrap());
-                timeout_sender.send(0).unwrap();
-            });
+            thread::sleep(duration.to_std().unwrap());
         }
 
         if waitfor {
-            // Wait for PID to complete
             let pid = args.waitfor.unwrap();
 
-            let mut child = process::Command::new("lsof")
-                .arg("-p")
-                .arg(pid.to_string())
-                .arg("+r")
-                .arg("1")
-                .stdout(process::Stdio::null())
-                .stderr(process::Stdio::null())
-                .spawn()
-                .unwrap();
+            // wait without polling using kevent
+            let kq = nix::sys::event::Kqueue::new().unwrap();
+            let kev = nix::sys::event::KEvent::new(
+                pid as usize,
+                nix::sys::event::EventFilter::EVFILT_PROC,
+                nix::sys::event::EventFlag::EV_ADD
+                    | nix::sys::event::EventFlag::EV_ENABLE
+                    | nix::sys::event::EventFlag::EV_ONESHOT
+                    | nix::sys::event::EventFlag::EV_ERROR,
+                nix::sys::event::FilterFlag::NOTE_EXITSTATUS,
+                0,
+                0,
+            );
 
-            // Spawn a new thread to handle the timeout
-            let waitpid_sender = sender.clone();
-            thread::spawn(move || {
-                let status = child.wait().unwrap();
-                let exit_code;
+            let mut eventlist = [kev];
 
-                if status.code() == Some(1) {
-                    eprintln!("PID {} does not exist.", pid);
-                    exit_code = 1;
+            kq.kevent(&[kev], &mut eventlist, None).unwrap();
+            if args.verbose {
+                println!("{:#?}", kev)
+            };
+
+            if eventlist[0]
+                .flags()
+                .contains(nix::sys::event::EventFlag::EV_ERROR)
+            {
+                if eventlist[0].data() == nix::Error::ESRCH as isize {
+                    println!("PID {} not found", pid);
                 } else {
-                    print!("PID {pid} finished ");
-                    exit_code = 0;
-                    let now = chrono::Local::now();
-                    println!("{}", now.format(SHORT_FMT));
+                    eprintln!(
+                        "kevent error waiting for PID {}: {}",
+                        pid,
+                        nix::Error::from_raw(eventlist[0].data() as i32)
+                    );
                 }
-                waitpid_sender.send(exit_code).unwrap();
-            });
+                process::exit(1);
+            }
+
+            exit_code = eventlist[0].data() as i32;
+
+            print!("PID {pid} finished ");
+            let now = chrono::Local::now();
+            print!("{} ", now.format(SHORT_FMT));
+            println!("with exit code {}", exit_code);
         }
 
         // Wait for either the timeout or the process to finish
-        exit_code = receiver.recv().unwrap();
     } else {
         // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
         sleep_str += "until Ctrl+C pressed.";

@@ -1,6 +1,6 @@
 [package]
 name = "caffeinate2"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 authors = ["Randomblock1 <randomblock1@pm.me>"]
 description = "Caffeinate MacOS utility with more options. Temporarily prevent your system from sleeping."
@@ -16,10 +16,10 @@ default-run = "caffeinate2"
 
 [dependencies]
 chrono = { version = "0.4.38", features = ["alloc", "clock", "now", "std"] }
-clap = { version = "4.4.7", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.23", features = ["derive", "wrap_help"] }
 core-foundation = "0.10.0"
-libloading = "0.8.1"
-nix = { version = "0.29.0", features = ["user"] }
+libloading = "0.8.6"
+nix = { version = "0.29.0", features = ["user", "event"] }
 regex = { version = "1.10.2", default-features = false, features = ["std", "unicode-perl"] }
 signal-hook = "0.3.17"
 

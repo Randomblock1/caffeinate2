@@ -6,14 +6,13 @@
 
 ## Current Status
 
-In development. Works fine, but I want to add more features and document the different types of sleep before version
-1.0.0.
+Functionally complete. Only a few things left on the TODO before it's time for 1.0.0.
 
 ## Installation
 
 ### GitHub Releases
 
-Download the latest release from [here](https://github.com/randomblock1/caffeinate2/releases/latest).
+Download the latest release binary from [here](https://github.com/randomblock1/caffeinate2/releases/latest).
 
 ### Homebrew
 
@@ -34,15 +33,15 @@ Arguments:
 Options:
   -v, --verbose             Verbose mode
       --dry-run             Dry run. Don't actually sleep. Useful for testing
-      --drop-root           Drop root privileges in command. Some programs don't want to work as root, but you need root to disable sleep entirely
+      --drop-root           Drop root privileges in command. You need root to disable sleep entirely, but some programs don't want to run as root
   -d, --display             Disable display sleep
   -m, --disk                Disable disk idle sleep
-  -i, --system              Disable idle system sleep. Default if no other options are specified
+  -i, --system              Disable idle system sleep. [DEFAULT]
   -s, --system-on-ac        Disable system sleep while not on battery
   -e, --entirely            Disable system sleep entirely (ignores lid closing)
   -u, --user-active         Declare the user is active. If the display is off, this option turns it on and prevents it from going into idle sleep
   -t, --timeout <DURATION>  Wait for X seconds. Also supports time units (like "1 day 2 hours 3mins 4s")
-  -w, --waitfor <PID>       Wait for program with PID X to complete
+  -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
   -h, --help                Print help
   -V, --version             Print version
 ```
@@ -51,7 +50,7 @@ Options:
 
 ### Command
 
-Sleep disabled until the command completes. You should enclose the command in quotes, although sometimes it isn't
+Sleep disabled until the command completes. You should enclose the command in quotes, although it isn't strictly
 required. Timeout and PID will be ignored if a command is specified.
 
 `caffeinate2 "sleep 5"`
@@ -67,6 +66,9 @@ first letter (so "3 movies" is just 3 minutes). Anything that's not a number fol
 and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise, it will try to parse
 anything that's past the space as a command, and ignore the timeout.
 
+For PIDs, it will wait until the specified program exits. If the program doesn't exist, it will immediately exit with an
+error. Once the program completes, caffeinate2 will exit with the same exit code as the program.
+
 `caffeinate2 -t 600`
 
 `caffeinate2 -t "1 hour and 30 minutes"`
@@ -77,20 +79,18 @@ anything that's past the space as a command, and ignore the timeout.
 
 ### None of the above
 
-Sleep will be disabled until you press `Ctrl+C`.
+Sleep will be disabled indefinitely until you press `Ctrl+C`.
 
 `caffeinate2`
 
 ## License
 
-This project is licensed under the MIT License - see [the license file](LICENSE.txt) for details.
+This project is licensed under the [MIT License](LICENSE.txt).
 
 ## TODO
 
 - [x] Make timeout and PID work together
 - [ ] Figure out how to fake a tty (for example, `caffeinate2 brew list` is uncolored)
-- [ ] Print sleep types better
-- [ ] Document all the sleep types (they are somewhat vague)
+- [ ] Document & experiemtn on all the sleep types (they are somewhat vague)
 - [x] Get system sleep status without reading a plist
-- [x] Get PID info by using Grand Central Dispatch instead of a weird `lsof` hack - POSTPONED because it's a mess, and
-  it currently Just Works™️
+- [x] Get PID info & wait by using syscalls instead of a weird `lsof` hack
