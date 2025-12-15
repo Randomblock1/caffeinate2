@@ -11,7 +11,7 @@ fn main() {
 
     let sleep_arr = Arc::new(Mutex::new(Vec::new()));
 
-    let mut signals = Signals::new([SIGINT]).unwrap();
+    let mut signals = Signals::new([SIGINT]).expect("Failed to create signal iterator");
     let sleep_arr_clone = sleep_arr.clone();
     thread::spawn(move || {
         if signals.forever().next().is_some() {
@@ -29,14 +29,18 @@ fn main() {
         }
     });
 
+    // Detect sleep by measuring actual elapsed time vs expected sleep duration.
+    // If the system sleeps, the elapsed time will be much longer than requested.
     loop {
         let now = SystemTime::now();
 
         sleep(SLEEP_DURATION);
 
-        let elapsed = now.elapsed().unwrap();
+        let elapsed = match now.elapsed() {
+            Ok(e) => e,
+            Err(_) => continue, // system clock adjusted backwards
+        };
 
-        // Sleep function isn't exactly accurate, but if it's off by more than 2x, it's probably because computer slept
         if elapsed > SLEEP_THRESHOLD {
             let elapsed_secs = elapsed.as_secs();
             sleep_arr.lock().unwrap().push(elapsed_secs - SLEEP_TIME);

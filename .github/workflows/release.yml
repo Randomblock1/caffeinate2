@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
       - name: Get the version
         run: echo version=$(cargo pkgid | cut -d "#" -f2) >> $GITHUB_ENV
       - name: Build
@@ -19,7 +19,7 @@ jobs:
       - name: Compress
         run: tar -czvf caffeinate2-${{ env.version }}.tar.gz target/release/caffeinate2
       - name: Create a release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: ${{ env.version }}
           files: caffeinate2-${{ env.version }}.tar.gz

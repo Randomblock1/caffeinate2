@@ -7,65 +7,109 @@ use nix::{sys::event, unistd};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::os::unix::process::CommandExt;
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-fn set_assertions(iokit: &power_management::IOKit, args: &Args, state: bool) -> Vec<u32> {
+struct ActiveAssertions {
+    _assertions: Vec<power_management::PowerAssertion>,
+    _sleep_guard: Option<power_management::SleepDisabledGuard>,
+}
+
+fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     if args.dry_run {
-        // Don't actually sleep
-        return Vec::new();
+        return ActiveAssertions {
+            _assertions: Vec::new(),
+            _sleep_guard: None,
+        };
     }
 
-    if args.entirely {
+    let sleep_guard = if args.entirely {
         // Prevents the system from sleeping entirely.
-        iokit.set_sleep_disabled(true).unwrap_or_else(|_| {
-            eprintln!("Error: Insufficient privileges to disable sleep. Try running with sudo.");
-            process::exit(1);
-        });
-    }
+        match power_management::disable_sleep(args.verbose) {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                eprintln!(
+                    "Error: Insufficient privileges to disable sleep. Try running with sudo."
+                );
+                process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let mut assertions = Vec::new();
+
+    let mut add_assertion =
+        |result: Result<power_management::PowerAssertion, u32>, name: &str| match result {
+            Ok(assertion) => assertions.push(assertion),
+            Err(code) => {
+                eprintln!(
+                    "Error: Failed to create {} assertion (code: {:X})",
+                    name, code
+                );
+                process::exit(1);
+            }
+        };
+
     if args.display {
-        // Prevents the display from dimming automatically.
-        assertions.push(iokit.create_assertion("PreventUserIdleDisplaySleep", state));
+        add_assertion(
+            power_management::create_assertion(
+                power_management::AssertionType::PreventUserIdleDisplaySleep,
+                state,
+                args.verbose,
+            ),
+            "display sleep",
+        );
     }
     if args.disk {
-        // Prevents the disk from stopping when idle.
-        assertions.push(iokit.create_assertion("PreventDiskIdle", state));
+        add_assertion(
+            power_management::create_assertion(
+                power_management::AssertionType::PreventDiskIdle,
+                state,
+                args.verbose,
+            ),
+            "disk idle",
+        );
     }
     if args.system {
-        // Prevents the system from sleeping automatically.
-        assertions.push(iokit.create_assertion("PreventUserIdleSystemSleep", state));
+        add_assertion(
+            power_management::create_assertion(
+                power_management::AssertionType::PreventUserIdleSystemSleep,
+                state,
+                args.verbose,
+            ),
+            "system sleep",
+        );
     }
     if args.system_on_ac {
-        // Prevents the system from sleeping when on AC power.
-        assertions.push(iokit.create_assertion("PreventSystemSleep", state));
+        add_assertion(
+            power_management::create_assertion(
+                power_management::AssertionType::PreventSystemSleep,
+                state,
+                args.verbose,
+            ),
+            "system sleep on AC",
+        );
     }
 
     if args.user_active {
-        // Declares the user is active.
-        assertions.push(iokit.declare_user_activity(true));
+        add_assertion(
+            power_management::declare_user_activity(true, args.verbose),
+            "user activity",
+        );
     }
 
     if args.verbose {
-        println!("Assertions: {:?}", assertions);
+        println!("Assertions created");
     }
 
-    assertions
-}
-
-fn release_assertions(iokit: &power_management::IOKit, assertions: &Vec<u32>) {
-    for assertion in assertions {
-        iokit.release_assertion(*assertion);
-    }
-    if power_management::IOKit::get_sleep_disabled(iokit) {
-        iokit.set_sleep_disabled(false).unwrap_or_else(|_| {
-            eprintln!("Error: Insufficient privileges to disable sleep. Try running with sudo.");
-            process::exit(1);
-        });
+    ActiveAssertions {
+        _assertions: assertions,
+        _sleep_guard: sleep_guard,
     }
 }
 
-/// Clap args
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -123,35 +167,29 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-fn parse_duration(duration: String) -> i64 {
-    // Use regex to split the duration into a bunch of number and unit pairs
-    let mut total_seconds = 0;
-    let re = regex::Regex::new(r"(\d+)\s*([smhd])").expect("Invalid regex");
+fn parse_duration(duration: String) -> chrono::Duration {
+    let duration = duration.trim();
 
-    for captures in re.captures_iter(&duration) {
-        let number = captures[1]
-            .parse::<i64>()
-            .unwrap_or_else(|_| panic!("Invalid timeout"));
-        let unit = &captures[2];
-
-        match unit {
-            "s" => total_seconds += number,
-            "m" => total_seconds += number * 60,
-            "h" => total_seconds += number * 3600,
-            "d" => total_seconds += number * 86400,
-            _ => panic!("Invalid duration"),
+    match humantime::parse_duration(duration) {
+        Ok(std_duration) => chrono::Duration::from_std(std_duration).unwrap_or_else(|_| {
+            eprintln!("Error: Timeout is too large!");
+            process::exit(1)
+        }),
+        Err(_) => {
+            let seconds = duration.parse::<u64>().unwrap_or_else(|_| {
+                eprintln!("Error: Timeout isn't a valid duration or number!");
+                process::exit(1)
+            });
+            chrono::Duration::try_seconds(seconds.try_into().unwrap_or_else(|_| {
+                eprintln!("Error: Timeout is too large!");
+                process::exit(1)
+            }))
+            .unwrap_or_else(|| {
+                eprintln!("Error: Timeout is too large!");
+                process::exit(1)
+            })
         }
     }
-
-    // If no units were specified, assume seconds
-    if total_seconds == 0 {
-        total_seconds = duration.parse().unwrap_or_else(|_| {
-            eprintln!("Error: Timeout isn't a valid duration or number!");
-            process::exit(1)
-        });
-    }
-
-    total_seconds
 }
 
 fn main() {
@@ -179,7 +217,6 @@ fn main() {
 
     sleep_str += "[ ";
 
-    // Print types of sleep prevented
     if args.display {
         sleep_str += "Display ";
     }
@@ -200,24 +237,23 @@ fn main() {
     }
     sleep_str += "] ";
 
-    let iokit = power_management::IOKit::new();
-    let assertions = set_assertions(&iokit, &args, true);
+    let assertions = Arc::new(Mutex::new(Some(set_assertions(&args, true))));
+    let assertions_clone = assertions.clone();
 
     let mut exit_code = 0;
 
     let mut signals = Signals::new([SIGINT]).expect("Failed to create signal iterator");
-    let assertions_clone = assertions.clone();
     thread::spawn(move || {
         if signals.forever().next().is_some() {
-            release_assertions(&power_management::IOKit::new(), &assertions_clone);
+            println!("\nStopping...");
+            if let Ok(mut guard) = assertions_clone.lock() {
+                let _ = guard.take();
+            }
             process::exit(exit_code);
         }
     });
 
-    if args.command.is_some() {
-        // If command is passed, it takes priority over everything else
-        let command = args.command.unwrap();
-        // Disable sleep while running the given command
+    if let Some(command) = args.command {
         sleep_str += "until command finishes.";
         println!("{sleep_str}");
 
@@ -267,8 +303,7 @@ fn main() {
         if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            duration =
-                chrono::Duration::try_seconds(parse_duration(args.timeout.unwrap())).unwrap();
+            duration = parse_duration(args.timeout.expect("Timeout should be present"));
             end_time += duration;
             let seconds = duration.num_seconds() % 60;
             let minutes = duration.num_minutes() % 60;
@@ -310,7 +345,10 @@ fn main() {
             print!(" or ");
         }
         if waitfor {
-            print!("until PID {} finishes", args.waitfor.unwrap());
+            print!(
+                "until PID {} finishes",
+                args.waitfor.expect("PID should be present")
+            );
         }
         println!(".");
 
@@ -327,14 +365,14 @@ fn main() {
                     end_time.format(SHORT_FMT)
                 }
             );
-            thread::sleep(duration.to_std().unwrap());
+            thread::sleep(duration.to_std().expect("Duration should be valid"));
         }
 
         if waitfor {
-            let pid = args.waitfor.unwrap();
+            let pid = args.waitfor.expect("PID should be present");
 
             // wait without polling using kevent
-            let kq = event::Kqueue::new().unwrap();
+            let kq = event::Kqueue::new().expect("Failed to create Kqueue");
             let kev = event::KEvent::new(
                 pid as usize,
                 event::EventFilter::EVFILT_PROC,
@@ -349,7 +387,8 @@ fn main() {
 
             let mut eventlist = [kev];
 
-            kq.kevent(&[kev], &mut eventlist, None).unwrap();
+            kq.kevent(&[kev], &mut eventlist, None)
+                .expect("Failed to register Kqueue event");
             if args.verbose {
                 println!("{:#?}", kev)
             };
@@ -374,15 +413,15 @@ fn main() {
             print!("{} ", now.format(SHORT_FMT));
             println!("with exit code {}", exit_code);
         }
-
-        // Wait for either the timeout or the process to finish
     } else {
         // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
         sleep_str += "until Ctrl+C pressed.";
         println!("{}", sleep_str);
         thread::park();
     }
-    release_assertions(&iokit, &assertions);
+    if let Ok(mut guard) = assertions.lock() {
+        let _ = guard.take();
+    }
     process::exit(exit_code);
 }
 
@@ -390,20 +429,127 @@ fn main() {
 mod tests {
     #[test]
     fn test_parse_duration() {
-        let duration = "1d2h3m4s".to_string();
+        let duration = "1d 2h 3m 4s".to_string();
         let result = super::parse_duration(duration);
-        assert_eq!(result, 93784);
+        assert_eq!(result.num_seconds(), 93784);
 
-        let duration = "1day 2hrs3m".to_string();
+        let duration = "1day 2h 3m".to_string();
         let result = super::parse_duration(duration);
-        assert_eq!(result, 93780);
+        assert_eq!(result.num_seconds(), 93780);
 
-        let duration = "3 minutes 17 hours 2 seconds".to_string();
+        let duration = "3min 17h 2s".to_string();
         let result = super::parse_duration(duration);
-        assert_eq!(result, 61382);
+        assert_eq!(result.num_seconds(), 61382);
 
         let duration = "45323".to_string();
         let result = super::parse_duration(duration);
-        assert_eq!(result, 45323);
+        assert_eq!(result.num_seconds(), 45323);
+    }
+
+    #[test]
+    fn test_parse_duration_edge_cases() {
+        // Test 0
+        let duration = "0s".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result.num_seconds(), 0);
+
+        // Test large number
+        let duration = "1000000s".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result.num_seconds(), 1000000);
+
+        // Test just number
+        let duration = "60".to_string();
+        let result = super::parse_duration(duration);
+        assert_eq!(result.num_seconds(), 60);
+    }
+
+    #[test]
+    fn test_set_assertions_dry_run() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: true,
+            drop_root: false,
+            display: true,
+            disk: true,
+            system: true,
+            system_on_ac: true,
+            entirely: true,
+            user_active: true,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let assertions = super::set_assertions(&args, true);
+        assert!(assertions._assertions.is_empty());
+        assert!(assertions._sleep_guard.is_none());
+    }
+
+    #[test]
+    fn test_set_assertions_display() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: false,
+            drop_root: false,
+            display: true,
+            disk: false,
+            system: false,
+            system_on_ac: false,
+            entirely: false,
+            user_active: false,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let assertions = super::set_assertions(&args, true);
+        assert_eq!(assertions._assertions.len(), 1);
+        assert!(assertions._sleep_guard.is_none());
+    }
+
+    #[test]
+    fn test_set_assertions_multiple_flags() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: false,
+            drop_root: false,
+            display: true,
+            disk: true,
+            system: true,
+            system_on_ac: false,
+            entirely: false,
+            user_active: false,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let assertions = super::set_assertions(&args, true);
+        // Should have 3 assertions: display, disk, system
+        assert_eq!(assertions._assertions.len(), 3);
+        assert!(assertions._sleep_guard.is_none());
+    }
+
+    #[test]
+    fn test_set_assertions_system_on_ac() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: false,
+            drop_root: false,
+            display: false,
+            disk: false,
+            system: false,
+            system_on_ac: true,
+            entirely: false,
+            user_active: false,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let assertions = super::set_assertions(&args, true);
+        assert_eq!(assertions._assertions.len(), 1);
+        assert!(assertions._sleep_guard.is_none());
     }
 }

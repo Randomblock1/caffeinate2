@@ -1,171 +1,179 @@
-use core_foundation::base::{TCFType, TCFTypeRef};
-use core_foundation::boolean::CFBoolean;
-use core_foundation::dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef};
-use core_foundation::number::CFBooleanRef;
-use core_foundation::string::{CFString, CFStringRef};
-use libloading::{Library, Symbol};
-use std::mem::MaybeUninit;
+#![allow(non_upper_case_globals)]
+use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue};
+use objc2_io_kit::{
+    IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionRelease,
+    IOPMUserActiveType, kIOPMAssertionLevelOff, kIOPMAssertionLevelOn, kIOReturnBadArgument,
+    kIOReturnNotFound, kIOReturnNotPrivileged,
+};
+use std::{fmt, mem::MaybeUninit};
 
-// constants
-type IOPMAssertionID = u32;
-type IOPMAssertionLevel = u32;
-const IOPMASSERTION_LEVEL_ON: u32 = 255;
-const IOPMASSERTION_LEVEL_OFF: u32 = 0;
-
-// global variables
-pub struct IOKit {
-    library: Library,
-    assertion_name: CFString,
+// Missing functions from objc2-io-kit
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> u32;
 }
 
-// functions
-impl IOKit {
-    pub fn new() -> IOKit {
-        let library =
-            unsafe { Library::new("/System/Library/Frameworks/IOKit.framework/IOKit").unwrap() };
-        let assertion_name = CFString::new("caffeinate2");
-        IOKit {
-            library,
-            assertion_name,
+#[derive(Copy, Clone)]
+pub enum AssertionType {
+    PreventUserIdleDisplaySleep,
+    PreventDiskIdle,
+    PreventUserIdleSystemSleep,
+    PreventSystemSleep,
+}
+
+impl AssertionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssertionType::PreventUserIdleDisplaySleep => "PreventUserIdleDisplaySleep",
+            AssertionType::PreventDiskIdle => "PreventDiskIdle",
+            AssertionType::PreventUserIdleSystemSleep => "PreventUserIdleSystemSleep",
+            AssertionType::PreventSystemSleep => "PreventSystemSleep",
         }
     }
+}
 
-    fn iopm_copy_power_settings(&self) -> CFDictionaryRef {
-        let iokit = &self.library;
-        let iopm_copy_power_settings: Symbol<unsafe extern "C" fn() -> CFDictionaryRef> =
-            unsafe { iokit.get(b"IOPMCopySystemPowerSettings") }.unwrap();
-        unsafe { iopm_copy_power_settings() }
+impl fmt::Display for AssertionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
+}
 
-    pub fn create_assertion(&self, assertion_type: &str, state: bool) -> u32 {
-        let iokit = &self.library;
-        let iopmassertion_create_with_name: Symbol<
-            unsafe extern "C" fn(
-                CFStringRef,
-                IOPMAssertionLevel,
-                CFStringRef,
-                *mut IOPMAssertionID,
-            ) -> i32,
-        > = unsafe { iokit.get(b"IOPMAssertionCreateWithName") }.unwrap();
-        let type_ = CFString::new(assertion_type);
-        let level = if state {
-            IOPMASSERTION_LEVEL_ON
-        } else {
-            IOPMASSERTION_LEVEL_OFF
-        };
-        let id = {
-            let mut id = MaybeUninit::uninit();
-            let status = unsafe {
-                iopmassertion_create_with_name(
-                    type_.as_concrete_TypeRef(),
-                    level,
-                    self.assertion_name.as_concrete_TypeRef(),
-                    id.as_mut_ptr(),
-                )
-            };
-            if status == 0 {
-                unsafe { id.assume_init() }
-            } else {
-                panic!(
-                    "Failed to create power management assertion with code: {:X}",
-                    status
-                );
-            }
-        };
+pub struct PowerAssertion {
+    id: u32,
+    verbose: bool,
+}
 
-        #[cfg(debug_assertions)]
-        println!(
-            "Successfully created power management assertion with ID: {}",
-            id
-        );
-
-        id
+impl Drop for PowerAssertion {
+    fn drop(&mut self) {
+        release_assertion(self.id, self.verbose);
     }
+}
 
-    pub fn release_assertion(&self, assertion_id: u32) {
-        let iokit = &self.library;
-        let iopmassertion_release: Symbol<unsafe extern "C" fn(IOPMAssertionID) -> u32> =
-            unsafe { iokit.get(b"IOPMAssertionRelease") }.unwrap();
+pub fn create_assertion(
+    assertion_type: AssertionType,
+    state: bool,
+    verbose: bool,
+) -> Result<PowerAssertion, u32> {
+    let assertion_name = CFString::from_str("caffeinate2");
+    let type_ = CFString::from_str(assertion_type.as_str());
+    let level = if state {
+        kIOPMAssertionLevelOn
+    } else {
+        kIOPMAssertionLevelOff
+    };
+    let mut id = MaybeUninit::uninit();
 
-        #[cfg(debug_assertions)]
+    let status = unsafe {
+        IOPMAssertionCreateWithName(Some(&type_), level, Some(&assertion_name), id.as_mut_ptr())
+    };
+
+    if status == 0 {
+        let id = unsafe { id.assume_init() };
+        if verbose {
+            println!(
+                "Successfully created power management assertion with ID: {}",
+                id
+            );
+        }
+        Ok(PowerAssertion { id, verbose })
+    } else {
+        Err(status as u32)
+    }
+}
+
+fn release_assertion(assertion_id: u32, verbose: bool) {
+    if verbose {
         println!(
             "Releasing power management assertion with ID: {}",
             assertion_id
         );
+    }
 
-        let status = unsafe { iopmassertion_release(assertion_id) };
+    let status = IOPMAssertionRelease(assertion_id) as u32;
 
-        match status {
-            0 => {
-                #[cfg(debug_assertions)]
+    match status {
+        0 => {
+            if verbose {
                 println!(
                     "Successfully released power management assertion with ID: {}",
                     assertion_id
                 );
             }
-            0xE00002C2 => {
-                #[cfg(debug_assertions)]
+        }
+        kIOReturnNotFound => {
+            if verbose {
                 println!("Assertion {} already released", assertion_id);
             }
-            _ => panic!(
+        }
+        kIOReturnBadArgument => {
+            if verbose {
+                println!("Assertion {} was invalid", assertion_id);
+            }
+        }
+        _ => {
+            eprintln!(
                 "Failed to release power management assertion with code: {:X}",
                 status
-            ),
+            );
         }
     }
+}
 
-    pub fn declare_user_activity(&self, state: bool) -> u32 {
-        let iokit = &self.library;
-        let iopmassertion_declare_user_activity: Symbol<
-            unsafe extern "C" fn(CFStringRef, IOPMAssertionLevel, *mut IOPMAssertionID) -> i32,
-        > = unsafe { iokit.get(b"IOPMAssertionDeclareUserActivity") }.unwrap();
+pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertion, u32> {
+    let assertion_name = CFString::from_str("caffeinate2");
+    let level = if state {
+        kIOPMAssertionLevelOn
+    } else {
+        kIOPMAssertionLevelOff
+    };
 
-        let level = if state {
-            IOPMASSERTION_LEVEL_ON
-        } else {
-            IOPMASSERTION_LEVEL_OFF
-        };
+    let mut id = MaybeUninit::uninit();
 
-        let mut id = MaybeUninit::uninit();
-        let status = unsafe {
-            iopmassertion_declare_user_activity(
-                self.assertion_name.as_concrete_TypeRef(),
-                level,
-                id.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            panic!("Failed to declare user activity with code: {:X}", status);
-        }
+    let level_typed: IOPMUserActiveType = unsafe { std::mem::transmute(level) };
 
-        let id = unsafe { id.assume_init() };
+    let status = unsafe {
+        IOPMAssertionDeclareUserActivity(Some(&assertion_name), level_typed, id.as_mut_ptr())
+    };
+    if status != 0 {
+        return Err(status as u32);
+    }
 
-        #[cfg(debug_assertions)]
+    let id = unsafe { id.assume_init() };
+
+    if verbose {
         println!("Successfully declared user activity with ID: {}", id);
-
-        id
     }
 
-    pub fn set_sleep_disabled(&self, sleep_disabled: bool) -> Result<(), u32> {
-        let iokit = &self.library;
-        let iopm_set_system_power_setting: libloading::Symbol<
-            unsafe extern "C" fn(CFString, CFBoolean) -> u32,
-        > = unsafe { iokit.get(b"IOPMSetSystemPowerSetting").unwrap() };
+    Ok(PowerAssertion { id, verbose })
+}
 
-        let sleep_disabled_bool = if sleep_disabled {
-            CFBoolean::true_value()
-        } else {
-            CFBoolean::false_value()
-        };
+pub struct SleepDisabledGuard {
+    verbose: bool,
+}
 
-        let result = unsafe {
-            iopm_set_system_power_setting(
-                CFString::from_static_string("SleepDisabled"),
-                sleep_disabled_bool,
-            )
-        };
+impl Drop for SleepDisabledGuard {
+    fn drop(&mut self) {
+        let _ = set_sleep_disabled(false, self.verbose);
+    }
+}
 
-        #[cfg(debug_assertions)]
+pub fn disable_sleep(verbose: bool) -> Result<SleepDisabledGuard, u32> {
+    set_sleep_disabled(true, verbose)?;
+    Ok(SleepDisabledGuard { verbose })
+}
+
+pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
+    let sleep_disabled_bool = if sleep_disabled {
+        unsafe { kCFBooleanTrue.unwrap() }
+    } else {
+        unsafe { kCFBooleanFalse.unwrap() }
+    };
+
+    let key = CFString::from_str("SleepDisabled");
+
+    let result = unsafe { IOPMSetSystemPowerSetting(&key, sleep_disabled_bool) };
+
+    if verbose {
         println!(
             "Got result {:X} when {} sleep",
             result,
@@ -175,37 +183,91 @@ impl IOKit {
                 "enabling"
             }
         );
+    }
 
-        // See IOKit/IOReturn.h for error codes.
-        if result == 0 {
-            // Success
-            Ok(())
-        } else if result == 0xE00002C1 {
-            // Insufficient privileges
-            Err(result)
-        } else {
-            panic!(
-                "Error: Failed to modify system sleep with code: {:X}",
-                result
-            );
+    if result == 0 {
+        Ok(())
+    } else if result == kIOReturnNotPrivileged {
+        Err(result as u32)
+    } else {
+        Err(result as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_assertion() {
+        // Test creating a valid assertion
+        let assertion =
+            create_assertion(AssertionType::PreventUserIdleSystemSleep, true, true).unwrap();
+        // The ID is a u32, usually non-zero if successful, but the function panics on failure.
+        // So if we get here, it worked.
+        println!("Created assertion with ID: {}", assertion.id);
+    }
+
+    #[test]
+    fn test_declare_user_activity() {
+        let assertion = declare_user_activity(true, true).unwrap();
+        println!("Declared user activity with ID: {}", assertion.id);
+    }
+
+    #[test]
+    fn test_disable_sleep() {
+        // This requires root privileges usually, so we expect it to either succeed or fail with kIOReturnNotPrivileged
+        match disable_sleep(true) {
+            Ok(guard) => {
+                println!("Successfully disabled sleep");
+                drop(guard); // Should re-enable sleep
+            }
+            Err(code) => {
+                if code == kIOReturnNotPrivileged {
+                    println!(
+                        "Insufficient privileges to disable sleep (expected in non-root tests)"
+                    );
+                } else {
+                    panic!("Failed to disable sleep with unexpected code: {:X}", code);
+                }
+            }
         }
     }
 
-    pub fn get_sleep_disabled(&self) -> bool {
-        let mut ptr: *const std::os::raw::c_void = std::ptr::null();
+    #[test]
+    fn test_release_assertion_invalid_id() {
+        // Releasing an invalid ID should not panic, but print a message if verbose is true
+        release_assertion(u32::MAX, true);
+    }
 
-        let result = unsafe {
-            CFDictionaryGetValueIfPresent(
-                self.iopm_copy_power_settings(),
-                CFString::new("SleepDisabled").as_CFTypeRef().as_void_ptr(),
-                &mut ptr,
-            )
-        };
+    #[test]
+    fn test_assertion_lifecycle() {
+        let assertion =
+            create_assertion(AssertionType::PreventUserIdleSystemSleep, true, false).unwrap();
+        let id = assertion.id;
+        // Explicitly drop the assertion to trigger release
+        drop(assertion);
 
-        if result == 0 {
-            panic!("Failed to get SleepDisabled value!");
+        // Try to release it again manually. This should not panic and should handle the "already released" case.
+        // This verifies that the drop implementation correctly released it, or at least that release_assertion is robust.
+        release_assertion(id, true);
+    }
+
+    #[test]
+    fn test_create_all_known_assertion_types() {
+        let types = [
+            AssertionType::PreventUserIdleDisplaySleep,
+            AssertionType::PreventDiskIdle,
+            AssertionType::PreventUserIdleSystemSleep,
+            AssertionType::PreventSystemSleep,
+        ];
+
+        for assertion_type in types {
+            let assertion = create_assertion(assertion_type, true, false).unwrap();
+            println!(
+                "Successfully created assertion type: {} with ID: {}",
+                assertion_type, assertion.id
+            );
         }
-
-        ptr as CFBooleanRef == unsafe { core_foundation::number::kCFBooleanTrue }
     }
 }

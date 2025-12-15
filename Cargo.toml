@@ -1,6 +1,6 @@
 [package]
 name = "caffeinate2"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Randomblock1 <randomblock1@pm.me>"]
 description = "Caffeinate MacOS utility with more options. Temporarily prevent your system from sleeping."
@@ -12,15 +12,14 @@ keywords = ["macos", "utility", "caffeinate"]
 categories = ["command-line-utilities"]
 default-run = "caffeinate2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 chrono = { version = "0.4", features = ["alloc", "clock", "now", "std"] }
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
-core-foundation = "0.10"
-libloading = "0.9"
+humantime = "2.3"
 nix = { version = "0.30", features = ["user", "event"] }
-regex = { version = "1.12", default-features = false, features = ["std", "unicode-perl"] }
+objc2 = "0.6"
+objc2-core-foundation = "0.3.2"
+objc2-io-kit = "0.3"
 signal-hook = "0.3"
 
 [[bin]]
