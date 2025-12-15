@@ -126,12 +126,12 @@ struct Args {
 fn parse_duration(duration: String) -> i64 {
     // Use regex to split the duration into a bunch of number and unit pairs
     let mut total_seconds = 0;
-    let re = regex::Regex::new(r"(\d+)\s*(s|m|h|d)").unwrap();
+    let re = regex::Regex::new(r"(\d+)\s*([smhd])").expect("Invalid regex");
 
     for captures in re.captures_iter(&duration) {
         let number = captures[1]
             .parse::<i64>()
-            .unwrap_or_else(|_| panic!("invalid timeout"));
+            .unwrap_or_else(|_| panic!("Invalid timeout"));
         let unit = &captures[2];
 
         match unit {
@@ -139,7 +139,7 @@ fn parse_duration(duration: String) -> i64 {
             "m" => total_seconds += number * 60,
             "h" => total_seconds += number * 3600,
             "d" => total_seconds += number * 86400,
-            _ => panic!("invalid duration"),
+            _ => panic!("Invalid duration"),
         }
     }
 
@@ -205,7 +205,7 @@ fn main() {
 
     let mut exit_code = 0;
 
-    let mut signals = Signals::new([SIGINT]).unwrap();
+    let mut signals = Signals::new([SIGINT]).expect("Failed to create signal iterator");
     let assertions_clone = assertions.clone();
     thread::spawn(move || {
         if signals.forever().next().is_some() {
@@ -230,8 +230,8 @@ fn main() {
             let gid_str =
                 std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
 
-            uid = uid_str.parse::<u32>().unwrap();
-            gid = gid_str.parse::<u32>().unwrap();
+            uid = uid_str.parse::<u32>().expect("Invalid UID");
+            gid = gid_str.parse::<u32>().expect("Invalid GID");
         } else {
             uid = unistd::getuid().into();
             gid = unistd::getgid().into();
@@ -249,9 +249,13 @@ fn main() {
             .uid(uid)
             .gid(gid)
             .spawn()
-            .unwrap();
+            .expect("Failed to execute command");
 
-        exit_code = child.wait().unwrap().code().unwrap_or(0);
+        exit_code = child
+            .wait()
+            .expect("Command wasn't running")
+            .code()
+            .unwrap_or(0);
     } else if args.timeout.is_some() || args.waitfor.is_some() {
         // If timeout or waitfor is used, wait appropriately
 
@@ -334,10 +338,10 @@ fn main() {
             let kev = event::KEvent::new(
                 pid as usize,
                 event::EventFilter::EVFILT_PROC,
-                event::EventFlag::EV_ADD
-                    | event::EventFlag::EV_ENABLE
-                    | event::EventFlag::EV_ONESHOT
-                    | event::EventFlag::EV_ERROR,
+                event::EvFlags::EV_ADD
+                    | event::EvFlags::EV_ENABLE
+                    | event::EvFlags::EV_ONESHOT
+                    | event::EvFlags::EV_ERROR,
                 event::FilterFlag::NOTE_EXITSTATUS,
                 0,
                 0,
@@ -350,7 +354,7 @@ fn main() {
                 println!("{:#?}", kev)
             };
 
-            if eventlist[0].flags().contains(event::EventFlag::EV_ERROR) {
+            if eventlist[0].flags().contains(event::EvFlags::EV_ERROR) {
                 if eventlist[0].data() == nix::Error::ESRCH as isize {
                     println!("PID {} not found", pid);
                 } else {

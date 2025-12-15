@@ -50,10 +50,9 @@ Options:
 
 ### Command
 
-Sleep disabled until the command completes. You should enclose the command in quotes, although it isn't strictly
-required. Timeout and PID will be ignored if a command is specified.
+Sleep disabled until the command completes. You should enclose the command in quotes to prevent your shell from prematurely executing or piping it, although it isn't strictly required. Timeout and PID will be ignored if a command is specified.
 
-`caffeinate2 "sleep 5"`
+`caffeinate2 'sleep 5'`
 
 ### Timeout and PID
 
@@ -91,6 +90,6 @@ This project is licensed under the [MIT License](LICENSE.txt).
 
 - [x] Make timeout and PID work together
 - [x] Figure out how to fix command output (for example, `caffeinate2 brew list` is uncolored)
-- [ ] Document & experiemtn on all the sleep types (they are somewhat vague)
+- [ ] Document & experiment on all the sleep types (they are somewhat vague)
 - [x] Get system sleep status without reading a plist
 - [x] Get PID info & wait by using syscalls instead of a weird `lsof` hack
