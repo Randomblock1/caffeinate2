@@ -6,13 +6,13 @@
 
 ## Current Status
 
-Functionally complete. Only a few things left on the TODO before it's time for 1.0.0.
+Almost ready for 1.0.0.
 
 ## Installation
 
 ### GitHub Releases
 
-Download the latest release binary from [here](https://github.com/randomblock1/caffeinate2/releases/latest).
+Download the latest release binary from [the releases page](https://github.com/randomblock1/caffeinate2/releases/latest).
 
 ### Homebrew
 
@@ -85,11 +85,3 @@ Sleep will be disabled indefinitely until you press `Ctrl+C`.
 ## License
 
 This project is licensed under the [MIT License](LICENSE.txt).
-
-## TODO
-
-- [x] Make timeout and PID work together
-- [x] Figure out how to fix command output (for example, `caffeinate2 brew list` is uncolored)
-- [ ] Document & experiment on all the sleep types (they are somewhat vague)
-- [x] Get system sleep status without reading a plist
-- [x] Get PID info & wait by using syscalls instead of a weird `lsof` hack

@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 
-mod power_management;
+pub mod power_management;
+pub mod process_lock;
 
 use clap::Parser;
 use nix::{sys::event, unistd};
@@ -12,7 +13,7 @@ use std::thread;
 
 struct ActiveAssertions {
     _assertions: Vec<power_management::PowerAssertion>,
-    _sleep_guard: Option<power_management::SleepDisabledGuard>,
+    _sleep_guard: Option<process_lock::ProcessLock>,
 }
 
 fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
@@ -24,12 +25,12 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 
     let sleep_guard = if args.entirely {
-        // Prevents the system from sleeping entirely.
-        match power_management::disable_sleep(args.verbose) {
+        match process_lock::ProcessLock::new(args.verbose) {
             Ok(guard) => Some(guard),
-            Err(_) => {
+            Err(e) => {
                 eprintln!(
-                    "Error: Insufficient privileges to disable sleep. Try running with sudo."
+                    "Error: Failed to acquire process lock or disable sleep: {}",
+                    e
                 );
                 process::exit(1);
             }
