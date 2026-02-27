@@ -11,6 +11,7 @@ use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[derive(Debug)]
 struct ActiveAssertions {
     _assertions: Vec<power_management::PowerAssertion>,
     _sleep_guard: Option<process_lock::ProcessLock>,

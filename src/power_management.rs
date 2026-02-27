@@ -38,6 +38,7 @@ impl fmt::Display for AssertionType {
     }
 }
 
+#[derive(Debug)]
 pub struct PowerAssertion {
     id: u32,
     verbose: bool,

@@ -9,6 +9,7 @@ use std::path::Path;
 
 const LOCK_FILE_PATH: &str = "/tmp/caffeinate2.lock";
 
+#[derive(Debug)]
 pub struct ProcessLock {
     verbose: bool,
     test_mode: bool,
