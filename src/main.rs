@@ -2,6 +2,7 @@
 
 pub mod power_management;
 pub mod process_lock;
+pub mod duration_parser;
 
 use clap::Parser;
 use nix::{sys::event, unistd};
@@ -168,31 +169,6 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-fn parse_duration(duration: String) -> chrono::Duration {
-    let duration = duration.trim();
-
-    match humantime::parse_duration(duration) {
-        Ok(std_duration) => chrono::Duration::from_std(std_duration).unwrap_or_else(|_| {
-            eprintln!("Error: Timeout is too large!");
-            process::exit(1)
-        }),
-        Err(_) => {
-            let seconds = duration.parse::<u64>().unwrap_or_else(|_| {
-                eprintln!("Error: Timeout isn't a valid duration or number!");
-                process::exit(1)
-            });
-            chrono::Duration::try_seconds(seconds.try_into().unwrap_or_else(|_| {
-                eprintln!("Error: Timeout is too large!");
-                process::exit(1)
-            }))
-            .unwrap_or_else(|| {
-                eprintln!("Error: Timeout is too large!");
-                process::exit(1)
-            })
-        }
-    }
-}
-
 fn main() {
     let mut args = Args::parse();
     if !(args.display
@@ -304,7 +280,13 @@ fn main() {
         if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            duration = parse_duration(args.timeout.expect("Timeout should be present"));
+            match duration_parser::parse_duration(&args.timeout.expect("Timeout should be present")) {
+                Ok(d) => duration = d,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
             end_time += duration;
             let seconds = duration.num_seconds() % 60;
             let minutes = duration.num_minutes() % 60;
@@ -428,43 +410,6 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_parse_duration() {
-        let duration = "1d 2h 3m 4s".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 93784);
-
-        let duration = "1day 2h 3m".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 93780);
-
-        let duration = "3min 17h 2s".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 61382);
-
-        let duration = "45323".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 45323);
-    }
-
-    #[test]
-    fn test_parse_duration_edge_cases() {
-        // Test 0
-        let duration = "0s".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 0);
-
-        // Test large number
-        let duration = "1000000s".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 1000000);
-
-        // Test just number
-        let duration = "60".to_string();
-        let result = super::parse_duration(duration);
-        assert_eq!(result.num_seconds(), 60);
-    }
-
     #[test]
     fn test_set_assertions_dry_run() {
         let args = super::Args {
