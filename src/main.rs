@@ -205,29 +205,28 @@ fn main() {
         println!("DEBUG {:#?}", &args);
     }
 
-    let mut sleep_str = "Preventing sleep types: ".to_string();
-
-    sleep_str += "[ ";
+    let mut sleep_types = Vec::new();
 
     if args.display {
-        sleep_str += "Display ";
+        sleep_types.push("Display");
     }
     if args.disk {
-        sleep_str += "Disk ";
+        sleep_types.push("Disk");
     }
     if args.system {
-        sleep_str += "System ";
+        sleep_types.push("System");
     }
     if args.system_on_ac {
-        sleep_str += "System (if on AC) ";
+        sleep_types.push("System (if on AC)");
     }
     if args.entirely {
-        sleep_str += "Entirely ";
+        sleep_types.push("Entirely");
     }
     if args.user_active {
-        sleep_str += "User active ";
+        sleep_types.push("User active");
     }
-    sleep_str += "] ";
+
+    let mut sleep_str = format!("Preventing sleep types: [{}] ", sleep_types.join(", "));
 
     let assertions = Arc::new(Mutex::new(Some(set_assertions(&args, true))));
     let assertions_clone = assertions.clone();
