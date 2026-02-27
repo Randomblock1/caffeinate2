@@ -53,45 +53,36 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
             }
         };
 
-    if args.display {
-        add_assertion(
-            power_management::create_assertion(
-                power_management::AssertionType::PreventUserIdleDisplaySleep,
-                state,
-                args.verbose,
-            ),
+    let assertions_config = [
+        (
+            args.display,
+            power_management::AssertionType::PreventUserIdleDisplaySleep,
             "display sleep",
-        );
-    }
-    if args.disk {
-        add_assertion(
-            power_management::create_assertion(
-                power_management::AssertionType::PreventDiskIdle,
-                state,
-                args.verbose,
-            ),
+        ),
+        (
+            args.disk,
+            power_management::AssertionType::PreventDiskIdle,
             "disk idle",
-        );
-    }
-    if args.system {
-        add_assertion(
-            power_management::create_assertion(
-                power_management::AssertionType::PreventUserIdleSystemSleep,
-                state,
-                args.verbose,
-            ),
+        ),
+        (
+            args.system,
+            power_management::AssertionType::PreventUserIdleSystemSleep,
             "system sleep",
-        );
-    }
-    if args.system_on_ac {
-        add_assertion(
-            power_management::create_assertion(
-                power_management::AssertionType::PreventSystemSleep,
-                state,
-                args.verbose,
-            ),
+        ),
+        (
+            args.system_on_ac,
+            power_management::AssertionType::PreventSystemSleep,
             "system sleep on AC",
-        );
+        ),
+    ];
+
+    for (enabled, assertion_type, name) in assertions_config {
+        if enabled {
+            add_assertion(
+                power_management::create_assertion(assertion_type, state, args.verbose),
+                name,
+            );
+        }
     }
 
     if args.user_active {
