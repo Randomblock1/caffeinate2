@@ -1,4 +1,5 @@
 use crate::power_management;
+use libc::{proc_pidinfo, proc_bsdinfo, PROC_PIDTBSDINFO};
 use nix::fcntl::{Flock, FlockArg, OFlag};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
@@ -6,12 +7,50 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
-const LOCK_FILE_PATH: &str = "/tmp/caffeinate2.lock";
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ProcessId {
+    pid: i32,
+    start_time: u64,
+}
+
+impl std::fmt::Display for ProcessId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.pid, self.start_time)
+    }
+}
+
+impl std::str::FromStr for ProcessId {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.trim().split(':').collect();
+        if parts.len() != 2 {
+            return Err(());
+        }
+        let pid = parts[0].parse().map_err(|_| ())?;
+        let start_time = parts[1].parse().map_err(|_| ())?;
+        Ok(ProcessId { pid, start_time })
+    }
+}
+
+fn get_process_start_time(pid: i32) -> u64 {
+    unsafe {
+        let mut info = std::mem::zeroed::<proc_bsdinfo>();
+        let size = std::mem::size_of::<proc_bsdinfo>() as i32;
+        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut _, size);
+        if ret == size {
+            info.pbi_start_tvsec
+        } else {
+            0
+        }
+    }
+}
 
 type SleepDisabler = Box<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
-type ProcessChecker = Box<dyn Fn(i32) -> bool + Send + Sync>;
+type ProcessChecker = Box<dyn Fn(i32, u64) -> bool + Send + Sync>;
 
 pub struct ProcessLock {
     verbose: bool,
@@ -22,9 +61,15 @@ pub struct ProcessLock {
 
 impl ProcessLock {
     pub fn new(verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        let lock_path = if nix::unistd::getuid().is_root() {
+            PathBuf::from("/var/run/caffeinate2.lock")
+        } else {
+            PathBuf::from(format!("/tmp/caffeinate2_{}.lock", nix::unistd::getuid()))
+        };
+
         Self::with_options(
             verbose,
-            PathBuf::from(LOCK_FILE_PATH),
+            lock_path,
             Box::new(power_management::set_sleep_disabled),
             Box::new(default_process_checker),
         )
@@ -61,15 +106,26 @@ impl ProcessLock {
     }
 }
 
-fn default_process_checker(pid: i32) -> bool {
-    if pid == std::process::id() as i32 {
+fn default_process_checker(pid: i32, start_time: u64) -> bool {
+    let current_id = std::process::id() as i32;
+    if pid == current_id {
         return true;
     }
-    match kill(Pid::from_raw(pid), None) {
+
+    // Check if PID is alive
+    let is_alive = match kill(Pid::from_raw(pid), None) {
         Ok(_) => true,
         Err(nix::errno::Errno::ESRCH) => false,
-        Err(_) => true, // Assume alive on other errors (e.g. permission) to be safe
+        Err(_) => true, // Assume alive on permission errors
+    };
+
+    if !is_alive {
+        return false;
     }
+
+    // Verify start time to prevent PID reuse issues
+    let actual_start_time = get_process_start_time(pid);
+    actual_start_time == start_time
 }
 
 impl Drop for ProcessLock {
@@ -106,38 +162,66 @@ fn update_lockfile(
     path: &Path,
     process_checker: &ProcessChecker,
 ) -> Result<bool, std::io::Error> {
+    let mode = if nix::unistd::getuid().is_root() {
+        0o644
+    } else {
+        0o600
+    };
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .mode(0o666)
+        .mode(mode)
         .custom_flags(OFlag::O_NOFOLLOW.bits())
         .open(path)?;
 
+    // Lock the file
     let mut file = match Flock::lock(file, FlockArg::LockExclusive) {
         Ok(f) => f,
         Err((_, e)) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
     };
 
+    let fstat = nix::sys::stat::fstat(file.as_fd())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    if let Ok(path_stat) = nix::sys::stat::stat(path) {
+        if fstat.st_ino != path_stat.st_ino {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Lockfile was replaced during acquisition",
+            ));
+        }
+    }
+
     let mut content = String::new();
     file.read_to_string(&mut content)?;
 
-    let current_pid = std::process::id() as i32;
-    let mut pids: HashSet<i32> = content
+    let current_id = std::process::id() as i32;
+    let current_start_time = get_process_start_time(current_id);
+    let current_proc = ProcessId {
+        pid: current_id,
+        start_time: current_start_time,
+    };
+
+    let mut pids: HashSet<ProcessId> = content
         .lines()
-        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .filter_map(|line| line.parse::<ProcessId>().ok())
         .collect();
 
-    // Filter out dead processes
-    pids.retain(|&pid| {
-        if pid == current_pid {
+    // Filter out dead processes or stale entries (PID reuse)
+    pids.retain(|p| {
+        if p.pid == current_id && p.start_time == current_start_time {
             return true;
         }
-        if process_checker(pid) {
+        if process_checker(p.pid, p.start_time) {
             true
         } else {
             if verbose {
-                println!("Removing stale PID {} from lockfile", pid);
+                println!(
+                    "Removing stale process {}:{} from lockfile",
+                    p.pid, p.start_time
+                );
             }
             false
         }
@@ -146,9 +230,9 @@ fn update_lockfile(
     let active_count_before = pids.len();
 
     if add {
-        pids.insert(current_pid);
+        pids.insert(current_proc);
     } else {
-        pids.remove(&current_pid);
+        pids.remove(&current_proc);
     }
 
     let active_count_after = pids.len();
@@ -157,8 +241,8 @@ fn update_lockfile(
     file.set_len(0)?;
     {
         let mut writer = BufWriter::new(&mut *file);
-        for pid in &pids {
-            writeln!(writer, "{}", pid)?;
+        for p in &pids {
+            writeln!(writer, "{}", p)?;
         }
         writer.flush()?;
     }
@@ -195,7 +279,6 @@ mod tests {
     #[test]
     fn test_first_instance() {
         let lock_path = temp_lock_path();
-        // Ensure file doesn't exist (though temp dir should be cleanish or unique name)
         if lock_path.exists() {
             std::fs::remove_file(&lock_path).unwrap();
         }
@@ -208,7 +291,7 @@ mod tests {
             Ok(())
         });
 
-        let process_checker = Box::new(|_pid: i32| false); // No other processes running
+        let process_checker = Box::new(|_pid: i32, _start_time: u64| false);
 
         let lock = ProcessLock::with_options(
             true,
@@ -218,25 +301,20 @@ mod tests {
         )
         .unwrap();
 
-        // Check if file created and contains PID
         let content = std::fs::read_to_string(&lock_path).unwrap();
         assert!(content.contains(&std::process::id().to_string()));
 
-        // Check if sleep disabled (true)
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], true);
 
-        // Cleanup done by Drop (or manually if we want to check state before drop)
-        drop(calls); // Release lock on calls
-        drop(lock); // Drop the lock
+        drop(calls);
+        drop(lock);
 
-        // Check if sleep re-enabled (false)
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1], false);
 
-        // Cleanup file
         if lock_path.exists() {
              std::fs::remove_file(&lock_path).unwrap();
         }
@@ -245,12 +323,11 @@ mod tests {
     #[test]
     fn test_subsequent_instance() {
         let lock_path = temp_lock_path();
-
-        // Pre-populate with another PID
         let other_pid = 99999;
+        let other_start = 12345;
         {
             let mut file = File::create(&lock_path).unwrap();
-            writeln!(file, "{}", other_pid).unwrap();
+            writeln!(file, "{}:{}", other_pid, other_start).unwrap();
         }
 
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
@@ -261,8 +338,7 @@ mod tests {
             Ok(())
         });
 
-        // process checker says other_pid is ALIVE
-        let process_checker = Box::new(move |pid: i32| pid == other_pid);
+        let process_checker = Box::new(move |pid: i32, start: u64| pid == other_pid && start == other_start);
 
         let lock = ProcessLock::with_options(
             true,
@@ -272,19 +348,16 @@ mod tests {
         )
         .unwrap();
 
-        // Check file contains both PIDs
         let content = std::fs::read_to_string(&lock_path).unwrap();
-        assert!(content.contains(&other_pid.to_string()));
+        assert!(content.contains(&format!("{}:{}", other_pid, other_start)));
         assert!(content.contains(&std::process::id().to_string()));
 
-        // Check sleep disabler NOT called (since other instance is running)
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 0);
 
         drop(calls);
         drop(lock);
 
-        // Check sleep disabler NOT called on drop either (other instance still running)
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 0);
 
@@ -296,12 +369,11 @@ mod tests {
     #[test]
     fn test_stale_pid_cleanup() {
         let lock_path = temp_lock_path();
-
-        // Pre-populate with a dead PID
         let dead_pid = 88888;
+        let dead_start = 67890;
         {
             let mut file = File::create(&lock_path).unwrap();
-            writeln!(file, "{}", dead_pid).unwrap();
+            writeln!(file, "{}:{}", dead_pid, dead_start).unwrap();
         }
 
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
@@ -312,8 +384,7 @@ mod tests {
             Ok(())
         });
 
-        // process checker says dead_pid is DEAD
-        let process_checker = Box::new(|_pid: i32| false);
+        let process_checker = Box::new(|_pid: i32, _start_time: u64| false);
 
         let lock = ProcessLock::with_options(
             true,
@@ -323,12 +394,10 @@ mod tests {
         )
         .unwrap();
 
-        // Check file contains ONLY current PID (dead one removed)
         let content = std::fs::read_to_string(&lock_path).unwrap();
         assert!(!content.contains(&dead_pid.to_string()));
         assert!(content.contains(&std::process::id().to_string()));
 
-        // Since we are now the "first" valid instance, sleep should be disabled
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], true);
