@@ -554,3 +554,8 @@ mod tests {
         assert!(assertions._sleep_guard.is_none());
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("Not supported on this OS");
+}
