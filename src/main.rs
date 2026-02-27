@@ -1,14 +1,10 @@
-#[cfg(target_os = "macos")]
-pub mod power_management;
-#[cfg(not(target_os = "macos"))]
-pub mod power_management;
+#![cfg(target_os = "macos")]
 
+pub mod power_management;
 pub mod process_lock;
 
 use clap::Parser;
-#[cfg(target_os = "macos")]
-use nix::sys::event;
-use nix::unistd;
+use nix::{sys::event, unistd};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::os::unix::process::CommandExt;
 use std::process;
@@ -210,7 +206,6 @@ fn main() {
         args.system = true;
     }
 
-    #[cfg(target_os = "macos")]
     if !cfg!(target_os = "macos") {
         panic!("This program only works on macOS.");
     }
@@ -378,55 +373,41 @@ fn main() {
             let pid = args.waitfor.expect("PID should be present");
 
             // wait without polling using kevent
-            #[cfg(target_os = "macos")]
-            {
-                let kq = event::Kqueue::new().expect("Failed to create Kqueue");
-                let kev = event::KEvent::new(
-                    pid as usize,
-                    event::EventFilter::EVFILT_PROC,
-                    event::EvFlags::EV_ADD
-                        | event::EvFlags::EV_ENABLE
-                        | event::EvFlags::EV_ONESHOT
-                        | event::EvFlags::EV_ERROR,
-                    event::FilterFlag::NOTE_EXITSTATUS,
-                    0,
-                    0,
-                );
+            let kq = event::Kqueue::new().expect("Failed to create Kqueue");
+            let kev = event::KEvent::new(
+                pid as usize,
+                event::EventFilter::EVFILT_PROC,
+                event::EvFlags::EV_ADD
+                    | event::EvFlags::EV_ENABLE
+                    | event::EvFlags::EV_ONESHOT
+                    | event::EvFlags::EV_ERROR,
+                event::FilterFlag::NOTE_EXITSTATUS,
+                0,
+                0,
+            );
 
-                let mut eventlist = [kev];
+            let mut eventlist = [kev];
 
-                kq.kevent(&[kev], &mut eventlist, None)
-                    .expect("Failed to register Kqueue event");
-                if args.verbose {
-                    println!("{:#?}", kev)
-                };
+            kq.kevent(&[kev], &mut eventlist, None)
+                .expect("Failed to register Kqueue event");
+            if args.verbose {
+                println!("{:#?}", kev)
+            };
 
-                if eventlist[0].flags().contains(event::EvFlags::EV_ERROR) {
-                    if eventlist[0].data() == nix::Error::ESRCH as isize {
-                        println!("PID {} not found", pid);
-                    } else {
-                        eprintln!(
-                            "kevent error waiting for PID {}: {}",
-                            pid,
-                            nix::Error::from_raw(eventlist[0].data() as i32)
-                        );
-                    }
-                    process::exit(1);
+            if eventlist[0].flags().contains(event::EvFlags::EV_ERROR) {
+                if eventlist[0].data() == nix::Error::ESRCH as isize {
+                    println!("PID {} not found", pid);
+                } else {
+                    eprintln!(
+                        "kevent error waiting for PID {}: {}",
+                        pid,
+                        nix::Error::from_raw(eventlist[0].data() as i32)
+                    );
                 }
-
-                exit_code = eventlist[0].data() as i32;
+                process::exit(1);
             }
 
-            #[cfg(not(target_os = "macos"))]
-            {
-                // Simple poll for non-macos
-                let mut system = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
-                while system.is_ok() {
-                    thread::sleep(std::time::Duration::from_millis(500));
-                    system = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
-                }
-                exit_code = 0; // Can't easily get exit code without waitpid (child) or kqueue (any proc)
-            }
+            exit_code = eventlist[0].data() as i32;
 
             print!("PID {pid} finished ");
             let now = chrono::Local::now();

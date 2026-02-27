@@ -1,8 +1,5 @@
 #![allow(non_upper_case_globals)]
-
-#[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue};
-#[cfg(target_os = "macos")]
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionRelease,
     IOPMUserActiveType, kIOPMAssertionLevelOff, kIOPMAssertionLevelOn, kIOReturnBadArgument,
@@ -11,7 +8,6 @@ use objc2_io_kit::{
 use std::{fmt, mem::MaybeUninit};
 
 // Missing functions from objc2-io-kit
-#[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> u32;
@@ -53,7 +49,6 @@ impl Drop for PowerAssertion {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub fn create_assertion(
     assertion_type: AssertionType,
     state: bool,
@@ -86,19 +81,6 @@ pub fn create_assertion(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn create_assertion(
-    assertion_type: AssertionType,
-    state: bool,
-    verbose: bool,
-) -> Result<PowerAssertion, u32> {
-    if verbose {
-        println!("Creating stub power management assertion: {} state: {}", assertion_type, state);
-    }
-    Ok(PowerAssertion { id: 0, verbose })
-}
-
-#[cfg(target_os = "macos")]
 fn release_assertion(assertion_id: u32, verbose: bool) {
     if verbose {
         println!(
@@ -107,7 +89,7 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
         );
     }
 
-    let status = unsafe { IOPMAssertionRelease(assertion_id) as u32 };
+    let status = IOPMAssertionRelease(assertion_id) as u32;
 
     match status {
         0 => {
@@ -137,17 +119,6 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn release_assertion(assertion_id: u32, verbose: bool) {
-    if verbose {
-        println!(
-            "Releasing stub power management assertion with ID: {}",
-            assertion_id
-        );
-    }
-}
-
-#[cfg(target_os = "macos")]
 pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
     let level = if state {
@@ -176,14 +147,6 @@ pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertio
     Ok(PowerAssertion { id, verbose })
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertion, u32> {
-    if verbose {
-        println!("Declaring stub user activity state: {}", state);
-    }
-    Ok(PowerAssertion { id: 0, verbose })
-}
-
 pub struct SleepDisabledGuard {
     verbose: bool,
 }
@@ -199,7 +162,6 @@ pub fn disable_sleep(verbose: bool) -> Result<SleepDisabledGuard, u32> {
     Ok(SleepDisabledGuard { verbose })
 }
 
-#[cfg(target_os = "macos")]
 pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
     let sleep_disabled_bool = if sleep_disabled {
         unsafe { kCFBooleanTrue.unwrap() }
@@ -232,21 +194,6 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
-    if verbose {
-        println!(
-            "Stub: {} sleep",
-            if sleep_disabled {
-                "disabling"
-            } else {
-                "enabling"
-            }
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,7 +223,6 @@ mod tests {
                 drop(guard); // Should re-enable sleep
             }
             Err(code) => {
-                #[cfg(target_os = "macos")]
                 if code == kIOReturnNotPrivileged {
                     println!(
                         "Insufficient privileges to disable sleep (expected in non-root tests)"
@@ -284,8 +230,6 @@ mod tests {
                 } else {
                     panic!("Failed to disable sleep with unexpected code: {:X}", code);
                 }
-                #[cfg(not(target_os = "macos"))]
-                panic!("Stub should not fail: {:X}", code);
             }
         }
     }
