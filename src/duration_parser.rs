@@ -21,19 +21,24 @@ pub fn parse_duration(duration: &str) -> Result<chrono::Duration, String> {
 mod tests {
     use super::*;
 
+    const SECOND: i64 = 1;
+    const MINUTE: i64 = 60 * SECOND;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+
     #[test]
     fn test_parse_duration_valid_strings() {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 93784);
+        assert_eq!(result.num_seconds(), 1 * DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND);
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 93780);
+        assert_eq!(result.num_seconds(), 1 * DAY + 2 * HOUR + 3 * MINUTE);
 
         let duration = "3min 17h 2s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 61382);
+        assert_eq!(result.num_seconds(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
     }
 
     #[test]
@@ -48,7 +53,7 @@ mod tests {
 
         let duration = "60";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 60);
+        assert_eq!(result.num_seconds(), 60 * SECOND);
     }
 
     #[test]
