@@ -2,6 +2,7 @@
 
 pub mod power_management;
 pub mod process_lock;
+pub mod lock_logic;
 
 use clap::Parser;
 use nix::{sys::event, unistd};
@@ -12,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 struct ActiveAssertions {
+    #[cfg(target_os = "macos")]
     _assertions: Vec<power_management::PowerAssertion>,
+    #[cfg(not(target_os = "macos"))]
+    _assertions: Vec<()>,
     _sleep_guard: Option<process_lock::ProcessLock>,
 }
 
@@ -41,6 +45,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
 
     let mut assertions = Vec::new();
 
+    #[cfg(target_os = "macos")]
     let mut add_assertion =
         |result: Result<power_management::PowerAssertion, u32>, name: &str| match result {
             Ok(assertion) => assertions.push(assertion),
@@ -53,7 +58,12 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
             }
         };
 
+    #[cfg(not(target_os = "macos"))]
+    let mut add_assertion = |_: Result<(), u32>, _: &str| {};
+
+
     if args.display {
+        #[cfg(target_os = "macos")]
         add_assertion(
             power_management::create_assertion(
                 power_management::AssertionType::PreventUserIdleDisplaySleep,
@@ -64,6 +74,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
         );
     }
     if args.disk {
+        #[cfg(target_os = "macos")]
         add_assertion(
             power_management::create_assertion(
                 power_management::AssertionType::PreventDiskIdle,
@@ -74,6 +85,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
         );
     }
     if args.system {
+        #[cfg(target_os = "macos")]
         add_assertion(
             power_management::create_assertion(
                 power_management::AssertionType::PreventUserIdleSystemSleep,
@@ -84,6 +96,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
         );
     }
     if args.system_on_ac {
+        #[cfg(target_os = "macos")]
         add_assertion(
             power_management::create_assertion(
                 power_management::AssertionType::PreventSystemSleep,
@@ -95,6 +108,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 
     if args.user_active {
+        #[cfg(target_os = "macos")]
         add_assertion(
             power_management::declare_user_activity(true, args.verbose),
             "user activity",

@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 #![allow(non_upper_case_globals)]
 use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue};
 use objc2_io_kit::{
