@@ -16,23 +16,75 @@ struct ActiveAssertions {
     _sleep_guard: Option<process_lock::ProcessLock>,
 }
 
-fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
+trait PowerManager {
+    fn create_assertion(
+        &self,
+        assertion_type: power_management::AssertionType,
+        state: bool,
+        verbose: bool,
+    ) -> Result<power_management::PowerAssertion, u32>;
+
+    fn declare_user_activity(
+        &self,
+        state: bool,
+        verbose: bool,
+    ) -> Result<power_management::PowerAssertion, u32>;
+
+    fn create_process_lock(
+        &self,
+        verbose: bool,
+    ) -> Result<process_lock::ProcessLock, Box<dyn std::error::Error>>;
+}
+
+struct RealPowerManager;
+
+impl PowerManager for RealPowerManager {
+    fn create_assertion(
+        &self,
+        assertion_type: power_management::AssertionType,
+        state: bool,
+        verbose: bool,
+    ) -> Result<power_management::PowerAssertion, u32> {
+        power_management::create_assertion(assertion_type, state, verbose)
+    }
+
+    fn declare_user_activity(
+        &self,
+        state: bool,
+        verbose: bool,
+    ) -> Result<power_management::PowerAssertion, u32> {
+        power_management::declare_user_activity(state, verbose)
+    }
+
+    fn create_process_lock(
+        &self,
+        verbose: bool,
+    ) -> Result<process_lock::ProcessLock, Box<dyn std::error::Error>> {
+        process_lock::ProcessLock::new(verbose)
+    }
+}
+
+fn set_assertions(
+    args: &Args,
+    state: bool,
+    pm: &impl PowerManager,
+) -> Result<ActiveAssertions, Box<dyn std::error::Error>> {
     if args.dry_run {
-        return ActiveAssertions {
+        return Ok(ActiveAssertions {
             _assertions: Vec::new(),
             _sleep_guard: None,
-        };
+        });
     }
 
     let sleep_guard = if args.entirely {
-        match process_lock::ProcessLock::new(args.verbose) {
+        match pm.create_process_lock(args.verbose) {
             Ok(guard) => Some(guard),
             Err(e) => {
-                eprintln!(
+                return Err(format!(
                     "Error: Failed to acquire process lock or disable sleep: {}",
                     e
-                );
-                process::exit(1);
+                )
+                .into());
             }
         }
     } else {
@@ -41,74 +93,78 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
 
     let mut assertions = Vec::new();
 
-    let mut add_assertion =
-        |result: Result<power_management::PowerAssertion, u32>, name: &str| match result {
-            Ok(assertion) => assertions.push(assertion),
-            Err(code) => {
-                eprintln!(
-                    "Error: Failed to create {} assertion (code: {:X})",
-                    name, code
-                );
-                process::exit(1);
+    let mut add_assertion = |result: Result<power_management::PowerAssertion, u32>,
+                             name: &str|
+     -> Result<(), Box<dyn std::error::Error>> {
+        match result {
+            Ok(assertion) => {
+                assertions.push(assertion);
+                Ok(())
             }
-        };
+            Err(code) => Err(format!(
+                "Error: Failed to create {} assertion (code: {:X})",
+                name, code
+            )
+            .into()),
+        }
+    };
 
     if args.display {
         add_assertion(
-            power_management::create_assertion(
+            pm.create_assertion(
                 power_management::AssertionType::PreventUserIdleDisplaySleep,
                 state,
                 args.verbose,
             ),
             "display sleep",
-        );
+        )?;
     }
     if args.disk {
         add_assertion(
-            power_management::create_assertion(
+            pm.create_assertion(
                 power_management::AssertionType::PreventDiskIdle,
                 state,
                 args.verbose,
             ),
             "disk idle",
-        );
+        )?;
     }
     if args.system {
         add_assertion(
-            power_management::create_assertion(
+            pm.create_assertion(
                 power_management::AssertionType::PreventUserIdleSystemSleep,
                 state,
                 args.verbose,
             ),
             "system sleep",
-        );
+        )?;
     }
     if args.system_on_ac {
         add_assertion(
-            power_management::create_assertion(
+            pm.create_assertion(
                 power_management::AssertionType::PreventSystemSleep,
                 state,
                 args.verbose,
             ),
             "system sleep on AC",
-        );
+        )?;
     }
 
     if args.user_active {
         add_assertion(
-            power_management::declare_user_activity(true, args.verbose),
+            pm.declare_user_activity(true, args.verbose),
             "user activity",
-        );
+        )?;
     }
 
     if args.verbose {
         println!("Assertions created");
     }
 
-    ActiveAssertions {
+    Ok(ActiveAssertions {
         _assertions: assertions,
         _sleep_guard: sleep_guard,
-    }
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -238,7 +294,14 @@ fn main() {
     }
     sleep_str += "] ";
 
-    let assertions = Arc::new(Mutex::new(Some(set_assertions(&args, true))));
+    let pm = RealPowerManager;
+    let assertions = match set_assertions(&args, true, &pm) {
+        Ok(a) => Arc::new(Mutex::new(Some(a))),
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
     let assertions_clone = assertions.clone();
 
     let mut exit_code = 0;
@@ -428,6 +491,71 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use crate::power_management::{AssertionType, PowerAssertion};
+    use crate::process_lock::ProcessLock;
+    use crate::PowerManager;
+    use std::cell::RefCell;
+
+    struct MockPowerManager {
+        should_fail_assertion: bool,
+        should_fail_lock: bool,
+        assertions_created: RefCell<Vec<String>>,
+    }
+
+    impl MockPowerManager {
+        fn new() -> Self {
+            Self {
+                should_fail_assertion: false,
+                should_fail_lock: false,
+                assertions_created: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PowerManager for MockPowerManager {
+        fn create_assertion(
+            &self,
+            assertion_type: AssertionType,
+            _state: bool,
+            verbose: bool,
+        ) -> Result<PowerAssertion, u32> {
+            if self.should_fail_assertion {
+                Err(1)
+            } else {
+                self.assertions_created
+                    .borrow_mut()
+                    .push(assertion_type.as_str().to_string());
+                Ok(PowerAssertion::new_test(1, verbose))
+            }
+        }
+
+        fn declare_user_activity(
+            &self,
+            _state: bool,
+            verbose: bool,
+        ) -> Result<PowerAssertion, u32> {
+            if self.should_fail_assertion {
+                Err(1)
+            } else {
+                self.assertions_created
+                    .borrow_mut()
+                    .push("UserActivity".to_string());
+                Ok(PowerAssertion::new_test(2, verbose))
+            }
+        }
+
+        fn create_process_lock(
+            &self,
+            verbose: bool,
+        ) -> Result<ProcessLock, Box<dyn std::error::Error>> {
+            if self.should_fail_lock {
+                Err("Lock failure".into())
+            } else {
+                Ok(ProcessLock::new_test(verbose))
+            }
+        }
+    }
+
     #[test]
     fn test_parse_duration() {
         let duration = "1d 2h 3m 4s".to_string();
@@ -482,7 +610,8 @@ mod tests {
             command: None,
         };
 
-        let assertions = super::set_assertions(&args, true);
+        let pm = MockPowerManager::new();
+        let assertions = super::set_assertions(&args, true, &pm).unwrap();
         assert!(assertions._assertions.is_empty());
         assert!(assertions._sleep_guard.is_none());
     }
@@ -504,9 +633,11 @@ mod tests {
             command: None,
         };
 
-        let assertions = super::set_assertions(&args, true);
+        let pm = MockPowerManager::new();
+        let assertions = super::set_assertions(&args, true, &pm).unwrap();
         assert_eq!(assertions._assertions.len(), 1);
         assert!(assertions._sleep_guard.is_none());
+        assert_eq!(pm.assertions_created.borrow()[0], "PreventUserIdleDisplaySleep");
     }
 
     #[test]
@@ -526,10 +657,16 @@ mod tests {
             command: None,
         };
 
-        let assertions = super::set_assertions(&args, true);
+        let pm = MockPowerManager::new();
+        let assertions = super::set_assertions(&args, true, &pm).unwrap();
         // Should have 3 assertions: display, disk, system
         assert_eq!(assertions._assertions.len(), 3);
         assert!(assertions._sleep_guard.is_none());
+
+        let created = pm.assertions_created.borrow();
+        assert!(created.contains(&"PreventUserIdleDisplaySleep".to_string()));
+        assert!(created.contains(&"PreventDiskIdle".to_string()));
+        assert!(created.contains(&"PreventUserIdleSystemSleep".to_string()));
     }
 
     #[test]
@@ -549,8 +686,60 @@ mod tests {
             command: None,
         };
 
-        let assertions = super::set_assertions(&args, true);
+        let pm = MockPowerManager::new();
+        let assertions = super::set_assertions(&args, true, &pm).unwrap();
         assert_eq!(assertions._assertions.len(), 1);
         assert!(assertions._sleep_guard.is_none());
+        assert_eq!(pm.assertions_created.borrow()[0], "PreventSystemSleep");
+    }
+
+    #[test]
+    fn test_set_assertions_lock_failure() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: false,
+            drop_root: false,
+            display: false,
+            disk: false,
+            system: false,
+            system_on_ac: false,
+            entirely: true,
+            user_active: false,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let mut pm = MockPowerManager::new();
+        pm.should_fail_lock = true;
+
+        let result = super::set_assertions(&args, true, &pm);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to acquire process lock"));
+    }
+
+    #[test]
+    fn test_set_assertions_assertion_failure() {
+        let args = super::Args {
+            verbose: false,
+            dry_run: false,
+            drop_root: false,
+            display: true,
+            disk: false,
+            system: false,
+            system_on_ac: false,
+            entirely: false,
+            user_active: false,
+            timeout: None,
+            waitfor: None,
+            command: None,
+        };
+
+        let mut pm = MockPowerManager::new();
+        pm.should_fail_assertion = true;
+
+        let result = super::set_assertions(&args, true, &pm);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to create display sleep assertion"));
     }
 }

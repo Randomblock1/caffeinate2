@@ -41,11 +41,24 @@ impl fmt::Display for AssertionType {
 pub struct PowerAssertion {
     id: u32,
     verbose: bool,
+    test_mode: bool,
+}
+
+impl PowerAssertion {
+    pub fn new_test(id: u32, verbose: bool) -> Self {
+        Self {
+            id,
+            verbose,
+            test_mode: true,
+        }
+    }
 }
 
 impl Drop for PowerAssertion {
     fn drop(&mut self) {
-        release_assertion(self.id, self.verbose);
+        if !self.test_mode {
+            release_assertion(self.id, self.verbose);
+        }
     }
 }
 
@@ -75,7 +88,11 @@ pub fn create_assertion(
                 id
             );
         }
-        Ok(PowerAssertion { id, verbose })
+        Ok(PowerAssertion {
+            id,
+            verbose,
+            test_mode: false,
+        })
     } else {
         Err(status as u32)
     }
@@ -144,7 +161,11 @@ pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertio
         println!("Successfully declared user activity with ID: {}", id);
     }
 
-    Ok(PowerAssertion { id, verbose })
+    Ok(PowerAssertion {
+        id,
+        verbose,
+        test_mode: false,
+    })
 }
 
 pub struct SleepDisabledGuard {

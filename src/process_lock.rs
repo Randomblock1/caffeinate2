@@ -11,6 +11,7 @@ const LOCK_FILE_PATH: &str = "/tmp/caffeinate2.lock";
 
 pub struct ProcessLock {
     verbose: bool,
+    test_mode: bool,
 }
 
 impl ProcessLock {
@@ -31,12 +32,26 @@ impl ProcessLock {
             println!("Other instances running. Sleep already disabled.");
         }
 
-        Ok(Self { verbose })
+        Ok(Self {
+            verbose,
+            test_mode: false,
+        })
+    }
+
+    pub fn new_test(verbose: bool) -> Self {
+        Self {
+            verbose,
+            test_mode: true,
+        }
     }
 }
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
+        if self.test_mode {
+            return;
+        }
+
         match update_lockfile(false, self.verbose) {
             Ok(should_enable) => {
                 if should_enable {
