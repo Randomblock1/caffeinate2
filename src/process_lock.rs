@@ -2,6 +2,7 @@ use crate::power_management;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -76,7 +77,7 @@ fn update_lockfile(add: bool, verbose: bool) -> Result<bool, std::io::Error> {
     file.read_to_string(&mut content)?;
 
     let current_pid = std::process::id() as i32;
-    let mut pids: Vec<i32> = content
+    let mut pids: HashSet<i32> = content
         .lines()
         .filter_map(|line| line.trim().parse::<i32>().ok())
         .collect();
@@ -101,13 +102,9 @@ fn update_lockfile(add: bool, verbose: bool) -> Result<bool, std::io::Error> {
     let active_count_before = pids.len();
 
     if add {
-        if !pids.contains(&current_pid) {
-            pids.push(current_pid);
-        }
+        pids.insert(current_pid);
     } else {
-        if let Some(pos) = pids.iter().position(|&x| x == current_pid) {
-            pids.remove(pos);
-        }
+        pids.remove(&current_pid);
     }
 
     let active_count_after = pids.len();
