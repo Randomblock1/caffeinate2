@@ -1,5 +1,5 @@
 use crate::power_management;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg, OFlag};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use std::collections::HashSet;
@@ -66,6 +66,7 @@ fn update_lockfile(add: bool, verbose: bool) -> Result<bool, std::io::Error> {
         .write(true)
         .create(true)
         .mode(0o666)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
         .open(path)?;
 
     let mut file = match Flock::lock(file, FlockArg::LockExclusive) {
