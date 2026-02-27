@@ -4,7 +4,7 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -155,8 +155,12 @@ fn update_lockfile(
 
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    for pid in &pids {
-        writeln!(file, "{}", pid)?;
+    {
+        let mut writer = BufWriter::new(&mut *file);
+        for pid in &pids {
+            writeln!(writer, "{}", pid)?;
+        }
+        writer.flush()?;
     }
 
     let should_toggle = if add {
