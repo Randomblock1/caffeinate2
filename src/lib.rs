@@ -14,6 +14,8 @@ pub mod helper_ipc;
 #[cfg(target_os = "macos")]
 pub mod install;
 #[cfg(all(target_os = "macos", feature = "tray"))]
+pub mod macos_apps;
+#[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod tray_mode;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod macos_activation;

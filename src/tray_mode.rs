@@ -130,10 +130,18 @@ impl TimeLimitPreset {
     ];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stop sleep prevention when no running instance of this bundle remains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitForApp {
+    pub bundle_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayConfig {
     pub mode: TrayMode,
     pub time_limit_secs: Option<u64>,
+    pub wait_for_app: Option<WaitForApp>,
 }
 
 impl Default for TrayConfig {
@@ -141,6 +149,7 @@ impl Default for TrayConfig {
         Self {
             mode: TrayMode::default(),
             time_limit_secs: None,
+            wait_for_app: None,
         }
     }
 }
@@ -184,9 +193,18 @@ pub fn load_config() -> TrayConfig {
     parse_config(&content).unwrap_or_default()
 }
 
+fn parse_quoted_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        Some(value[1..value.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
 fn parse_config(content: &str) -> Option<TrayConfig> {
     let mut config = TrayConfig::default();
-    let mut found_mode = false;
+    let mut any = false;
 
     for line in content.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -205,16 +223,39 @@ fn parse_config(content: &str) -> Option<TrayConfig> {
                     "entirely" => TrayMode::Entirely,
                     _ => return None,
                 };
-                found_mode = true;
+                any = true;
             }
             "time_limit_secs" => {
                 config.time_limit_secs = value.trim().parse().ok();
+                any = true;
+            }
+            "wait_for_bundle_id" => {
+                let bundle_id = parse_quoted_value(value)?;
+                if bundle_id.is_empty() {
+                    config.wait_for_app = None;
+                } else {
+                    let name = config
+                        .wait_for_app
+                        .as_ref()
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| bundle_id.clone());
+                    config.wait_for_app = Some(WaitForApp { bundle_id, name });
+                }
+                any = true;
+            }
+            "wait_for_app_name" => {
+                if let Some(name) = parse_quoted_value(value) {
+                    if let Some(app) = &mut config.wait_for_app {
+                        app.name = name;
+                    }
+                }
+                any = true;
             }
             _ => {}
         }
     }
 
-    found_mode.then_some(config)
+    any.then_some(config)
 }
 
 pub fn save_config(config: &TrayConfig) -> Result<(), String> {
@@ -226,7 +267,41 @@ pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     if let Some(secs) = config.time_limit_secs {
         content.push_str(&format!("time_limit_secs = {secs}\n"));
     }
+    if let Some(app) = &config.wait_for_app {
+        content.push_str(&format!(
+            "wait_for_bundle_id = \"{}\"\n",
+            app.bundle_id.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+        content.push_str(&format!(
+            "wait_for_app_name = \"{}\"\n",
+            app.name.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+    }
     std::fs::write(path, content).map_err(|e| e.to_string())
+}
+
+/// Build menu bar tooltip text while sleep prevention is active.
+pub fn format_active_tooltip(
+    remaining_secs: Option<u64>,
+    wait_for_app: Option<&WaitForApp>,
+    waiting_for_app_launch: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(secs) = remaining_secs.filter(|&s| s > 0) {
+        parts.push(format_remaining_secs(secs));
+    }
+    if let Some(app) = wait_for_app {
+        if waiting_for_app_launch {
+            parts.push(format!("waiting for {}", app.name));
+        } else {
+            parts.push(format!("until {} quits", app.name));
+        }
+    }
+    if parts.is_empty() {
+        "caffeinate2".to_string()
+    } else {
+        format!("caffeinate2 ({})", parts.join(" · "))
+    }
 }
 
 fn serde_variant(mode: TrayMode) -> &'static str {
@@ -259,9 +334,36 @@ mod tests {
     }
 
     #[test]
-    fn format_remaining_secs() {
-        assert_eq!(format_remaining_secs(45), "45s remaining");
-        assert_eq!(format_remaining_secs(90), "1m remaining");
-        assert_eq!(format_remaining_secs(3661), "1h 1m remaining");
+    fn format_remaining_secs_display() {
+        assert_eq!(super::format_remaining_secs(45), "45s remaining");
+        assert_eq!(super::format_remaining_secs(90), "1m remaining");
+        assert_eq!(super::format_remaining_secs(3661), "1h 1m remaining");
+    }
+
+    #[test]
+    fn parse_config_reads_wait_for_app() {
+        let config = parse_config(
+            "mode = \"system\"\nwait_for_bundle_id = \"com.example.app\"\nwait_for_app_name = \"Example\"\n",
+        )
+        .unwrap();
+        let app = config.wait_for_app.unwrap();
+        assert_eq!(app.bundle_id, "com.example.app");
+        assert_eq!(app.name, "Example");
+    }
+
+    #[test]
+    fn format_active_tooltip_combines_limit_and_app() {
+        let app = WaitForApp {
+            bundle_id: "com.example".into(),
+            name: "Example".into(),
+        };
+        assert_eq!(
+            format_active_tooltip(Some(90), Some(&app), false),
+            "caffeinate2 (1m remaining · until Example quits)"
+        );
+        assert_eq!(
+            format_active_tooltip(None, Some(&app), true),
+            "caffeinate2 (waiting for Example)"
+        );
     }
 }

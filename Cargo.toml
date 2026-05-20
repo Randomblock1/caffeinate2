@@ -29,8 +29,17 @@ muda = { version = "0.17", optional = true }
 objc2 = "0.6"
 objc2-core-foundation = "0.3.2"
 objc2-io-kit = "0.3"
-objc2-app-kit = { version = "0.3", optional = true }
-objc2-foundation = { version = "0.3", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSWorkspace",
+    "NSRunningApplication",
+    "NSOpenPanel",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSString",
+    "NSArray",
+    "NSBundle",
+    "NSURL",
+] }
 
 [features]
 default = []
