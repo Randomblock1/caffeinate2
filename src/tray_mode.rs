@@ -66,7 +66,7 @@ impl TrayMode {
                 if !client.is_available() {
                     return Err(0);
                 }
-                client.hold().map_err(|_| 0)?;
+                client.hold().map_err(|_| 0u32)?;
                 Ok(ActiveMode::EntirelyHold(client))
             }
         }
