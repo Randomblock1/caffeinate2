@@ -11,9 +11,9 @@ use std::path::Path;
 pub(crate) const LOCK_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub(crate) struct ProcessStartTime {
-    pub(crate) seconds: u64,
-    pub(crate) microseconds: u64,
+pub struct ProcessStartTime {
+    pub seconds: u64,
+    pub microseconds: u64,
 }
 
 impl std::fmt::Display for ProcessStartTime {
@@ -23,9 +23,9 @@ impl std::fmt::Display for ProcessStartTime {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub(crate) struct ProcessId {
-    pub(crate) pid: i32,
-    pub(crate) start_time: ProcessStartTime,
+pub struct ProcessId {
+    pub pid: i32,
+    pub start_time: ProcessStartTime,
 }
 
 impl std::fmt::Display for ProcessId {
@@ -59,7 +59,7 @@ impl std::str::FromStr for ProcessId {
     }
 }
 
-pub(crate) type ProcessChecker = dyn Fn(i32, ProcessStartTime) -> bool + Send + Sync;
+pub type ProcessChecker = dyn Fn(i32, ProcessStartTime) -> bool + Send + Sync;
 
 /// Returns true when the global sleep state should change.
 pub(crate) fn update_lockfile(
