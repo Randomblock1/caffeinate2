@@ -1,3 +1,5 @@
+#![allow(dead_code)] // used by the caffeinate2-tray binary, not within this crate
+
 #[cfg(feature = "tray")]
 pub const ICON_OFF: &[u8] = include_bytes!("../resources/icons/icon_off.png");
 

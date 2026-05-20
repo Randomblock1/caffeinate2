@@ -18,4 +18,4 @@ pub mod tray_mode;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod macos_activation;
 #[cfg(all(target_os = "macos", feature = "tray"))]
-mod tray_icons;
+pub mod tray_icons;
