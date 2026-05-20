@@ -15,7 +15,7 @@ use std::{process, thread};
 /// # Returns
 ///
 /// * `Option<Duration>` - The excess duration (actual - expected) if a sleep event was detected,
-///                        or `None` if no sleep event was detected or an error occurred.
+///   or `None` if no sleep event was detected or an error occurred.
 fn detect_sleep_event<F>(
     expected_duration: Duration,
     threshold: Duration,
@@ -69,8 +69,8 @@ fn main() {
         let now = SystemTime::now();
 
         let sleep_result = detect_sleep_event(SLEEP_DURATION, SLEEP_THRESHOLD, |duration| {
-             sleep(duration);
-             now.elapsed().map_err(|_| ())
+            sleep(duration);
+            now.elapsed().map_err(|_| ())
         });
 
         if let Some(excess_duration) = sleep_result {

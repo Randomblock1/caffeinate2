@@ -3,7 +3,7 @@ use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionRelease,
     IOPMUserActiveType, kIOPMAssertionLevelOff, kIOPMAssertionLevelOn, kIOReturnBadArgument,
-    kIOReturnNotFound, kIOReturnNotPrivileged,
+    kIOReturnNotFound,
 };
 use std::{fmt, mem::MaybeUninit};
 
@@ -185,18 +185,13 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
         );
     }
 
-    if result == 0 {
-        Ok(())
-    } else if result == kIOReturnNotPrivileged {
-        Err(result as u32)
-    } else {
-        Err(result as u32)
-    }
+    if result == 0 { Ok(()) } else { Err(result) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_io_kit::kIOReturnNotPrivileged;
 
     #[test]
     fn test_create_assertion() {

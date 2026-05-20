@@ -1,22 +1,27 @@
-#![cfg(target_os = "macos")]
-
-pub mod power_management;
-pub mod process_lock;
-pub mod duration_parser;
-
+#[cfg(target_os = "macos")]
+use caffeinate2::{duration_parser, power_management, process_lock};
+#[cfg(target_os = "macos")]
 use clap::Parser;
+#[cfg(target_os = "macos")]
 use nix::{sys::event, unistd};
+#[cfg(target_os = "macos")]
 use signal_hook::{consts::SIGINT, iterator::Signals};
+#[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "macos")]
 use std::process;
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::thread;
 
+#[cfg(target_os = "macos")]
 struct ActiveAssertions {
     _assertions: Vec<power_management::PowerAssertion>,
     _sleep_guard: Option<process_lock::ProcessLock>,
 }
 
+#[cfg(target_os = "macos")]
 fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     if args.dry_run {
         return ActiveAssertions {
@@ -103,6 +108,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -160,6 +166,7 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let mut args = Args::parse();
     if !(args.display
@@ -171,10 +178,6 @@ fn main() {
     {
         // Default to system sleep if no other options are specified
         args.system = true;
-    }
-
-    if !cfg!(target_os = "macos") {
-        panic!("This program only works on macOS.");
     }
 
     if args.verbose {
@@ -270,7 +273,8 @@ fn main() {
         if timeout {
             // Timeout selected
             // Print how long we're waiting for
-            match duration_parser::parse_duration(&args.timeout.expect("Timeout should be present")) {
+            match duration_parser::parse_duration(&args.timeout.expect("Timeout should be present"))
+            {
                 Ok(d) => duration = d,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -398,7 +402,7 @@ fn main() {
     process::exit(exit_code);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
     fn test_set_assertions_dry_run() {
@@ -492,5 +496,6 @@ mod tests {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    println!("Not supported on this OS");
+    eprintln!("caffeinate2 only supports macOS.");
+    std::process::exit(1);
 }

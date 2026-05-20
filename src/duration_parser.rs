@@ -5,13 +5,15 @@ pub fn parse_duration(duration: &str) -> Result<chrono::Duration, String> {
         Ok(std_duration) => chrono::Duration::from_std(std_duration)
             .map_err(|_| "Error: Timeout is too large!".to_string()),
         Err(_) => {
-            let seconds = duration.parse::<u64>().map_err(|_| {
-                "Error: Timeout isn't a valid duration or number!".to_string()
-            })?;
+            let seconds = duration
+                .parse::<u64>()
+                .map_err(|_| "Error: Timeout isn't a valid duration or number!".to_string())?;
 
-            chrono::Duration::try_seconds(seconds.try_into().map_err(|_| {
-                "Error: Timeout is too large!".to_string()
-            })?)
+            chrono::Duration::try_seconds(
+                seconds
+                    .try_into()
+                    .map_err(|_| "Error: Timeout is too large!".to_string())?,
+            )
             .ok_or_else(|| "Error: Timeout is too large!".to_string())
         }
     }
@@ -30,11 +32,14 @@ mod tests {
     fn test_parse_duration_valid_strings() {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 1 * DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND);
+        assert_eq!(
+            result.num_seconds(),
+            DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND
+        );
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 1 * DAY + 2 * HOUR + 3 * MINUTE);
+        assert_eq!(result.num_seconds(), DAY + 2 * HOUR + 3 * MINUTE);
 
         let duration = "3min 17h 2s";
         let result = parse_duration(duration).unwrap();
@@ -84,9 +89,6 @@ mod tests {
         // 10000000000000000000 is > i64::MAX
         let duration = "10000000000000000000";
         let result = parse_duration(duration);
-        assert_eq!(
-            result.unwrap_err(),
-            "Error: Timeout is too large!"
-        );
+        assert_eq!(result.unwrap_err(), "Error: Timeout is too large!");
     }
 }
