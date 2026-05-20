@@ -38,36 +38,36 @@ impl TrayMode {
 
     pub fn enable(self) -> Result<ActiveMode, u32> {
         match self {
-            TrayMode::Display => ActiveMode::Assertion(power_management::create_assertion(
+            TrayMode::Display => Ok(ActiveMode::Assertion(power_management::create_assertion(
                 AssertionType::PreventUserIdleDisplaySleep,
                 true,
                 false,
-            )?),
-            TrayMode::Disk => ActiveMode::Assertion(power_management::create_assertion(
+            )?)),
+            TrayMode::Disk => Ok(ActiveMode::Assertion(power_management::create_assertion(
                 AssertionType::PreventDiskIdle,
                 true,
                 false,
-            )?),
-            TrayMode::System => ActiveMode::Assertion(power_management::create_assertion(
+            )?)),
+            TrayMode::System => Ok(ActiveMode::Assertion(power_management::create_assertion(
                 AssertionType::PreventUserIdleSystemSleep,
                 true,
                 false,
-            )?),
-            TrayMode::SystemOnAc => ActiveMode::Assertion(power_management::create_assertion(
+            )?)),
+            TrayMode::SystemOnAc => Ok(ActiveMode::Assertion(power_management::create_assertion(
                 AssertionType::PreventSystemSleep,
                 true,
                 false,
-            )?),
-            TrayMode::UserActive => ActiveMode::Assertion(
+            )?)),
+            TrayMode::UserActive => Ok(ActiveMode::Assertion(
                 power_management::declare_user_activity(true, false)?,
-            ),
+            )),
             TrayMode::Entirely => {
                 let client = crate::helper_ipc::HelperClient::new();
                 if !client.is_available() {
                     return Err(0);
                 }
                 client.hold().map_err(|_| 0)?;
-                ActiveMode::EntirelyHold(client)
+                Ok(ActiveMode::EntirelyHold(client))
             }
         }
     }
