@@ -1,33 +1,9 @@
 use crate::{
-    lockfile::{self, ProcessChecker, ProcessId, ProcessStartTime},
+    lockfile::{self, ProcessChecker, ProcessId},
     power_management,
+    process_util::{self, ProcessStartTime},
 };
-use libc::{PROC_PIDTBSDINFO, proc_bsdinfo, proc_pidinfo};
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
 use std::path::PathBuf;
-
-fn get_process_start_time(pid: i32) -> Option<ProcessStartTime> {
-    unsafe {
-        let mut info = std::mem::zeroed::<proc_bsdinfo>();
-        let size = std::mem::size_of::<proc_bsdinfo>() as i32;
-        let ret = proc_pidinfo(
-            pid,
-            PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut _,
-            size,
-        );
-        if ret == size {
-            Some(ProcessStartTime {
-                seconds: info.pbi_start_tvsec,
-                microseconds: info.pbi_start_tvusec,
-            })
-        } else {
-            None
-        }
-    }
-}
 
 type SleepDisabler = Box<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
 
@@ -51,17 +27,17 @@ impl ProcessLock {
             verbose,
             lock_path,
             Box::new(power_management::set_sleep_disabled),
-            Box::new(default_process_checker),
+            Box::new(process_util::default_process_checker),
         )
     }
 
-    fn with_options(
+    pub(crate) fn with_options(
         verbose: bool,
         lock_file_path: PathBuf,
         sleep_disabler: SleepDisabler,
         process_checker: Box<ProcessChecker>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let process_id = current_process_id()?;
+        let process_id = process_util::process_id_from_pid(std::process::id() as i32)?;
         let should_disable = lockfile::update_lockfile(
             true,
             verbose,
@@ -102,31 +78,6 @@ impl ProcessLock {
     }
 }
 
-fn current_process_id() -> Result<ProcessId, std::io::Error> {
-    let pid = std::process::id() as i32;
-    let start_time = get_process_start_time(pid)
-        .ok_or_else(|| std::io::Error::other("Failed to determine current process start time"))?;
-    Ok(ProcessId { pid, start_time })
-}
-
-fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
-    let is_alive = match kill(Pid::from_raw(pid), None) {
-        Ok(_) => true,
-        Err(nix::errno::Errno::ESRCH) => false,
-        Err(_) => true, // Assume alive on permission errors
-    };
-
-    if !is_alive {
-        return false;
-    }
-
-    // Verify start time to prevent PID reuse issues
-    match get_process_start_time(pid) {
-        Some(actual_start_time) => actual_start_time == start_time,
-        None => true,
-    }
-}
-
 impl Drop for ProcessLock {
     fn drop(&mut self) {
         match lockfile::update_lockfile(
@@ -155,6 +106,35 @@ impl Drop for ProcessLock {
     }
 }
 
+/// Used when the privileged helper is available.
+pub struct HelperEntirelyGuard {
+    _guard: crate::helper_ipc::HelperHoldGuard,
+}
+
+impl HelperEntirelyGuard {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            _guard: crate::helper_ipc::HelperHoldGuard::acquire()?,
+        })
+    }
+}
+
+/// Acquire entirely sleep prevention via helper or in-process lock.
+pub fn acquire_entirely(verbose: bool) -> Result<EntirelyGuard, Box<dyn std::error::Error>> {
+    let client = crate::helper_ipc::HelperClient::new();
+    if client.is_available() {
+        return Ok(EntirelyGuard::Helper(HelperEntirelyGuard::new().map_err(
+            |e| -> Box<dyn std::error::Error> { e.into() },
+        )?));
+    }
+    Ok(EntirelyGuard::ProcessLock(ProcessLock::new(verbose)?))
+}
+
+pub enum EntirelyGuard {
+    ProcessLock(ProcessLock),
+    Helper(HelperEntirelyGuard),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,14 +156,20 @@ mod tests {
     #[test]
     fn test_process_checker_rejects_current_pid_with_wrong_start_time() {
         let current_pid = std::process::id() as i32;
-        let current_start_time = get_process_start_time(current_pid).unwrap();
+        let current_start_time = process_util::get_process_start_time(current_pid).unwrap();
         let wrong_start_time = ProcessStartTime {
             seconds: current_start_time.seconds.saturating_add(1),
             microseconds: current_start_time.microseconds,
         };
 
-        assert!(default_process_checker(current_pid, current_start_time));
-        assert!(!default_process_checker(current_pid, wrong_start_time));
+        assert!(process_util::default_process_checker(
+            current_pid,
+            current_start_time
+        ));
+        assert!(!process_util::default_process_checker(
+            current_pid,
+            wrong_start_time
+        ));
     }
 
     #[test]

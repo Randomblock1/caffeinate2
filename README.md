@@ -20,7 +20,41 @@ _This won't be available until version 1.0.0._
 
 ### Cargo
 
+CLI only (default):
+
 `cargo install caffeinate2`
+
+Menu bar + privileged helper:
+
+`cargo install caffeinate2 --features full`
+
+From a clone:
+
+`cargo build --release --features full`
+
+## Menu bar
+
+Run `caffeinate2-tray` after installing with `--features full`.
+
+- **Left click:** toggle the selected sleep mode on/off.
+- **Right click:** choose mode (Display, Disk, System, System on AC, User active, Entirely), toggle **Start at login**, or Quit.
+
+Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
+
+Unsigned binaries may require running from Terminal once (right-click → Open) or allowing in Privacy & Security.
+
+## Entirely mode (no repeated sudo)
+
+Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid is closed. It uses a small privileged helper daemon.
+
+**One-time setup** (either method):
+
+1. Tray: select **Entirely** and approve the administrator dialog when prompted, or
+2. CLI: `sudo caffeinate2 install-helper`
+
+After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
+
+Remove the helper: `sudo caffeinate2 uninstall-helper`
 
 ## Usage
 
@@ -44,6 +78,10 @@ Options:
   -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
   -h, --help                Print help
   -V, --version             Print version
+
+Subcommands:
+  install-helper            Install privileged helper for entirely mode (root)
+  uninstall-helper          Remove privileged helper (root)
 ```
 
 ## Sleep Timers (in order of priority)

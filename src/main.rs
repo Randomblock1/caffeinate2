@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
-use caffeinate2::{duration_parser, power_management, process_lock};
+use caffeinate2::{duration_parser, install, power_management, process_lock};
+#[cfg(target_os = "macos")]
+use clap::Subcommand;
 #[cfg(any(test, target_os = "macos"))]
 use clap::Parser;
 #[cfg(target_os = "macos")]
@@ -18,7 +20,7 @@ use std::thread;
 #[cfg(target_os = "macos")]
 struct ActiveAssertions {
     _assertions: Vec<power_management::PowerAssertion>,
-    _sleep_guard: Option<process_lock::ProcessLock>,
+    _sleep_guard: Option<process_lock::EntirelyGuard>,
 }
 
 #[cfg(target_os = "macos")]
@@ -31,12 +33,15 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 
     let sleep_guard = if args.entirely {
-        match process_lock::ProcessLock::new(args.verbose) {
+        match process_lock::acquire_entirely(args.verbose) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 eprintln!(
                     "Error: Failed to acquire process lock or disable sleep: {}",
                     e
+                );
+                eprintln!(
+                    "Hint: install the privileged helper with: sudo caffeinate2 install-helper"
                 );
                 process::exit(1);
             }
@@ -108,9 +113,30 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Subcommand, Debug)]
+enum MaintenanceCommand {
+    /// Install the privileged helper for entirely mode (requires root).
+    InstallHelper,
+    /// Remove the privileged helper (requires root).
+    UninstallHelper,
+    /// Internal entry point used after administrator authorization.
+    #[command(hide = true, name = "install-helper-internal")]
+    InstallHelperInternal,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<MaintenanceCommand>,
+    #[command(flatten)]
+    args: Args,
+}
+
 #[cfg(any(test, target_os = "macos"))]
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 struct Args {
     /// Verbose mode
     #[arg(short, long)]
@@ -336,8 +362,55 @@ fn wait_for_pid(
 }
 
 #[cfg(target_os = "macos")]
+fn run_maintenance(command: MaintenanceCommand) {
+    match command {
+        MaintenanceCommand::InstallHelper => {
+            if let Err(e) = install::install_helper_privileged() {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+            println!("Installed caffeinate2 helper.");
+        }
+        MaintenanceCommand::UninstallHelper => {
+            if !nix::unistd::Uid::effective().is_root() {
+                eprintln!("Error: uninstall-helper must run as root (try sudo).");
+                process::exit(1);
+            }
+            if let Err(e) = install::uninstall_helper() {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+            println!("Uninstalled caffeinate2 helper.");
+        }
+        MaintenanceCommand::InstallHelperInternal => {
+            if !nix::unistd::Uid::effective().is_root() {
+                eprintln!("Error: install-helper-internal must run as root.");
+                process::exit(1);
+            }
+            let source = match install::resolve_helper_source() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = install::install_helper(&source) {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
-    let mut args = Args::parse();
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        run_maintenance(command);
+        return;
+    }
+
+    let mut args = cli.args;
     apply_default_assertion(&mut args);
 
     if args.verbose {
@@ -517,7 +590,14 @@ mod tests {
     use clap::Parser;
 
     fn parse_args(args: &[&str]) -> Args {
-        Args::try_parse_from(args).unwrap()
+        #[cfg(target_os = "macos")]
+        {
+            return Cli::try_parse_from(args).unwrap().args;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Args::try_parse_from(args).unwrap();
+        }
     }
 
     #[test]
