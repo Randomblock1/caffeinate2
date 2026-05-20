@@ -217,7 +217,7 @@ fn build_menu(state: &AppState) -> (Menu, MenuHandles) {
 
     menu.append(&PredefinedMenuItem::separator()).expect("separator");
 
-    let time_limit_submenu = Submenu::new("Time limit", true).expect("time limit submenu");
+    let time_limit_submenu = Submenu::new("Time limit", true);
     let mut time_limit_items = Vec::new();
     for preset in TimeLimitPreset::ALL {
         let item = CheckMenuItem::new(
