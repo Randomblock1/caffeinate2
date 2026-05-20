@@ -1,7 +1,7 @@
 use crate::{
-    lockfile::{self, ProcessChecker, ProcessId},
+    lockfile::{self, ProcessChecker, ProcessId, ProcessStartTime},
     power_management,
-    process_util::{self, ProcessStartTime},
+    process_util,
 };
 use std::path::PathBuf;
 

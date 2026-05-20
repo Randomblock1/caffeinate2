@@ -165,24 +165,12 @@ impl Drop for HelperHoldGuard {
 
 #[cfg(target_os = "macos")]
 pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId, String> {
+    use nix::sys::socket::getsockopt;
+    use nix::sys::socket::sockopt::LocalPeerPid;
     use std::os::unix::io::AsRawFd;
 
-    let mut pid: libc::pid_t = 0;
-    let fd = stream.as_raw_fd();
-    let ret = unsafe {
-        libc::getpeereid(
-            fd,
-            &mut pid as *mut libc::pid_t,
-            std::ptr::null_mut(),
-        )
-    };
-    if ret != 0 {
-        return Err(format!(
-            "getpeereid failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    process_util::process_id_from_pid(pid as i32).map_err(|e| e.to_string())
+    let pid = getsockopt(stream.as_raw_fd(), LocalPeerPid).map_err(|e| e.to_string())?;
+    process_util::process_id_from_pid(pid).map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]
