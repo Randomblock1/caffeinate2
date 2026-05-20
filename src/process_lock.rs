@@ -1,5 +1,5 @@
 use crate::{
-    lockfile::{self, ProcessChecker, ProcessId, ProcessStartTime},
+    lockfile::{self, ProcessChecker, ProcessId},
     power_management,
     process_util,
 };
@@ -157,7 +157,7 @@ mod tests {
     fn test_process_checker_rejects_current_pid_with_wrong_start_time() {
         let current_pid = std::process::id() as i32;
         let current_start_time = process_util::get_process_start_time(current_pid).unwrap();
-        let wrong_start_time = ProcessStartTime {
+        let wrong_start_time = lockfile::ProcessStartTime {
             seconds: current_start_time.seconds.saturating_add(1),
             microseconds: current_start_time.microseconds,
         };
@@ -187,7 +187,8 @@ mod tests {
             Ok(())
         });
 
-        let process_checker = Box::new(|_pid: i32, _start_time: ProcessStartTime| false);
+        let process_checker =
+            Box::new(|_pid: i32, _start_time: lockfile::ProcessStartTime| false);
 
         let lock =
             ProcessLock::with_options(true, lock_path.clone(), sleep_disabler, process_checker)
@@ -215,7 +216,8 @@ mod tests {
 
         let sleep_disabler = Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1));
 
-        let process_checker = Box::new(|_pid: i32, _start_time: ProcessStartTime| false);
+        let process_checker =
+            Box::new(|_pid: i32, _start_time: lockfile::ProcessStartTime| false);
 
         let result =
             ProcessLock::with_options(false, lock_path.clone(), sleep_disabler, process_checker);

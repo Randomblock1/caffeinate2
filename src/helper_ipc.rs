@@ -167,9 +167,8 @@ impl Drop for HelperHoldGuard {
 pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId, String> {
     use nix::sys::socket::getsockopt;
     use nix::sys::socket::sockopt::LocalPeerPid;
-    use std::os::unix::io::AsRawFd;
 
-    let pid = getsockopt(stream.as_raw_fd(), LocalPeerPid).map_err(|e| e.to_string())?;
+    let pid = getsockopt(&stream, LocalPeerPid).map_err(|e| e.to_string())?;
     process_util::process_id_from_pid(pid).map_err(|e| e.to_string())
 }
 
