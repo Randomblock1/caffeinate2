@@ -1,13 +1,15 @@
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use caffeinate2::install;
 #[cfg(all(target_os = "macos", feature = "tray"))]
-use caffeinate2::tray_mode::{self, ActiveMode, TrayMode};
+use caffeinate2::tray_mode::{self, ActiveMode, TimeLimitPreset, TrayConfig, TrayMode};
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use caffeinate2::tray_icons;
 #[cfg(all(target_os = "macos", feature = "tray"))]
-use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use std::sync::{Arc, Mutex};
+#[cfg(all(target_os = "macos", feature = "tray"))]
+use std::time::{Duration, Instant};
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use tray_icon::menu::MenuId;
 #[cfg(all(target_os = "macos", feature = "tray"))]
@@ -16,18 +18,36 @@ use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 #[cfg(all(target_os = "macos", feature = "tray"))]
 struct AppState {
     mode: TrayMode,
+    time_limit_secs: Option<u64>,
     active: Option<ActiveMode>,
+    active_until: Option<Instant>,
+    last_tooltip_remaining_secs: Option<u64>,
     start_at_login: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 impl AppState {
     fn new() -> Self {
+        let config = tray_mode::load_config();
         Self {
-            mode: tray_mode::load_config(),
+            mode: config.mode,
+            time_limit_secs: config.time_limit_secs,
             active: None,
+            active_until: None,
+            last_tooltip_remaining_secs: None,
             start_at_login: install::tray_launch_agent_installed(),
         }
+    }
+
+    fn config(&self) -> TrayConfig {
+        TrayConfig {
+            mode: self.mode,
+            time_limit_secs: self.time_limit_secs,
+        }
+    }
+
+    fn save_config(&self) -> Result<(), String> {
+        tray_mode::save_config(&self.config())
     }
 
     fn is_on(&self) -> bool {
@@ -47,11 +67,51 @@ impl AppState {
         ) {
             let _ = tray.set_icon(Some(icon));
         }
+        self.update_tooltip(tray);
+    }
+
+    fn update_tooltip(&self, tray: &tray_icon::TrayIcon) {
+        let tooltip = if self.is_on() {
+            if let Some(until) = self.active_until {
+                let remaining = until.saturating_duration_since(Instant::now()).as_secs();
+                if remaining > 0 {
+                    format!(
+                        "caffeinate2 ({})",
+                        tray_mode::format_remaining_secs(remaining)
+                    )
+                } else {
+                    "caffeinate2".to_string()
+                }
+            } else {
+                "caffeinate2".to_string()
+            }
+        } else {
+            "caffeinate2".to_string()
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+
+    fn clear_active(&mut self) {
+        self.active = None;
+        self.active_until = None;
+        self.last_tooltip_remaining_secs = None;
+    }
+
+    fn check_timeout(&mut self) -> bool {
+        if self.active.is_some()
+            && self
+                .active_until
+                .is_some_and(|until| Instant::now() >= until)
+        {
+            self.clear_active();
+            return true;
+        }
+        false
     }
 
     fn toggle(&mut self) -> Result<(), String> {
         if self.active.is_some() {
-            self.active = None;
+            self.clear_active();
             return Ok(());
         }
         self.enable()?;
@@ -72,17 +132,26 @@ impl AppState {
         self.active = Some(self.mode.enable().map_err(|_| {
             "failed to enable sleep prevention (entirely mode requires the helper)".to_string()
         })?);
+        self.active_until = self
+            .time_limit_secs
+            .map(|secs| Instant::now() + Duration::from_secs(secs));
         Ok(())
     }
 
     fn set_mode(&mut self, mode: TrayMode) -> Result<(), String> {
         let was_on = self.active.is_some();
-        self.active = None;
+        self.clear_active();
         self.mode = mode;
-        let _ = tray_mode::save_config(mode);
+        self.save_config()?;
         if was_on {
             self.enable()?;
         }
+        Ok(())
+    }
+
+    fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), String> {
+        self.time_limit_secs = time_limit_secs;
+        self.save_config()?;
         Ok(())
     }
 
@@ -128,6 +197,7 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 #[cfg(all(target_os = "macos", feature = "tray"))]
 struct MenuHandles {
     mode_items: Vec<(MenuId, TrayMode, CheckMenuItem)>,
+    time_limit_items: Vec<(MenuId, Option<u64>, CheckMenuItem)>,
     start_at_login: CheckMenuItem,
     start_at_login_id: MenuId,
     quit_id: MenuId,
@@ -147,6 +217,26 @@ fn build_menu(state: &AppState) -> (Menu, MenuHandles) {
 
     menu.append(&PredefinedMenuItem::separator()).expect("separator");
 
+    let time_limit_submenu = Submenu::new("Time limit", true).expect("time limit submenu");
+    let mut time_limit_items = Vec::new();
+    for preset in TimeLimitPreset::ALL {
+        let item = CheckMenuItem::new(
+            preset.label,
+            true,
+            state.time_limit_secs == preset.seconds,
+            None,
+        );
+        let id = item.id().clone();
+        time_limit_items.push((id, preset.seconds, item.clone()));
+        time_limit_submenu
+            .append(&item)
+            .expect("append time limit item");
+    }
+    menu.append(&time_limit_submenu)
+        .expect("append time limit submenu");
+
+    menu.append(&PredefinedMenuItem::separator()).expect("separator");
+
     let start_at_login =
         CheckMenuItem::new("Start at login", true, state.start_at_login, None);
     let start_at_login_id = start_at_login.id().clone();
@@ -162,6 +252,7 @@ fn build_menu(state: &AppState) -> (Menu, MenuHandles) {
         menu,
         MenuHandles {
             mode_items,
+            time_limit_items,
             start_at_login,
             start_at_login_id,
             quit_id,
@@ -173,6 +264,13 @@ fn build_menu(state: &AppState) -> (Menu, MenuHandles) {
 fn refresh_mode_checks(handles: &MenuHandles, selected: TrayMode) {
     for (_, mode, item) in &handles.mode_items {
         let _ = item.set_checked(*mode == selected);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+fn refresh_time_limit_checks(handles: &MenuHandles, selected: Option<u64>) {
+    for (_, secs, item) in &handles.time_limit_items {
+        let _ = item.set_checked(*secs == selected);
     }
 }
 
@@ -204,6 +302,21 @@ fn run() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     loop {
+        {
+            let mut s = state.lock().expect("state lock");
+            if s.check_timeout() {
+                s.set_icon(&tray);
+            } else if s.is_on()
+                && let Some(until) = s.active_until
+            {
+                let remaining = until.saturating_duration_since(Instant::now()).as_secs();
+                if s.last_tooltip_remaining_secs != Some(remaining) {
+                    s.last_tooltip_remaining_secs = Some(remaining);
+                    s.update_tooltip(&tray);
+                }
+            }
+        }
+
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == handles.quit_id {
                 break;
@@ -230,6 +343,17 @@ fn run() -> Result<(), String> {
                     break;
                 }
             }
+            for (id, secs, _) in &handles.time_limit_items {
+                if event.id == *id {
+                    let mut s = state.lock().expect("state lock");
+                    if let Err(e) = s.set_time_limit(*secs) {
+                        eprintln!("{e}");
+                    } else {
+                        refresh_time_limit_checks(&handles, *secs);
+                    }
+                    break;
+                }
+            }
         }
 
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
@@ -251,7 +375,7 @@ fn run() -> Result<(), String> {
     }
 
     let mut s = state.lock().expect("state lock");
-    s.active = None;
+    s.clear_active();
     Ok(())
 }
 
@@ -260,7 +384,10 @@ impl AppState {
     fn clone_for_menu(&self) -> Self {
         Self {
             mode: self.mode,
+            time_limit_secs: self.time_limit_secs,
             active: None,
+            active_until: None,
+            last_tooltip_remaining_secs: None,
             start_at_login: self.start_at_login,
         }
     }

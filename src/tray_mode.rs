@@ -91,6 +91,78 @@ impl Drop for ActiveMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeLimitPreset {
+    pub label: &'static str,
+    pub seconds: Option<u64>,
+}
+
+impl TimeLimitPreset {
+    pub const ALL: [TimeLimitPreset; 7] = [
+        TimeLimitPreset {
+            label: "Off",
+            seconds: None,
+        },
+        TimeLimitPreset {
+            label: "15 minutes",
+            seconds: Some(15 * 60),
+        },
+        TimeLimitPreset {
+            label: "30 minutes",
+            seconds: Some(30 * 60),
+        },
+        TimeLimitPreset {
+            label: "1 hour",
+            seconds: Some(60 * 60),
+        },
+        TimeLimitPreset {
+            label: "2 hours",
+            seconds: Some(2 * 60 * 60),
+        },
+        TimeLimitPreset {
+            label: "4 hours",
+            seconds: Some(4 * 60 * 60),
+        },
+        TimeLimitPreset {
+            label: "8 hours",
+            seconds: Some(8 * 60 * 60),
+        },
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayConfig {
+    pub mode: TrayMode,
+    pub time_limit_secs: Option<u64>,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            mode: TrayMode::default(),
+            time_limit_secs: None,
+        }
+    }
+}
+
+pub fn format_remaining_secs(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m remaining")
+        } else {
+            format!("{hours}h remaining")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m remaining")
+    } else {
+        format!("{seconds}s remaining")
+    }
+}
+
 pub fn config_path() -> Result<std::path::PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -100,25 +172,31 @@ pub fn config_path() -> Result<std::path::PathBuf, String> {
         .join("tray.toml"))
 }
 
-pub fn load_config() -> TrayMode {
+pub fn load_config() -> TrayConfig {
     let path = match config_path() {
         Ok(p) => p,
-        Err(_) => return TrayMode::default(),
+        Err(_) => return TrayConfig::default(),
     };
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return TrayMode::default(),
+        Err(_) => return TrayConfig::default(),
     };
-    parse_config_mode(&content).unwrap_or_default()
+    parse_config(&content).unwrap_or_default()
 }
 
-fn parse_config_mode(content: &str) -> Option<TrayMode> {
+fn parse_config(content: &str) -> Option<TrayConfig> {
+    let mut config = TrayConfig::default();
+    let mut found_mode = false;
+
     for line in content.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "mode" {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "mode" => {
                 let value = value.trim().trim_matches('"');
-                return Some(match value {
+                config.mode = match value {
                     "display" => TrayMode::Display,
                     "disk" => TrayMode::Disk,
                     "system" => TrayMode::System,
@@ -126,19 +204,28 @@ fn parse_config_mode(content: &str) -> Option<TrayMode> {
                     "user_active" => TrayMode::UserActive,
                     "entirely" => TrayMode::Entirely,
                     _ => return None,
-                });
+                };
+                found_mode = true;
             }
+            "time_limit_secs" => {
+                config.time_limit_secs = value.trim().parse().ok();
+            }
+            _ => {}
         }
     }
-    None
+
+    found_mode.then_some(config)
 }
 
-pub fn save_config(mode: TrayMode) -> Result<(), String> {
+pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let content = format!("mode = \"{}\"\n", serde_variant(mode));
+    let mut content = format!("mode = \"{}\"\n", serde_variant(config.mode));
+    if let Some(secs) = config.time_limit_secs {
+        content.push_str(&format!("time_limit_secs = {secs}\n"));
+    }
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -150,5 +237,31 @@ fn serde_variant(mode: TrayMode) -> &'static str {
         TrayMode::SystemOnAc => "system_on_ac",
         TrayMode::UserActive => "user_active",
         TrayMode::Entirely => "entirely",
+    }
+}
+
+#[cfg(all(test, feature = "tray"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_defaults_time_limit_to_off() {
+        let config = parse_config("mode = \"system\"\n").unwrap();
+        assert_eq!(config.mode, TrayMode::System);
+        assert_eq!(config.time_limit_secs, None);
+    }
+
+    #[test]
+    fn parse_config_reads_time_limit() {
+        let config = parse_config("mode = \"display\"\ntime_limit_secs = 1800\n").unwrap();
+        assert_eq!(config.mode, TrayMode::Display);
+        assert_eq!(config.time_limit_secs, Some(1800));
+    }
+
+    #[test]
+    fn format_remaining_secs() {
+        assert_eq!(format_remaining_secs(45), "45s remaining");
+        assert_eq!(format_remaining_secs(90), "1m remaining");
+        assert_eq!(format_remaining_secs(3661), "1h 1m remaining");
     }
 }

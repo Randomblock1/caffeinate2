@@ -37,7 +37,9 @@ From a clone:
 Run `caffeinate2-tray` after installing with `--features full`.
 
 - **Left click:** toggle the selected sleep mode on/off.
-- **Right click:** choose mode (Display, Disk, System, System on AC, User active, Entirely), toggle **Start at login**, or Quit.
+- **Right click:** choose mode (Display, Disk, System, System on AC, User active, Entirely), set an optional **Time limit** (Off, 15 minutes, 30 minutes, 1 hour, and so on), toggle **Start at login**, or Quit.
+
+When a time limit is set, left-clicking to start sleep prevention automatically turns it off again after that duration (similar to `caffeinate2 -t`). The menu bar tooltip shows the remaining time while active.
 
 Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
 
