@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use caffeinate2::{duration_parser, power_management, process_lock};
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 use clap::Parser;
 #[cfg(target_os = "macos")]
 use nix::{sys::event, unistd};
@@ -108,7 +108,7 @@ fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -166,9 +166,18 @@ struct Args {
     command: Option<Vec<String>>,
 }
 
-#[cfg(target_os = "macos")]
-fn main() {
-    let mut args = Args::parse();
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, PartialEq, Eq)]
+enum WaitMode {
+    Command,
+    Timeout,
+    Pid,
+    TimeoutOrPid,
+    UntilInterrupt,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn apply_default_assertion(args: &mut Args) {
     if !(args.display
         || args.disk
         || args.system
@@ -176,14 +185,12 @@ fn main() {
         || args.entirely
         || args.user_active)
     {
-        // Default to system sleep if no other options are specified
         args.system = true;
     }
+}
 
-    if args.verbose {
-        println!("DEBUG {:#?}", &args);
-    }
-
+#[cfg(any(test, target_os = "macos"))]
+fn selected_sleep_types(args: &Args) -> Vec<&'static str> {
     let mut sleep_types = Vec::new();
 
     if args.display {
@@ -205,7 +212,142 @@ fn main() {
         sleep_types.push("User active");
     }
 
-    let mut sleep_str = format!("Preventing sleep types: [{}] ", sleep_types.join(", "));
+    sleep_types
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn wait_mode(args: &Args) -> WaitMode {
+    if args.command.is_some() {
+        WaitMode::Command
+    } else {
+        match (args.timeout.is_some(), args.waitfor.is_some()) {
+            (true, true) => WaitMode::TimeoutOrPid,
+            (true, false) => WaitMode::Timeout,
+            (false, true) => WaitMode::Pid,
+            (false, false) => WaitMode::UntilInterrupt,
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn format_timeout_duration(duration: chrono::Duration) -> String {
+    let seconds = duration.num_seconds() % 60;
+    let minutes = duration.num_minutes() % 60;
+    let hours = duration.num_hours() % 24;
+    let days = duration.num_days();
+    let mut parts = Vec::new();
+
+    if days > 0 {
+        parts.push(format!("{} day{}", days, if days != 1 { "s" } else { "" }));
+    }
+    if hours > 0 {
+        parts.push(format!(
+            "{} hour{}",
+            hours,
+            if hours != 1 { "s" } else { "" }
+        ));
+    }
+    if minutes > 0 {
+        parts.push(format!(
+            "{} minute{}",
+            minutes,
+            if minutes != 1 { "s" } else { "" }
+        ));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!(
+            "{} second{}",
+            seconds,
+            if seconds != 1 { "s" } else { "" }
+        ));
+    }
+
+    parts.join(" ")
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum WaitForPidResult {
+    Exited(i32),
+    TimedOut,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum WaitForPidError {
+    NotFound,
+    Kevent(nix::Error),
+}
+
+#[cfg(target_os = "macos")]
+fn timespec_from_duration(duration: std::time::Duration) -> libc::timespec {
+    let max_seconds = <libc::time_t>::MAX as u64;
+    libc::timespec {
+        tv_sec: duration.as_secs().min(max_seconds) as libc::time_t,
+        tv_nsec: duration.subsec_nanos() as libc::c_long,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_pid(
+    pid: i32,
+    timeout: Option<std::time::Duration>,
+    verbose: bool,
+) -> Result<WaitForPidResult, WaitForPidError> {
+    let kq = event::Kqueue::new().map_err(WaitForPidError::Kevent)?;
+    let kev = event::KEvent::new(
+        pid as usize,
+        event::EventFilter::EVFILT_PROC,
+        event::EvFlags::EV_ADD
+            | event::EvFlags::EV_ENABLE
+            | event::EvFlags::EV_ONESHOT
+            | event::EvFlags::EV_ERROR,
+        event::FilterFlag::NOTE_EXITSTATUS,
+        0,
+        0,
+    );
+
+    let mut eventlist = [kev];
+    let timeout = timeout.map(timespec_from_duration);
+    let event_count = kq
+        .kevent(&[kev], &mut eventlist, timeout)
+        .map_err(WaitForPidError::Kevent)?;
+
+    if event_count == 0 {
+        return Ok(WaitForPidResult::TimedOut);
+    }
+
+    let event = eventlist[0];
+    if verbose {
+        println!("{:#?}", event);
+    }
+
+    if event.flags().contains(event::EvFlags::EV_ERROR) {
+        if event.data() == nix::Error::ESRCH as isize {
+            Err(WaitForPidError::NotFound)
+        } else {
+            Err(WaitForPidError::Kevent(nix::Error::from_raw(
+                event.data() as i32
+            )))
+        }
+    } else {
+        Ok(WaitForPidResult::Exited(event.data() as i32))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    let mut args = Args::parse();
+    apply_default_assertion(&mut args);
+
+    if args.verbose {
+        println!("DEBUG {:#?}", &args);
+    }
+
+    let mut sleep_str = format!(
+        "Preventing sleep types: [{}] ",
+        selected_sleep_types(&args).join(", ")
+    );
 
     let assertions = Arc::new(Mutex::new(Some(set_assertions(&args, true))));
     let assertions_clone = assertions.clone();
@@ -223,178 +365,139 @@ fn main() {
         }
     });
 
-    if let Some(command) = args.command {
-        sleep_str += "until command finishes.";
-        println!("{sleep_str}");
+    match wait_mode(&args) {
+        WaitMode::Command => {
+            let command = args.command.expect("Command should be present");
+            sleep_str += "until command finishes.";
+            println!("{sleep_str}");
 
-        let uid;
-        let gid;
+            let uid;
+            let gid;
 
-        if args.drop_root {
-            let uid_str =
-                std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
-            let gid_str =
-                std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
+            if args.drop_root {
+                let uid_str =
+                    std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
+                let gid_str =
+                    std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
 
-            uid = uid_str.parse::<u32>().expect("Invalid UID");
-            gid = gid_str.parse::<u32>().expect("Invalid GID");
-        } else {
-            uid = unistd::getuid().into();
-            gid = unistd::getgid().into();
-        }
-
-        if args.verbose {
-            println!("uid: {uid}, gid: {gid}");
-        }
-
-        let mut child = process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(command.join(" "))
-            .stdout(process::Stdio::inherit())
-            .stderr(process::Stdio::inherit())
-            .uid(uid)
-            .gid(gid)
-            .spawn()
-            .expect("Failed to execute command");
-
-        exit_code = child
-            .wait()
-            .expect("Command wasn't running")
-            .code()
-            .unwrap_or(0);
-    } else if args.timeout.is_some() || args.waitfor.is_some() {
-        // If timeout or waitfor is used, wait appropriately
-
-        let mut duration = chrono::Duration::try_seconds(0).unwrap();
-        let mut end_time = chrono::Local::now();
-
-        let timeout = args.timeout.is_some();
-        let waitfor = args.waitfor.is_some();
-        if timeout {
-            // Timeout selected
-            // Print how long we're waiting for
-            match duration_parser::parse_duration(&args.timeout.expect("Timeout should be present"))
-            {
-                Ok(d) => duration = d,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    process::exit(1);
-                }
+                uid = uid_str.parse::<u32>().expect("Invalid UID");
+                gid = gid_str.parse::<u32>().expect("Invalid GID");
+            } else {
+                uid = unistd::getuid().into();
+                gid = unistd::getgid().into();
             }
-            end_time += duration;
-            let seconds = duration.num_seconds() % 60;
-            let minutes = duration.num_minutes() % 60;
-            let hours = duration.num_hours() % 24;
-            let days = duration.num_days();
 
-            sleep_str += &format!(
-                "for {}{}{}{}",
-                if days > 0 {
-                    format!("{} day{} ", days, if days != 1 { "s" } else { "" })
-                } else {
-                    String::from("")
-                },
-                if hours > 0 {
-                    format!("{} hour{} ", hours, if hours != 1 { "s" } else { "" })
-                } else {
-                    String::from("")
-                },
-                if minutes > 0 {
-                    format!("{} minute{} ", minutes, if minutes != 1 { "s" } else { "" })
-                } else {
-                    String::from("")
-                },
-                if seconds % 60 > 0 || seconds == 0 {
-                    format!(
-                        "{} second{}",
-                        seconds,
-                        if seconds % 60 != 1 { "s" } else { "" }
-                    )
-                } else {
-                    String::new()
-                }
-            );
-        }
-
-        print!("{sleep_str}");
-
-        if timeout && waitfor {
-            print!(" or ");
-        }
-        if waitfor {
-            print!(
-                "until PID {} finishes",
-                args.waitfor.expect("PID should be present")
-            );
-        }
-        println!(".");
-
-        const SHORT_FMT: &str = "at %-I:%M:%S %p";
-        const LONG_FMT: &str = "on %B %-d at %-I:%M:%S %p";
-
-        if timeout {
-            // Print when we're resuming
-            println!(
-                "Resuming {}.",
-                if duration.num_seconds() > (60 * 60 * 24) {
-                    end_time.format(LONG_FMT)
-                } else {
-                    end_time.format(SHORT_FMT)
-                }
-            );
-            thread::sleep(duration.to_std().expect("Duration should be valid"));
-        }
-
-        if waitfor {
-            let pid = args.waitfor.expect("PID should be present");
-
-            // wait without polling using kevent
-            let kq = event::Kqueue::new().expect("Failed to create Kqueue");
-            let kev = event::KEvent::new(
-                pid as usize,
-                event::EventFilter::EVFILT_PROC,
-                event::EvFlags::EV_ADD
-                    | event::EvFlags::EV_ENABLE
-                    | event::EvFlags::EV_ONESHOT
-                    | event::EvFlags::EV_ERROR,
-                event::FilterFlag::NOTE_EXITSTATUS,
-                0,
-                0,
-            );
-
-            let mut eventlist = [kev];
-
-            kq.kevent(&[kev], &mut eventlist, None)
-                .expect("Failed to register Kqueue event");
             if args.verbose {
-                println!("{:#?}", kev)
-            };
-
-            if eventlist[0].flags().contains(event::EvFlags::EV_ERROR) {
-                if eventlist[0].data() == nix::Error::ESRCH as isize {
-                    println!("PID {} not found", pid);
-                } else {
-                    eprintln!(
-                        "kevent error waiting for PID {}: {}",
-                        pid,
-                        nix::Error::from_raw(eventlist[0].data() as i32)
-                    );
-                }
-                process::exit(1);
+                println!("uid: {uid}, gid: {gid}");
             }
 
-            exit_code = eventlist[0].data() as i32;
+            let mut child = process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command.join(" "))
+                .stdout(process::Stdio::inherit())
+                .stderr(process::Stdio::inherit())
+                .uid(uid)
+                .gid(gid)
+                .spawn()
+                .expect("Failed to execute command");
 
-            print!("PID {pid} finished ");
-            let now = chrono::Local::now();
-            print!("{} ", now.format(SHORT_FMT));
-            println!("with exit code {}", exit_code);
+            exit_code = child
+                .wait()
+                .expect("Command wasn't running")
+                .code()
+                .unwrap_or(0);
         }
-    } else {
-        // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
-        sleep_str += "until Ctrl+C pressed.";
-        println!("{}", sleep_str);
-        thread::park();
+        WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
+            // If timeout or waitfor is used, wait appropriately
+
+            let mut duration = chrono::Duration::try_seconds(0).unwrap();
+            let mut end_time = chrono::Local::now();
+
+            let timeout = args.timeout.is_some();
+            let waitfor = args.waitfor.is_some();
+            if timeout {
+                // Timeout selected
+                // Print how long we're waiting for
+                match duration_parser::parse_duration(
+                    &args.timeout.expect("Timeout should be present"),
+                ) {
+                    Ok(d) => duration = d,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        process::exit(1);
+                    }
+                }
+                end_time += duration;
+                sleep_str += &format!("for {}", format_timeout_duration(duration));
+            }
+
+            print!("{sleep_str}");
+
+            if timeout && waitfor {
+                print!(" or ");
+            }
+            if waitfor {
+                print!(
+                    "until PID {} finishes",
+                    args.waitfor.expect("PID should be present")
+                );
+            }
+            println!(".");
+
+            const SHORT_FMT: &str = "at %-I:%M:%S %p";
+            const LONG_FMT: &str = "on %B %-d at %-I:%M:%S %p";
+
+            if timeout {
+                // Print when we're resuming
+                println!(
+                    "Resuming {}.",
+                    if duration.num_seconds() > (60 * 60 * 24) {
+                        end_time.format(LONG_FMT)
+                    } else {
+                        end_time.format(SHORT_FMT)
+                    }
+                );
+                if !waitfor {
+                    thread::sleep(duration.to_std().expect("Duration should be valid"));
+                }
+            }
+
+            if waitfor {
+                let pid = args.waitfor.expect("PID should be present");
+
+                let timeout = if timeout {
+                    Some(duration.to_std().expect("Duration should be valid"))
+                } else {
+                    None
+                };
+
+                match wait_for_pid(pid, timeout, args.verbose) {
+                    Ok(WaitForPidResult::Exited(pid_exit_code)) => {
+                        exit_code = pid_exit_code;
+
+                        print!("PID {pid} finished ");
+                        let now = chrono::Local::now();
+                        print!("{} ", now.format(SHORT_FMT));
+                        println!("with exit code {}", exit_code);
+                    }
+                    Ok(WaitForPidResult::TimedOut) => {}
+                    Err(WaitForPidError::NotFound) => {
+                        println!("PID {} not found", pid);
+                        process::exit(1);
+                    }
+                    Err(WaitForPidError::Kevent(e)) => {
+                        eprintln!("kevent error waiting for PID {}: {}", pid, e);
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+        WaitMode::UntilInterrupt => {
+            // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
+            sleep_str += "until Ctrl+C pressed.";
+            println!("{}", sleep_str);
+            thread::park();
+        }
     }
     if let Ok(mut guard) = assertions.lock() {
         let _ = guard.take();
@@ -402,8 +505,102 @@ fn main() {
     process::exit(exit_code);
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("caffeinate2 only supports macOS.");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
 mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_args(args: &[&str]) -> Args {
+        Args::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn defaults_to_system_assertion_when_no_assertion_flags_are_set() {
+        let mut args = parse_args(&["caffeinate2"]);
+
+        apply_default_assertion(&mut args);
+
+        assert!(args.system);
+        assert_eq!(selected_sleep_types(&args), vec!["System"]);
+    }
+
+    #[test]
+    fn explicit_assertion_flags_do_not_add_default_system_assertion() {
+        let mut args = parse_args(&["caffeinate2", "--display", "--user-active"]);
+
+        apply_default_assertion(&mut args);
+
+        assert!(args.display);
+        assert!(args.user_active);
+        assert!(!args.system);
+        assert_eq!(selected_sleep_types(&args), vec!["Display", "User active"]);
+    }
+
+    #[test]
+    fn wait_mode_matches_cli_priority() {
+        assert_eq!(
+            wait_mode(&parse_args(&["caffeinate2"])),
+            WaitMode::UntilInterrupt
+        );
+        assert_eq!(
+            wait_mode(&parse_args(&["caffeinate2", "--timeout", "10m"])),
+            WaitMode::Timeout
+        );
+        assert_eq!(
+            wait_mode(&parse_args(&["caffeinate2", "--waitfor", "123"])),
+            WaitMode::Pid
+        );
+        assert_eq!(
+            wait_mode(&parse_args(&[
+                "caffeinate2",
+                "--timeout",
+                "10m",
+                "--waitfor",
+                "123"
+            ])),
+            WaitMode::TimeoutOrPid
+        );
+        assert_eq!(
+            wait_mode(&parse_args(&[
+                "caffeinate2",
+                "--timeout",
+                "10m",
+                "echo",
+                "ok"
+            ])),
+            WaitMode::Command
+        );
+    }
+
+    #[test]
+    fn timeout_duration_format_omits_zero_components() {
+        assert_eq!(
+            format_timeout_duration(chrono::Duration::try_seconds(0).unwrap()),
+            "0 seconds"
+        );
+        assert_eq!(
+            format_timeout_duration(chrono::Duration::try_seconds(60).unwrap()),
+            "1 minute"
+        );
+        assert_eq!(
+            format_timeout_duration(chrono::Duration::try_seconds(3661).unwrap()),
+            "1 hour 1 minute 1 second"
+        );
+        assert_eq!(
+            format_timeout_duration(chrono::Duration::try_seconds(90_061).unwrap()),
+            "1 day 1 hour 1 minute 1 second"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
     #[test]
     fn test_set_assertions_dry_run() {
         let args = super::Args {
@@ -425,77 +622,4 @@ mod tests {
         assert!(assertions._assertions.is_empty());
         assert!(assertions._sleep_guard.is_none());
     }
-
-    #[test]
-    fn test_set_assertions_display() {
-        let args = super::Args {
-            verbose: false,
-            dry_run: false,
-            drop_root: false,
-            display: true,
-            disk: false,
-            system: false,
-            system_on_ac: false,
-            entirely: false,
-            user_active: false,
-            timeout: None,
-            waitfor: None,
-            command: None,
-        };
-
-        let assertions = super::set_assertions(&args, true);
-        assert_eq!(assertions._assertions.len(), 1);
-        assert!(assertions._sleep_guard.is_none());
-    }
-
-    #[test]
-    fn test_set_assertions_multiple_flags() {
-        let args = super::Args {
-            verbose: false,
-            dry_run: false,
-            drop_root: false,
-            display: true,
-            disk: true,
-            system: true,
-            system_on_ac: false,
-            entirely: false,
-            user_active: false,
-            timeout: None,
-            waitfor: None,
-            command: None,
-        };
-
-        let assertions = super::set_assertions(&args, true);
-        // Should have 3 assertions: display, disk, system
-        assert_eq!(assertions._assertions.len(), 3);
-        assert!(assertions._sleep_guard.is_none());
-    }
-
-    #[test]
-    fn test_set_assertions_system_on_ac() {
-        let args = super::Args {
-            verbose: false,
-            dry_run: false,
-            drop_root: false,
-            display: false,
-            disk: false,
-            system: false,
-            system_on_ac: true,
-            entirely: false,
-            user_active: false,
-            timeout: None,
-            waitfor: None,
-            command: None,
-        };
-
-        let assertions = super::set_assertions(&args, true);
-        assert_eq!(assertions._assertions.len(), 1);
-        assert!(assertions._sleep_guard.is_none());
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    eprintln!("caffeinate2 only supports macOS.");
-    std::process::exit(1);
 }

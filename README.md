@@ -60,10 +60,10 @@ Sleep is disabled for a certain amount of time or until the program with the spe
 specified, it waits until one of them completes.
 
 Timeout can either be a number of seconds or a duration string. For example, you can pass `-t 600` or `-t 10m` to wait
-for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`, but it only looks at the
-first letter (so "3 movies" is just 3 minutes). Anything that's not a number followed by a letter will be ignored (the "
-and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise, it will try to parse
-anything that's past the space as a command, and ignore the timeout.
+for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`. Supported units include
+seconds, minutes, hours, days, weeks, months, and years, plus common short forms like `s`, `m`, `h`, and `d`.
+**YOU MUST USE QUOTATION MARKS FOR MULTI-WORD DURATIONS TO WORK.** Otherwise, it will try to parse anything that's past
+the space as a command, and ignore the timeout.
 
 For PIDs, it will wait until the specified program exits. If the program doesn't exist, it will immediately exit with an
 error. Once the program completes, caffeinate2 will exit with the same exit code as the program.
