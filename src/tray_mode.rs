@@ -1,95 +1,9 @@
-use crate::power_management::{self, AssertionType, PowerAssertion};
+use crate::app_target::AppTarget;
+use crate::duration_parser::format_remaining_secs;
+use crate::sleep_mode::{ActiveSleepHold, SleepMode};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TrayMode {
-    Display,
-    Disk,
-    #[default]
-    System,
-    SystemOnAc,
-    UserActive,
-    Entirely,
-}
-
-impl TrayMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            TrayMode::Display => "Display",
-            TrayMode::Disk => "Disk",
-            TrayMode::System => "System",
-            TrayMode::SystemOnAc => "System (on AC)",
-            TrayMode::UserActive => "User active",
-            TrayMode::Entirely => "Entirely",
-        }
-    }
-
-    pub fn all() -> [TrayMode; 6] {
-        [
-            TrayMode::Display,
-            TrayMode::Disk,
-            TrayMode::System,
-            TrayMode::SystemOnAc,
-            TrayMode::UserActive,
-            TrayMode::Entirely,
-        ]
-    }
-
-    pub fn enable(self) -> Result<ActiveMode, u32> {
-        match self {
-            TrayMode::Display => Ok(ActiveMode::Assertion(power_management::create_assertion(
-                AssertionType::PreventUserIdleDisplaySleep,
-                true,
-                false,
-            )?)),
-            TrayMode::Disk => Ok(ActiveMode::Assertion(power_management::create_assertion(
-                AssertionType::PreventDiskIdle,
-                true,
-                false,
-            )?)),
-            TrayMode::System => Ok(ActiveMode::Assertion(power_management::create_assertion(
-                AssertionType::PreventUserIdleSystemSleep,
-                true,
-                false,
-            )?)),
-            TrayMode::SystemOnAc => Ok(ActiveMode::Assertion(power_management::create_assertion(
-                AssertionType::PreventSystemSleep,
-                true,
-                false,
-            )?)),
-            TrayMode::UserActive => Ok(ActiveMode::Assertion(
-                power_management::declare_user_activity(true, false)?,
-            )),
-            TrayMode::Entirely => {
-                let client = crate::helper_ipc::HelperClient::new();
-                if !client.is_available() {
-                    return Err(0);
-                }
-                client.hold().map_err(|_| 0u32)?;
-                Ok(ActiveMode::EntirelyHold(client))
-            }
-        }
-    }
-}
-
-pub enum ActiveMode {
-    Assertion(PowerAssertion),
-    EntirelyHold(crate::helper_ipc::HelperClient),
-}
-
-impl Drop for ActiveMode {
-    fn drop(&mut self) {
-        match self {
-            ActiveMode::Assertion(_) => {}
-            ActiveMode::EntirelyHold(client) => {
-                if let Err(e) = client.release() {
-                    eprintln!("Error releasing entirely hold: {e}");
-                }
-            }
-        }
-    }
-}
+pub use crate::sleep_mode::SleepMode as TrayMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeLimitPreset {
@@ -130,46 +44,16 @@ impl TimeLimitPreset {
     ];
 }
 
-/// Stop sleep prevention when no running instance of this bundle remains.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitForApp {
-    pub bundle_id: String,
-    pub name: String,
-}
+pub type ActiveMode = ActiveSleepHold;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TrayConfig {
-    pub mode: TrayMode,
+    #[serde(default)]
+    pub mode: SleepMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_limit_secs: Option<u64>,
-    pub wait_for_app: Option<WaitForApp>,
-}
-
-impl Default for TrayConfig {
-    fn default() -> Self {
-        Self {
-            mode: TrayMode::default(),
-            time_limit_secs: None,
-            wait_for_app: None,
-        }
-    }
-}
-
-pub fn format_remaining_secs(secs: u64) -> String {
-    let hours = secs / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-
-    if hours > 0 {
-        if minutes > 0 {
-            format!("{hours}h {minutes}m remaining")
-        } else {
-            format!("{hours}h remaining")
-        }
-    } else if minutes > 0 {
-        format!("{minutes}m remaining")
-    } else {
-        format!("{seconds}s remaining")
-    }
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for_app: Option<AppTarget>,
 }
 
 pub fn config_path() -> Result<std::path::PathBuf, String> {
@@ -190,21 +74,17 @@ pub fn load_config() -> TrayConfig {
         Ok(c) => c,
         Err(_) => return TrayConfig::default(),
     };
-    parse_config(&content).unwrap_or_default()
-}
-
-fn parse_quoted_value(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        Some(value[1..value.len() - 1].to_string())
-    } else {
-        None
+    match toml::from_str::<TrayConfig>(&content) {
+        Ok(config) => config,
+        Err(_) => migrate_legacy_config(&content).unwrap_or_default(),
     }
 }
 
-fn parse_config(content: &str) -> Option<TrayConfig> {
+fn migrate_legacy_config(content: &str) -> Option<TrayConfig> {
     let mut config = TrayConfig::default();
     let mut any = false;
+    let mut bundle_id = None::<String>;
+    let mut app_name = None::<String>;
 
     for line in content.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -214,15 +94,7 @@ fn parse_config(content: &str) -> Option<TrayConfig> {
         match key.trim() {
             "mode" => {
                 let value = value.trim().trim_matches('"');
-                config.mode = match value {
-                    "display" => TrayMode::Display,
-                    "disk" => TrayMode::Disk,
-                    "system" => TrayMode::System,
-                    "system_on_ac" => TrayMode::SystemOnAc,
-                    "user_active" => TrayMode::UserActive,
-                    "entirely" => TrayMode::Entirely,
-                    _ => return None,
-                };
+                config.mode = toml::from_str(&format!("\"{value}\"")).ok()?;
                 any = true;
             }
             "time_limit_secs" => {
@@ -230,29 +102,22 @@ fn parse_config(content: &str) -> Option<TrayConfig> {
                 any = true;
             }
             "wait_for_bundle_id" => {
-                let bundle_id = parse_quoted_value(value)?;
-                if bundle_id.is_empty() {
-                    config.wait_for_app = None;
-                } else {
-                    let name = config
-                        .wait_for_app
-                        .as_ref()
-                        .map(|a| a.name.clone())
-                        .unwrap_or_else(|| bundle_id.clone());
-                    config.wait_for_app = Some(WaitForApp { bundle_id, name });
-                }
+                bundle_id = Some(value.trim().trim_matches('"').to_string());
                 any = true;
             }
             "wait_for_app_name" => {
-                if let Some(name) = parse_quoted_value(value) {
-                    if let Some(app) = &mut config.wait_for_app {
-                        app.name = name;
-                    }
-                }
+                app_name = Some(value.trim().trim_matches('"').to_string());
                 any = true;
             }
             _ => {}
         }
+    }
+
+    if let Some(id) = bundle_id.filter(|s| !s.is_empty()) {
+        config.wait_for_app = Some(AppTarget {
+            bundle_id: id.clone(),
+            name: app_name.unwrap_or(id),
+        });
     }
 
     any.then_some(config)
@@ -263,27 +128,14 @@ pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut content = format!("mode = \"{}\"\n", serde_variant(config.mode));
-    if let Some(secs) = config.time_limit_secs {
-        content.push_str(&format!("time_limit_secs = {secs}\n"));
-    }
-    if let Some(app) = &config.wait_for_app {
-        content.push_str(&format!(
-            "wait_for_bundle_id = \"{}\"\n",
-            app.bundle_id.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
-        content.push_str(&format!(
-            "wait_for_app_name = \"{}\"\n",
-            app.name.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
-    }
+    let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
 /// Build menu bar tooltip text while sleep prevention is active.
 pub fn format_active_tooltip(
     remaining_secs: Option<u64>,
-    wait_for_app: Option<&WaitForApp>,
+    wait_for_app: Option<&AppTarget>,
     waiting_for_app_launch: bool,
 ) -> String {
     let mut parts = Vec::new();
@@ -304,45 +156,28 @@ pub fn format_active_tooltip(
     }
 }
 
-fn serde_variant(mode: TrayMode) -> &'static str {
-    match mode {
-        TrayMode::Display => "display",
-        TrayMode::Disk => "disk",
-        TrayMode::System => "system",
-        TrayMode::SystemOnAc => "system_on_ac",
-        TrayMode::UserActive => "user_active",
-        TrayMode::Entirely => "entirely",
-    }
-}
-
 #[cfg(all(test, feature = "tray"))]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_config_defaults_time_limit_to_off() {
-        let config = parse_config("mode = \"system\"\n").unwrap();
-        assert_eq!(config.mode, TrayMode::System);
+        let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
+        assert_eq!(config.mode, SleepMode::System);
         assert_eq!(config.time_limit_secs, None);
     }
 
     #[test]
     fn parse_config_reads_time_limit() {
-        let config = parse_config("mode = \"display\"\ntime_limit_secs = 1800\n").unwrap();
-        assert_eq!(config.mode, TrayMode::Display);
+        let config: TrayConfig =
+            toml::from_str("mode = \"display\"\ntime_limit_secs = 1800\n").unwrap();
+        assert_eq!(config.mode, SleepMode::Display);
         assert_eq!(config.time_limit_secs, Some(1800));
     }
 
     #[test]
-    fn format_remaining_secs_display() {
-        assert_eq!(super::format_remaining_secs(45), "45s remaining");
-        assert_eq!(super::format_remaining_secs(90), "1m remaining");
-        assert_eq!(super::format_remaining_secs(3661), "1h 1m remaining");
-    }
-
-    #[test]
-    fn parse_config_reads_wait_for_app() {
-        let config = parse_config(
+    fn migrate_legacy_flat_wait_for_app_keys() {
+        let config = migrate_legacy_config(
             "mode = \"system\"\nwait_for_bundle_id = \"com.example.app\"\nwait_for_app_name = \"Example\"\n",
         )
         .unwrap();
@@ -352,8 +187,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_reads_wait_for_app() {
+        let config: TrayConfig = toml::from_str(
+            r#"
+mode = "system"
+
+[wait_for_app]
+bundle_id = "com.example.app"
+name = "Example"
+"#,
+        )
+        .unwrap();
+        let app = config.wait_for_app.unwrap();
+        assert_eq!(app.bundle_id, "com.example.app");
+        assert_eq!(app.name, "Example");
+    }
+
+    #[test]
     fn format_active_tooltip_combines_limit_and_app() {
-        let app = WaitForApp {
+        let app = AppTarget {
             bundle_id: "com.example".into(),
             name: "Example".into(),
         };

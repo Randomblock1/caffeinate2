@@ -1,32 +1,20 @@
 //! Running application discovery and bundle selection (tray).
 
+use crate::app_target::AppTarget;
 use objc2_app_kit::{
     NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel, NSRunningApplication,
     NSWorkspace,
 };
 use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSURL};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunningAppChoice {
-    pub bundle_id: String,
-    pub name: String,
-}
-
-/// User-visible app target stored in tray config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppBundleChoice {
-    pub bundle_id: String,
-    pub name: String,
-}
-
-pub fn running_app_choices() -> Vec<RunningAppChoice> {
+pub fn running_app_choices() -> Vec<AppTarget> {
     if MainThreadMarker::new().is_none() {
         return Vec::new();
     }
 
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
-    let mut choices: Vec<RunningAppChoice> = Vec::new();
+    let mut choices: Vec<AppTarget> = Vec::new();
 
     for app in apps.iter() {
         if app.isTerminated() {
@@ -53,7 +41,7 @@ pub fn running_app_choices() -> Vec<RunningAppChoice> {
                 existing.name = name;
             }
         } else {
-            choices.push(RunningAppChoice { bundle_id, name });
+            choices.push(AppTarget { bundle_id, name });
         }
     }
 
@@ -72,7 +60,7 @@ pub fn is_bundle_running(bundle_id: &str) -> bool {
 }
 
 /// Modal open panel for an `.app` bundle (including apps that are not running).
-pub fn choose_app_bundle() -> Option<AppBundleChoice> {
+pub fn choose_app_bundle() -> Option<AppTarget> {
     let mtm = MainThreadMarker::new()?;
     let panel = NSOpenPanel::openPanel(mtm);
     panel.setCanChooseFiles(true);
@@ -94,7 +82,7 @@ pub fn choose_app_bundle() -> Option<AppBundleChoice> {
     bundle_from_app_path(&path)
 }
 
-pub fn bundle_from_app_path(path: &str) -> Option<AppBundleChoice> {
+pub fn bundle_from_app_path(path: &str) -> Option<AppTarget> {
     let ns_path = NSString::from_str(path);
     let url = NSURL::fileURLWithPath(&ns_path);
     let bundle = NSBundle::bundleWithURL(&url)?;
@@ -107,5 +95,5 @@ pub fn bundle_from_app_path(path: &str) -> Option<AppBundleChoice> {
         .and_then(|s| s.to_str())
         .unwrap_or(&bundle_id)
         .to_string();
-    Some(AppBundleChoice { bundle_id, name })
+    Some(AppTarget { bundle_id, name })
 }

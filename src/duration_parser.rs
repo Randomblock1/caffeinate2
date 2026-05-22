@@ -49,6 +49,61 @@ fn duration_without_connectors(duration: &str) -> Option<String> {
     removed_connector.then(|| parts.join(" "))
 }
 
+/// Human-readable duration for CLI messages (e.g. "1 hour 30 minutes").
+pub fn format_duration_human(duration: chrono::Duration) -> String {
+    let seconds = duration.num_seconds() % 60;
+    let minutes = duration.num_minutes() % 60;
+    let hours = duration.num_hours() % 24;
+    let days = duration.num_days();
+    let mut parts = Vec::new();
+
+    if days > 0 {
+        parts.push(format!("{} day{}", days, if days != 1 { "s" } else { "" }));
+    }
+    if hours > 0 {
+        parts.push(format!(
+            "{} hour{}",
+            hours,
+            if hours != 1 { "s" } else { "" }
+        ));
+    }
+    if minutes > 0 {
+        parts.push(format!(
+            "{} minute{}",
+            minutes,
+            if minutes != 1 { "s" } else { "" }
+        ));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!(
+            "{} second{}",
+            seconds,
+            if seconds != 1 { "s" } else { "" }
+        ));
+    }
+
+    parts.join(" ")
+}
+
+/// Compact remaining-time label for tray tooltips (e.g. "1h 30m remaining").
+pub fn format_remaining_secs(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m remaining")
+        } else {
+            format!("{hours}h remaining")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m remaining")
+    } else {
+        format!("{seconds}s remaining")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +112,33 @@ mod tests {
     const MINUTE: i64 = 60 * SECOND;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
+
+    #[test]
+    fn format_duration_human_omits_zero_components() {
+        assert_eq!(
+            format_duration_human(chrono::Duration::try_seconds(0).unwrap()),
+            "0 seconds"
+        );
+        assert_eq!(
+            format_duration_human(chrono::Duration::try_seconds(60).unwrap()),
+            "1 minute"
+        );
+        assert_eq!(
+            format_duration_human(chrono::Duration::try_seconds(3661).unwrap()),
+            "1 hour 1 minute 1 second"
+        );
+        assert_eq!(
+            format_duration_human(chrono::Duration::try_seconds(90_061).unwrap()),
+            "1 day 1 hour 1 minute 1 second"
+        );
+    }
+
+    #[test]
+    fn format_remaining_secs_display() {
+        assert_eq!(format_remaining_secs(45), "45s remaining");
+        assert_eq!(format_remaining_secs(90), "1m remaining");
+        assert_eq!(format_remaining_secs(3661), "1h 1m remaining");
+    }
 
     #[test]
     fn test_parse_duration_valid_strings() {

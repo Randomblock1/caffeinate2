@@ -1,8 +1,11 @@
+pub mod app_target;
 pub mod duration_parser;
 #[cfg(any(all(test, unix), target_os = "macos"))]
 pub mod lockfile;
 #[cfg(target_os = "macos")]
 pub mod power_management;
+#[cfg(target_os = "macos")]
+pub mod sleep_mode;
 #[cfg(target_os = "macos")]
 pub mod process_lock;
 #[cfg(target_os = "macos")]
@@ -21,3 +24,5 @@ pub mod tray_mode;
 pub mod macos_activation;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod tray_icons;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+pub mod tray;

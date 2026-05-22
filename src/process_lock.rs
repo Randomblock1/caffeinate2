@@ -1,143 +1,50 @@
 use crate::{
-    lockfile::{self, ProcessChecker, ProcessId},
-    power_management,
-    process_util,
+    entirely::{EntirelyCoordinator, EntirelyHoldGuard},
+    helper_ipc::HelperHoldGuard,
 };
-use std::path::PathBuf;
 
-type SleepDisabler = Box<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
-
-pub struct ProcessLock {
-    verbose: bool,
-    lock_file_path: PathBuf,
-    sleep_disabler: SleepDisabler,
-    process_checker: Box<ProcessChecker>,
-    process_id: ProcessId,
-}
-
-impl ProcessLock {
-    pub fn new(verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        let lock_path = if nix::unistd::getuid().is_root() {
-            PathBuf::from("/var/run/caffeinate2.lock")
-        } else {
-            PathBuf::from(format!("/tmp/caffeinate2_{}.lock", nix::unistd::getuid()))
-        };
-
-        Self::with_options(
-            verbose,
-            lock_path,
-            Box::new(power_management::set_sleep_disabled),
-            Box::new(process_util::default_process_checker),
-        )
-    }
-
-    pub(crate) fn with_options(
-        verbose: bool,
-        lock_file_path: PathBuf,
-        sleep_disabler: SleepDisabler,
-        process_checker: Box<ProcessChecker>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let process_id = process_util::process_id_from_pid(std::process::id() as i32)?;
-        let should_disable = lockfile::update_lockfile(
-            true,
-            verbose,
-            &lock_file_path,
-            process_checker.as_ref(),
-            &process_id,
-        )?;
-
-        if should_disable {
-            if verbose {
-                println!("First instance detected. Disabling system sleep globally.");
-            }
-            if let Err(code) = sleep_disabler(true, verbose) {
-                let _ = lockfile::update_lockfile(
-                    false,
-                    verbose,
-                    &lock_file_path,
-                    process_checker.as_ref(),
-                    &process_id,
-                );
-                return Err(std::io::Error::other(format!(
-                    "Failed to disable sleep (IOKit error: {:X})",
-                    code
-                ))
-                .into());
-            }
-        } else if verbose {
-            println!("Other instances running. Sleep already disabled.");
-        }
-
-        Ok(Self {
-            verbose,
-            lock_file_path,
-            sleep_disabler,
-            process_checker,
-            process_id,
-        })
-    }
-}
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        match lockfile::update_lockfile(
-            false,
-            self.verbose,
-            &self.lock_file_path,
-            self.process_checker.as_ref(),
-            &self.process_id,
-        ) {
-            Ok(should_enable) => {
-                if should_enable {
-                    if self.verbose {
-                        println!("Last instance exiting. Re-enabling system sleep globally.");
-                    }
-                    if let Err(code) = (self.sleep_disabler)(false, self.verbose) {
-                        eprintln!("Error: Failed to re-enable sleep (IOKit error: {:X})", code);
-                    }
-                } else if self.verbose {
-                    println!("Other instances still running. Keeping sleep disabled.");
-                }
-            }
-            Err(e) => {
-                eprintln!("Error updating lockfile during exit: {}", e);
-            }
-        }
-    }
-}
-
-/// Used when the privileged helper is available.
-pub struct HelperEntirelyGuard {
-    _guard: crate::helper_ipc::HelperHoldGuard,
-}
-
-impl HelperEntirelyGuard {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            _guard: crate::helper_ipc::HelperHoldGuard::acquire()?,
-        })
-    }
+pub enum EntirelyGuard {
+    Local(EntirelyHoldGuard),
+    Helper(HelperHoldGuard),
 }
 
 /// Acquire entirely sleep prevention via helper or in-process lock.
 pub fn acquire_entirely(verbose: bool) -> Result<EntirelyGuard, Box<dyn std::error::Error>> {
     let client = crate::helper_ipc::HelperClient::new();
     if client.is_available() {
-        return Ok(EntirelyGuard::Helper(HelperEntirelyGuard::new().map_err(
+        return Ok(EntirelyGuard::Helper(HelperHoldGuard::acquire().map_err(
             |e| -> Box<dyn std::error::Error> { e.into() },
         )?));
     }
-    Ok(EntirelyGuard::ProcessLock(ProcessLock::new(verbose)?))
+    Ok(EntirelyGuard::Local(
+        EntirelyCoordinator::cli_fallback(verbose).hold_current_process()?,
+    ))
 }
 
-pub enum EntirelyGuard {
-    ProcessLock(ProcessLock),
-    Helper(HelperEntirelyGuard),
+/// RAII entirely-mode lock for the current process (CLI fallback path).
+pub struct ProcessLock(EntirelyHoldGuard);
+
+impl ProcessLock {
+    pub fn new(verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self(
+            EntirelyCoordinator::cli_fallback(verbose).hold_current_process()?,
+        ))
+    }
+
+    pub(crate) fn with_coordinator(
+        coordinator: EntirelyCoordinator,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self(coordinator.hold_current_process()?))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entirely::EntirelyCoordinator;
+    use crate::lockfile::{ProcessChecker, ProcessStartTime};
+    use crate::process_util;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -157,7 +64,7 @@ mod tests {
     fn test_process_checker_rejects_current_pid_with_wrong_start_time() {
         let current_pid = std::process::id() as i32;
         let current_start_time = process_util::get_process_start_time(current_pid).unwrap();
-        let wrong_start_time = lockfile::ProcessStartTime {
+        let wrong_start_time = crate::lockfile::ProcessStartTime {
             seconds: current_start_time.seconds.saturating_add(1),
             microseconds: current_start_time.microseconds,
         };
@@ -182,17 +89,22 @@ mod tests {
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
         let sleep_calls_clone = sleep_calls.clone();
 
-        let sleep_disabler = Box::new(move |state: bool, _verbose: bool| {
+        let sleep_disabler = Arc::new(Box::new(move |state: bool, _verbose: bool| {
             sleep_calls_clone.lock().unwrap().push(state);
             Ok(())
-        });
+        }) as crate::entirely::SleepDisabler);
 
-        let process_checker =
-            Box::new(|_pid: i32, _start_time: lockfile::ProcessStartTime| false);
+        let process_checker: Arc<ProcessChecker> =
+            Arc::new(|_pid: i32, _start: ProcessStartTime| false);
 
-        let lock =
-            ProcessLock::with_options(true, lock_path.clone(), sleep_disabler, process_checker)
-                .unwrap();
+        let coordinator = EntirelyCoordinator::with_options(
+            true,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        let lock = ProcessLock::with_coordinator(coordinator).unwrap();
 
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -214,13 +126,20 @@ mod tests {
     fn test_sleep_disable_failure_rolls_back_lockfile_entry() {
         let lock_path = temp_lock_path();
 
-        let sleep_disabler = Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1));
+        let sleep_disabler = Arc::new(Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1))
+            as crate::entirely::SleepDisabler);
 
-        let process_checker =
-            Box::new(|_pid: i32, _start_time: lockfile::ProcessStartTime| false);
+        let process_checker: Arc<ProcessChecker> =
+            Arc::new(|_pid: i32, _start: ProcessStartTime| false);
 
-        let result =
-            ProcessLock::with_options(false, lock_path.clone(), sleep_disabler, process_checker);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        let result = ProcessLock::with_coordinator(coordinator);
 
         assert!(result.is_err());
         let content = std::fs::read_to_string(&lock_path).unwrap();

@@ -1,11 +1,16 @@
 #[cfg(target_os = "macos")]
-use caffeinate2::{duration_parser, install, power_management, process_lock};
+mod cli;
 #[cfg(target_os = "macos")]
-use clap::Subcommand;
-#[cfg(any(test, target_os = "macos"))]
+mod wait;
+
+#[cfg(target_os = "macos")]
+use caffeinate2::{duration_parser, install, sleep_mode};
+#[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
-use nix::{sys::event, unistd};
+use cli::{Cli, MaintenanceCommand};
+#[cfg(target_os = "macos")]
+use nix::unistd;
 #[cfg(target_os = "macos")]
 use signal_hook::{consts::SIGINT, iterator::Signals};
 #[cfg(target_os = "macos")]
@@ -13,353 +18,13 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "macos")]
 use std::process;
 #[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::thread;
-
 #[cfg(target_os = "macos")]
-struct ActiveAssertions {
-    _assertions: Vec<power_management::PowerAssertion>,
-    _sleep_guard: Option<process_lock::EntirelyGuard>,
-}
-
-#[cfg(target_os = "macos")]
-fn set_assertions(args: &Args, state: bool) -> ActiveAssertions {
-    if args.dry_run {
-        return ActiveAssertions {
-            _assertions: Vec::new(),
-            _sleep_guard: None,
-        };
-    }
-
-    let sleep_guard = if args.entirely {
-        match process_lock::acquire_entirely(args.verbose) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                eprintln!(
-                    "Error: Failed to acquire process lock or disable sleep: {}",
-                    e
-                );
-                eprintln!(
-                    "Hint: install the privileged helper with: sudo caffeinate2 install-helper"
-                );
-                process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-
-    let mut assertions = Vec::new();
-
-    let mut add_assertion =
-        |result: Result<power_management::PowerAssertion, u32>, name: &str| match result {
-            Ok(assertion) => assertions.push(assertion),
-            Err(code) => {
-                eprintln!(
-                    "Error: Failed to create {} assertion (code: {:X})",
-                    name, code
-                );
-                process::exit(1);
-            }
-        };
-
-    let assertions_config = [
-        (
-            args.display,
-            power_management::AssertionType::PreventUserIdleDisplaySleep,
-            "display sleep",
-        ),
-        (
-            args.disk,
-            power_management::AssertionType::PreventDiskIdle,
-            "disk idle",
-        ),
-        (
-            args.system,
-            power_management::AssertionType::PreventUserIdleSystemSleep,
-            "system sleep",
-        ),
-        (
-            args.system_on_ac,
-            power_management::AssertionType::PreventSystemSleep,
-            "system sleep on AC",
-        ),
-    ];
-
-    for (enabled, assertion_type, name) in assertions_config {
-        if enabled {
-            add_assertion(
-                power_management::create_assertion(assertion_type, state, args.verbose),
-                name,
-            );
-        }
-    }
-
-    if args.user_active {
-        add_assertion(
-            power_management::declare_user_activity(true, args.verbose),
-            "user activity",
-        );
-    }
-
-    if args.verbose {
-        println!("Assertions created");
-    }
-
-    ActiveAssertions {
-        _assertions: assertions,
-        _sleep_guard: sleep_guard,
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Subcommand, Debug)]
-enum MaintenanceCommand {
-    /// Install the privileged helper for entirely mode (requires root).
-    InstallHelper,
-    /// Remove the privileged helper (requires root).
-    UninstallHelper,
-    /// Internal entry point used after administrator authorization.
-    #[command(hide = true, name = "install-helper-internal")]
-    InstallHelperInternal,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<MaintenanceCommand>,
-    #[command(flatten)]
-    args: Args,
-}
-
-#[cfg(any(test, target_os = "macos"))]
-#[derive(Parser, Debug)]
-struct Args {
-    /// Verbose mode
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// Dry run. Don't actually prevent sleep.
-    /// Useful for testing.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Drop root privileges in command.
-    /// You need root to disable sleep entirely,
-    /// but some programs don't want to run as root.
-    #[arg(long)]
-    drop_root: bool,
-
-    /// Disable display sleep
-    #[arg(short, long)]
-    display: bool,
-
-    /// Disable disk idle sleep
-    #[arg(short = 'm', long)]
-    disk: bool,
-
-    /// Disable idle system sleep. [DEFAULT]
-    #[arg(short = 'i', long)]
-    system: bool,
-
-    /// Disable system sleep while not on battery
-    #[arg(short, long)]
-    system_on_ac: bool,
-
-    /// Disable system sleep entirely (ignores lid closing)
-    #[arg(short, long)]
-    entirely: bool,
-
-    /// Declare the user is active.
-    /// If the display is off, this option turns it on and prevents it from going into idle sleep.
-    #[arg(short, long)]
-    user_active: bool,
-
-    /// Wait for X seconds.
-    /// Also supports time units (like "1 day 2 hours 3mins 4s").
-    #[arg(short, long, name = "DURATION")]
-    timeout: Option<String>,
-
-    /// Wait for program with PID X to complete and pass its exit code.
-    #[arg(short, long, name = "PID")]
-    waitfor: Option<i32>,
-
-    /// Wait for given command to complete (takes priority above timeout and pid)
-    #[arg()]
-    command: Option<Vec<String>>,
-}
-
-#[cfg(any(test, target_os = "macos"))]
-#[derive(Debug, PartialEq, Eq)]
-enum WaitMode {
-    Command,
-    Timeout,
-    Pid,
-    TimeoutOrPid,
-    UntilInterrupt,
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn apply_default_assertion(args: &mut Args) {
-    if !(args.display
-        || args.disk
-        || args.system
-        || args.system_on_ac
-        || args.entirely
-        || args.user_active)
-    {
-        args.system = true;
-    }
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn selected_sleep_types(args: &Args) -> Vec<&'static str> {
-    let mut sleep_types = Vec::new();
-
-    if args.display {
-        sleep_types.push("Display");
-    }
-    if args.disk {
-        sleep_types.push("Disk");
-    }
-    if args.system {
-        sleep_types.push("System");
-    }
-    if args.system_on_ac {
-        sleep_types.push("System (if on AC)");
-    }
-    if args.entirely {
-        sleep_types.push("Entirely");
-    }
-    if args.user_active {
-        sleep_types.push("User active");
-    }
-
-    sleep_types
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn wait_mode(args: &Args) -> WaitMode {
-    if args.command.is_some() {
-        WaitMode::Command
-    } else {
-        match (args.timeout.is_some(), args.waitfor.is_some()) {
-            (true, true) => WaitMode::TimeoutOrPid,
-            (true, false) => WaitMode::Timeout,
-            (false, true) => WaitMode::Pid,
-            (false, false) => WaitMode::UntilInterrupt,
-        }
-    }
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn format_timeout_duration(duration: chrono::Duration) -> String {
-    let seconds = duration.num_seconds() % 60;
-    let minutes = duration.num_minutes() % 60;
-    let hours = duration.num_hours() % 24;
-    let days = duration.num_days();
-    let mut parts = Vec::new();
-
-    if days > 0 {
-        parts.push(format!("{} day{}", days, if days != 1 { "s" } else { "" }));
-    }
-    if hours > 0 {
-        parts.push(format!(
-            "{} hour{}",
-            hours,
-            if hours != 1 { "s" } else { "" }
-        ));
-    }
-    if minutes > 0 {
-        parts.push(format!(
-            "{} minute{}",
-            minutes,
-            if minutes != 1 { "s" } else { "" }
-        ));
-    }
-    if seconds > 0 || parts.is_empty() {
-        parts.push(format!(
-            "{} second{}",
-            seconds,
-            if seconds != 1 { "s" } else { "" }
-        ));
-    }
-
-    parts.join(" ")
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq, Eq)]
-enum WaitForPidResult {
-    Exited(i32),
-    TimedOut,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-enum WaitForPidError {
-    NotFound,
-    Kevent(nix::Error),
-}
-
-#[cfg(target_os = "macos")]
-fn timespec_from_duration(duration: std::time::Duration) -> libc::timespec {
-    let max_seconds = <libc::time_t>::MAX as u64;
-    libc::timespec {
-        tv_sec: duration.as_secs().min(max_seconds) as libc::time_t,
-        tv_nsec: duration.subsec_nanos() as libc::c_long,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_pid(
-    pid: i32,
-    timeout: Option<std::time::Duration>,
-    verbose: bool,
-) -> Result<WaitForPidResult, WaitForPidError> {
-    let kq = event::Kqueue::new().map_err(WaitForPidError::Kevent)?;
-    let kev = event::KEvent::new(
-        pid as usize,
-        event::EventFilter::EVFILT_PROC,
-        event::EvFlags::EV_ADD
-            | event::EvFlags::EV_ENABLE
-            | event::EvFlags::EV_ONESHOT
-            | event::EvFlags::EV_ERROR,
-        event::FilterFlag::NOTE_EXITSTATUS,
-        0,
-        0,
-    );
-
-    let mut eventlist = [kev];
-    let timeout = timeout.map(timespec_from_duration);
-    let event_count = kq
-        .kevent(&[kev], &mut eventlist, timeout)
-        .map_err(WaitForPidError::Kevent)?;
-
-    if event_count == 0 {
-        return Ok(WaitForPidResult::TimedOut);
-    }
-
-    let event = eventlist[0];
-    if verbose {
-        println!("{:#?}", event);
-    }
-
-    if event.flags().contains(event::EvFlags::EV_ERROR) {
-        if event.data() == nix::Error::ESRCH as isize {
-            Err(WaitForPidError::NotFound)
-        } else {
-            Err(WaitForPidError::Kevent(nix::Error::from_raw(
-                event.data() as i32
-            )))
-        }
-    } else {
-        Ok(WaitForPidResult::Exited(event.data() as i32))
-    }
-}
+use wait::{wait_for_pid, wait_mode, WaitForPidError, WaitForPidResult, WaitMode};
 
 #[cfg(target_os = "macos")]
 fn run_maintenance(command: MaintenanceCommand) {
@@ -411,30 +76,44 @@ fn main() {
     }
 
     let mut args = cli.args;
-    apply_default_assertion(&mut args);
+    let mut sleep_modes = args.sleep_modes();
+    sleep_modes.apply_defaults();
 
     if args.verbose {
-        println!("DEBUG {:#?}", &args);
+        println!("DEBUG {args:#?}");
     }
 
     let mut sleep_str = format!(
         "Preventing sleep types: [{}] ",
-        selected_sleep_types(&args).join(", ")
+        sleep_modes.selected_labels().join(", ")
     );
 
-    let assertions = Arc::new(Mutex::new(Some(set_assertions(&args, true))));
-    let assertions_clone = assertions.clone();
+    let active = match sleep_modes.enable_all(args.verbose, args.dry_run) {
+        Ok(active) => active,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            if sleep_modes.entirely {
+                eprintln!(
+                    "Hint: install the privileged helper with: sudo caffeinate2 install-helper"
+                );
+            }
+            process::exit(1);
+        }
+    };
 
-    let mut exit_code = 0;
+    let active = Arc::new(Mutex::new(Some(active)));
+    let active_signal = active.clone();
+    let exit_code = Arc::new(AtomicI32::new(0));
+    let exit_code_signal = Arc::clone(&exit_code);
 
     let mut signals = Signals::new([SIGINT]).expect("Failed to create signal iterator");
     thread::spawn(move || {
         if signals.forever().next().is_some() {
             println!("\nStopping...");
-            if let Ok(mut guard) = assertions_clone.lock() {
+            if let Ok(mut guard) = active_signal.lock() {
                 let _ = guard.take();
             }
-            process::exit(exit_code);
+            process::exit(exit_code_signal.load(Ordering::Relaxed));
         }
     });
 
@@ -474,34 +153,34 @@ fn main() {
                 .spawn()
                 .expect("Failed to execute command");
 
-            exit_code = child
+            let code = child
                 .wait()
                 .expect("Command wasn't running")
                 .code()
                 .unwrap_or(0);
+            exit_code.store(code, Ordering::Relaxed);
         }
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
-            // If timeout or waitfor is used, wait appropriately
-
             let mut duration = chrono::Duration::try_seconds(0).unwrap();
             let mut end_time = chrono::Local::now();
 
             let timeout = args.timeout.is_some();
             let waitfor = args.waitfor.is_some();
             if timeout {
-                // Timeout selected
-                // Print how long we're waiting for
                 match duration_parser::parse_duration(
-                    &args.timeout.expect("Timeout should be present"),
+                    args.timeout.as_ref().expect("Timeout should be present"),
                 ) {
                     Ok(d) => duration = d,
                     Err(e) => {
-                        eprintln!("{}", e);
+                        eprintln!("{e}");
                         process::exit(1);
                     }
                 }
                 end_time += duration;
-                sleep_str += &format!("for {}", format_timeout_duration(duration));
+                sleep_str += &format!(
+                    "for {}",
+                    duration_parser::format_duration_human(duration)
+                );
             }
 
             print!("{sleep_str}");
@@ -521,7 +200,6 @@ fn main() {
             const LONG_FMT: &str = "on %B %-d at %-I:%M:%S %p";
 
             if timeout {
-                // Print when we're resuming
                 println!(
                     "Resuming {}.",
                     if duration.num_seconds() > (60 * 60 * 24) {
@@ -538,44 +216,47 @@ fn main() {
             if waitfor {
                 let pid = args.waitfor.expect("PID should be present");
 
-                let timeout = if timeout {
+                let timeout_duration = if timeout {
                     Some(duration.to_std().expect("Duration should be valid"))
                 } else {
                     None
                 };
 
-                match wait_for_pid(pid, timeout, args.verbose) {
+                match wait_for_pid(pid, timeout_duration, args.verbose) {
                     Ok(WaitForPidResult::Exited(pid_exit_code)) => {
-                        exit_code = pid_exit_code;
+                        exit_code.store(pid_exit_code, Ordering::Relaxed);
 
                         print!("PID {pid} finished ");
                         let now = chrono::Local::now();
                         print!("{} ", now.format(SHORT_FMT));
-                        println!("with exit code {}", exit_code);
+                        println!(
+                            "with exit code {}",
+                            exit_code.load(Ordering::Relaxed)
+                        );
                     }
                     Ok(WaitForPidResult::TimedOut) => {}
                     Err(WaitForPidError::NotFound) => {
-                        println!("PID {} not found", pid);
+                        println!("PID {pid} not found");
                         process::exit(1);
                     }
                     Err(WaitForPidError::Kevent(e)) => {
-                        eprintln!("kevent error waiting for PID {}: {}", pid, e);
+                        eprintln!("kevent error waiting for PID {pid}: {e}");
                         process::exit(1);
                     }
                 }
             }
         }
         WaitMode::UntilInterrupt => {
-            // If no timer arguments are provided, disable sleep until Ctrl+C is pressed
             sleep_str += "until Ctrl+C pressed.";
-            println!("{}", sleep_str);
+            println!("{sleep_str}");
             thread::park();
         }
     }
-    if let Ok(mut guard) = assertions.lock() {
+
+    if let Ok(mut guard) = active.lock() {
         let _ = guard.take();
     }
-    process::exit(exit_code);
+    process::exit(exit_code.load(Ordering::Relaxed));
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -584,122 +265,44 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use clap::Parser;
-
-    fn parse_args(args: &[&str]) -> Args {
-        #[cfg(target_os = "macos")]
-        {
-            return Cli::try_parse_from(args).unwrap().args;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            return Args::try_parse_from(args).unwrap();
-        }
-    }
+    use crate::cli::tests::parse_args;
+    use sleep_mode::SleepModeSet;
 
     #[test]
     fn defaults_to_system_assertion_when_no_assertion_flags_are_set() {
-        let mut args = parse_args(&["caffeinate2"]);
-
-        apply_default_assertion(&mut args);
-
-        assert!(args.system);
-        assert_eq!(selected_sleep_types(&args), vec!["System"]);
+        let mut sleep_modes = parse_args(&["caffeinate2"]).sleep_modes();
+        sleep_modes.apply_defaults();
+        assert!(sleep_modes.system);
+        assert_eq!(sleep_modes.selected_labels(), vec!["System"]);
     }
 
     #[test]
     fn explicit_assertion_flags_do_not_add_default_system_assertion() {
-        let mut args = parse_args(&["caffeinate2", "--display", "--user-active"]);
-
-        apply_default_assertion(&mut args);
-
-        assert!(args.display);
-        assert!(args.user_active);
-        assert!(!args.system);
-        assert_eq!(selected_sleep_types(&args), vec!["Display", "User active"]);
-    }
-
-    #[test]
-    fn wait_mode_matches_cli_priority() {
+        let sleep_modes = parse_args(&["caffeinate2", "--display", "--user-active"]).sleep_modes();
+        assert!(sleep_modes.display);
+        assert!(sleep_modes.user_active);
+        assert!(!sleep_modes.system);
         assert_eq!(
-            wait_mode(&parse_args(&["caffeinate2"])),
-            WaitMode::UntilInterrupt
-        );
-        assert_eq!(
-            wait_mode(&parse_args(&["caffeinate2", "--timeout", "10m"])),
-            WaitMode::Timeout
-        );
-        assert_eq!(
-            wait_mode(&parse_args(&["caffeinate2", "--waitfor", "123"])),
-            WaitMode::Pid
-        );
-        assert_eq!(
-            wait_mode(&parse_args(&[
-                "caffeinate2",
-                "--timeout",
-                "10m",
-                "--waitfor",
-                "123"
-            ])),
-            WaitMode::TimeoutOrPid
-        );
-        assert_eq!(
-            wait_mode(&parse_args(&[
-                "caffeinate2",
-                "--timeout",
-                "10m",
-                "echo",
-                "ok"
-            ])),
-            WaitMode::Command
+            sleep_modes.selected_labels(),
+            vec!["Display", "User active"]
         );
     }
 
     #[test]
-    fn timeout_duration_format_omits_zero_components() {
-        assert_eq!(
-            format_timeout_duration(chrono::Duration::try_seconds(0).unwrap()),
-            "0 seconds"
-        );
-        assert_eq!(
-            format_timeout_duration(chrono::Duration::try_seconds(60).unwrap()),
-            "1 minute"
-        );
-        assert_eq!(
-            format_timeout_duration(chrono::Duration::try_seconds(3661).unwrap()),
-            "1 hour 1 minute 1 second"
-        );
-        assert_eq!(
-            format_timeout_duration(chrono::Duration::try_seconds(90_061).unwrap()),
-            "1 day 1 hour 1 minute 1 second"
-        );
-    }
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod macos_tests {
-    #[test]
-    fn test_set_assertions_dry_run() {
-        let args = super::Args {
-            verbose: false,
-            dry_run: true,
-            drop_root: false,
+    fn dry_run_creates_no_assertions() {
+        let sleep_modes = SleepModeSet {
             display: true,
             disk: true,
             system: true,
             system_on_ac: true,
             entirely: true,
             user_active: true,
-            timeout: None,
-            waitfor: None,
-            command: None,
         };
-
-        let assertions = super::set_assertions(&args, true);
-        assert!(assertions._assertions.is_empty());
-        assert!(assertions._sleep_guard.is_none());
+        let active = sleep_modes.enable_all(false, true).unwrap();
+        assert!(active.assertions.is_empty());
+        assert!(active.entirely.is_none());
     }
 }
