@@ -41,6 +41,7 @@ struct EntirelyCoordinatorInner {
     process_checker: Arc<ProcessChecker>,
 }
 
+#[derive(Clone)]
 pub struct EntirelyCoordinator {
     inner: Arc<EntirelyCoordinatorInner>,
 }
@@ -153,7 +154,7 @@ impl EntirelyCoordinator {
         let process_id = process_util::process_id_from_pid(std::process::id() as i32)?;
         self.hold(process_id)?;
         Ok(EntirelyHoldGuard {
-            coordinator: Arc::clone(&self.inner),
+            coordinator: self.clone(),
             process_id,
             active: true,
         })
@@ -165,7 +166,7 @@ impl EntirelyCoordinator {
 }
 
 pub struct EntirelyHoldGuard {
-    coordinator: Arc<EntirelyCoordinatorInner>,
+    coordinator: EntirelyCoordinator,
     process_id: ProcessId,
     active: bool,
 }
@@ -176,31 +177,7 @@ impl EntirelyHoldGuard {
             return Ok(());
         }
         self.active = false;
-
-        let inner = &self.coordinator;
-        let should_enable = lockfile::update_lockfile(
-            false,
-            inner.verbose,
-            &inner.lock_file_path,
-            inner.process_checker.as_ref(),
-            &self.process_id,
-        )?;
-
-        if should_enable {
-            if inner.verbose {
-                eprintln!("Last holder released. Re-enabling system sleep globally.");
-            }
-            if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
-                return Err(std::io::Error::other(format!(
-                    "Failed to re-enable sleep (IOKit error: {code:X})"
-                ))
-                .into());
-            }
-        } else if inner.verbose {
-            eprintln!("Other holders still running. Keeping sleep disabled.");
-        }
-
-        Ok(())
+        self.coordinator.release(self.process_id)
     }
 }
 

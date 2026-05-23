@@ -1,5 +1,5 @@
-use crate::helper_ipc::HelperHoldGuard;
 use crate::power_management::{self, AssertionType, PowerAssertion};
+use crate::process_lock::{acquire_entirely, EntirelyHold};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -12,6 +12,15 @@ pub enum SleepMode {
     SystemOnAc,
     UserActive,
     Entirely,
+}
+
+/// How to acquire entirely-mode sleep prevention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntirelyPolicy {
+    /// Helper daemon required (menu bar); no local lockfile fallback.
+    HelperRequired,
+    /// Prefer helper; fall back to in-process lockfile when unavailable (CLI).
+    HelperOrLocalFallback,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,21 +77,20 @@ impl SleepMode {
         }
     }
 
-    pub fn enable(self, verbose: bool) -> Result<ActiveSleepHold, EnableError> {
+    pub fn enable(
+        self,
+        verbose: bool,
+        entirely_policy: EntirelyPolicy,
+    ) -> Result<ActiveSleepHold, EnableError> {
         match self {
             SleepMode::UserActive => power_management::declare_user_activity(true, verbose)
                 .map(ActiveSleepHold::Assertion)
                 .map_err(EnableError::Iokit),
-            SleepMode::Entirely => {
-                if !crate::helper_ipc::HelperClient::new().is_available() {
-                    return Err(EnableError::HelperUnavailable);
-                }
-                HelperHoldGuard::acquire()
-                    .map(ActiveSleepHold::Entirely)
-                    .map_err(EnableError::Ipc)
-            }
+            SleepMode::Entirely => acquire_entirely(verbose, entirely_policy)
+                .map(ActiveSleepHold::Entirely),
             mode => {
-                let assertion_type = mode.assertion_type().expect("non-entirely modes have assertions");
+                let assertion_type =
+                    mode.assertion_type().expect("non-entirely modes have assertions");
                 power_management::create_assertion(assertion_type, true, verbose)
                     .map(ActiveSleepHold::Assertion)
                     .map_err(EnableError::Iokit)
@@ -91,10 +99,22 @@ impl SleepMode {
     }
 }
 
-/// Active sleep prevention for tray (single mode) or CLI building blocks.
+/// One active sleep-prevention hold (IOKit assertion or entirely-mode lock).
 pub enum ActiveSleepHold {
     Assertion(PowerAssertion),
-    Entirely(HelperHoldGuard),
+    Entirely(EntirelyHold),
+}
+
+/// All holds for a running CLI or tray session.
+#[derive(Default)]
+pub struct ActiveSession {
+    pub holds: Vec<ActiveSleepHold>,
+}
+
+impl ActiveSession {
+    pub fn is_empty(&self) -> bool {
+        self.holds.is_empty()
+    }
 }
 
 /// CLI flags for one or more simultaneous sleep modes.
@@ -146,65 +166,22 @@ impl SleepModeSet {
         &self,
         verbose: bool,
         dry_run: bool,
-    ) -> Result<ActiveSleepModes, Box<dyn std::error::Error>> {
+    ) -> Result<ActiveSession, EnableError> {
         if dry_run {
-            return Ok(ActiveSleepModes {
-                assertions: Vec::new(),
-                entirely: None,
-            });
+            return Ok(ActiveSession::default());
         }
 
-        let entirely = if self.entirely {
-            Some(crate::process_lock::acquire_entirely(verbose)?)
-        } else {
-            None
-        };
-
-        let mut assertions = Vec::new();
+        let mut holds = Vec::new();
         for mode in self.iter_enabled() {
-            match mode {
-                SleepMode::Entirely => {}
-                SleepMode::UserActive => {
-                    assertions.push(power_management::declare_user_activity(true, verbose).map_err(
-                        |code| -> Box<dyn std::error::Error> {
-                            std::io::Error::other(format!(
-                                "Failed to create user activity assertion (code: {code:X})"
-                            ))
-                            .into()
-                        },
-                    )?);
-                }
-                mode => {
-                    let assertion_type = mode.assertion_type().unwrap();
-                    assertions.push(
-                        power_management::create_assertion(assertion_type, true, verbose).map_err(
-                            |code| -> Box<dyn std::error::Error> {
-                                std::io::Error::other(format!(
-                                    "Failed to create {} assertion (code: {code:X})",
-                                    mode.label()
-                                ))
-                                .into()
-                            },
-                        )?,
-                    );
-                }
-            }
+            holds.push(mode.enable(verbose, EntirelyPolicy::HelperOrLocalFallback)?);
         }
 
-        if verbose {
+        if verbose && !holds.is_empty() {
             println!("Assertions created");
         }
 
-        Ok(ActiveSleepModes {
-            assertions,
-            entirely,
-        })
+        Ok(ActiveSession { holds })
     }
-}
-
-pub struct ActiveSleepModes {
-    pub assertions: Vec<PowerAssertion>,
-    pub entirely: Option<crate::process_lock::EntirelyGuard>,
 }
 
 #[cfg(test)]

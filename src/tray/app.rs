@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
+fn poll_stop_conditions(state: &mut AppState) -> bool {
+    state.check_timeout() || state.check_app_watch()
+}
+
 pub fn run() -> Result<(), String> {
     crate::macos_activation::hide_dock_icon();
 
@@ -19,7 +23,7 @@ pub fn run() -> Result<(), String> {
 
     let state = Arc::new(Mutex::new(AppState::new()));
     let running_apps = macos_apps::running_app_choices();
-    let initial = state.lock().expect("state lock").snapshot_for_menu();
+    let initial = state.lock().expect("state lock").menu_snapshot();
     let mut menu_apps_key = running_apps_menu_key(&running_apps);
 
     let (menu, initial_handles) = build_menu(&initial, &running_apps);
@@ -39,7 +43,7 @@ pub fn run() -> Result<(), String> {
 
         {
             let mut s = state.lock().expect("state lock");
-            if s.check_timeout() || s.check_app_watch() {
+            if poll_stop_conditions(&mut s) {
                 state_changed = true;
             }
             if state_changed {
@@ -55,7 +59,7 @@ pub fn run() -> Result<(), String> {
             let key = running_apps_menu_key(&apps);
             if key != menu_apps_key {
                 menu_apps_key = key;
-                let snapshot = state.lock().expect("state lock").snapshot_for_menu();
+                let snapshot = state.lock().expect("state lock").menu_snapshot();
                 let new_handles = install_menu(&tray, &snapshot, &apps);
                 *handles.lock().expect("handles lock") = new_handles;
             }
@@ -70,7 +74,7 @@ pub fn run() -> Result<(), String> {
                     handle_choose_app(&mut s, &tray)
                 } {
                     menu_apps_key = running_apps_menu_key(&apps);
-                    let snapshot = state.lock().expect("state lock").snapshot_for_menu();
+                    let snapshot = state.lock().expect("state lock").menu_snapshot();
                     *handles.lock().expect("handles lock") = install_menu(&tray, &snapshot, &apps);
                     let selected = state.lock().expect("state lock").wait_for_app.clone();
                     let h = handles.lock().expect("handles lock");

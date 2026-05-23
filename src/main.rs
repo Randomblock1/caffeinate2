@@ -302,7 +302,6 @@ mod tests {
             user_active: true,
         };
         let active = sleep_modes.enable_all(false, true).unwrap();
-        assert!(active.assertions.is_empty());
-        assert!(active.entirely.is_none());
+        assert!(active.is_empty());
     }
 }

@@ -1,40 +1,37 @@
-use crate::{
-    entirely::{EntirelyCoordinator, EntirelyHoldGuard},
-    helper_ipc::HelperHoldGuard,
-};
+use crate::entirely::{EntirelyCoordinator, EntirelyHoldGuard};
+use crate::helper_ipc::HelperHoldGuard;
+use crate::sleep_mode::{EnableError, EntirelyPolicy};
 
-pub enum EntirelyGuard {
+/// RAII hold for entirely mode (helper IPC or local lockfile).
+pub enum EntirelyHold {
     Local(EntirelyHoldGuard),
     Helper(HelperHoldGuard),
 }
 
-/// Acquire entirely sleep prevention via helper or in-process lock.
-pub fn acquire_entirely(verbose: bool) -> Result<EntirelyGuard, Box<dyn std::error::Error>> {
+/// Acquire entirely sleep prevention using the given policy.
+pub fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHold, EnableError> {
     let client = crate::helper_ipc::HelperClient::new();
-    if client.is_available() {
-        return Ok(EntirelyGuard::Helper(HelperHoldGuard::acquire().map_err(
-            |e| -> Box<dyn std::error::Error> { e.into() },
-        )?));
-    }
-    Ok(EntirelyGuard::Local(
-        EntirelyCoordinator::cli_fallback(verbose).hold_current_process()?,
-    ))
-}
-
-/// RAII entirely-mode lock for the current process (CLI fallback path).
-pub struct ProcessLock(EntirelyHoldGuard);
-
-impl ProcessLock {
-    pub fn new(verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self(
-            EntirelyCoordinator::cli_fallback(verbose).hold_current_process()?,
-        ))
-    }
-
-    pub(crate) fn with_coordinator(
-        coordinator: EntirelyCoordinator,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self(coordinator.hold_current_process()?))
+    match policy {
+        EntirelyPolicy::HelperOrLocalFallback => {
+            if client.is_available() {
+                HelperHoldGuard::acquire()
+                    .map(EntirelyHold::Helper)
+                    .map_err(EnableError::Ipc)
+            } else {
+                EntirelyCoordinator::cli_fallback(verbose)
+                    .hold_current_process()
+                    .map(EntirelyHold::Local)
+                    .map_err(|e| EnableError::Ipc(e.to_string()))
+            }
+        }
+        EntirelyPolicy::HelperRequired => {
+            if !client.is_available() {
+                return Err(EnableError::HelperUnavailable);
+            }
+            HelperHoldGuard::acquire()
+                .map(EntirelyHold::Helper)
+                .map_err(EnableError::Ipc)
+        }
     }
 }
 
@@ -104,14 +101,14 @@ mod tests {
             process_checker,
         );
 
-        let lock = ProcessLock::with_coordinator(coordinator).unwrap();
+        let guard = coordinator.hold_current_process().unwrap();
 
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0]);
 
         drop(calls);
-        drop(lock);
+        drop(guard);
 
         let calls = sleep_calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -139,7 +136,7 @@ mod tests {
             process_checker,
         );
 
-        let result = ProcessLock::with_coordinator(coordinator);
+        let result = coordinator.hold_current_process();
 
         assert!(result.is_err());
         let content = std::fs::read_to_string(&lock_path).unwrap();

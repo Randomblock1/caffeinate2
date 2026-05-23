@@ -1,7 +1,7 @@
 use crate::app_target::AppTarget;
 use crate::macos_apps;
 use crate::sleep_mode::SleepMode;
-use crate::tray::state::AppState;
+use crate::tray::state::MenuSnapshot;
 use crate::tray_mode::TimeLimitPreset;
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::menu::MenuId;
@@ -24,12 +24,12 @@ pub fn running_apps_menu_key(apps: &[AppTarget]) -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn build_menu(state: &AppState, running_apps: &[AppTarget]) -> (Menu, MenuHandles) {
+pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu, MenuHandles) {
     let menu = Menu::new();
     let mut mode_items = Vec::new();
 
     for mode in SleepMode::all() {
-        let item = CheckMenuItem::new(mode.label(), true, state.mode == mode, None);
+        let item = CheckMenuItem::new(mode.label(), true, snapshot.mode == mode, None);
         let id = item.id().clone();
         mode_items.push((id, mode, item.clone()));
         menu.append(&item).expect("append mode item");
@@ -43,7 +43,7 @@ pub fn build_menu(state: &AppState, running_apps: &[AppTarget]) -> (Menu, MenuHa
         let item = CheckMenuItem::new(
             preset.label,
             true,
-            state.time_limit_secs == preset.seconds,
+            snapshot.time_limit_secs == preset.seconds,
             None,
         );
         let id = item.id().clone();
@@ -56,7 +56,7 @@ pub fn build_menu(state: &AppState, running_apps: &[AppTarget]) -> (Menu, MenuHa
         .expect("append time limit submenu");
 
     let until_app_submenu = Submenu::new("Until app quits", true);
-    let off_item = CheckMenuItem::new("Off", true, state.wait_for_app.is_none(), None);
+    let off_item = CheckMenuItem::new("Off", true, snapshot.wait_for_app.is_none(), None);
     let until_app_off_id = off_item.id().clone();
     until_app_submenu
         .append(&off_item)
@@ -68,7 +68,7 @@ pub fn build_menu(state: &AppState, running_apps: &[AppTarget]) -> (Menu, MenuHa
             .append(&PredefinedMenuItem::separator())
             .expect("separator");
         for app in running_apps {
-            let checked = state
+            let checked = snapshot
                 .wait_for_app
                 .as_ref()
                 .is_some_and(|w| w.bundle_id == app.bundle_id);
@@ -95,7 +95,8 @@ pub fn build_menu(state: &AppState, running_apps: &[AppTarget]) -> (Menu, MenuHa
 
     menu.append(&PredefinedMenuItem::separator()).expect("separator");
 
-    let start_at_login = CheckMenuItem::new("Start at login", true, state.start_at_login, None);
+    let start_at_login =
+        CheckMenuItem::new("Start at login", true, snapshot.start_at_login, None);
     let start_at_login_id = start_at_login.id().clone();
     menu.append(&start_at_login).expect("append login item");
 
@@ -142,10 +143,10 @@ pub fn set_until_app_checks(handles: &MenuHandles, selected: Option<&AppTarget>)
 
 pub fn install_menu(
     tray: &tray_icon::TrayIcon,
-    state: &AppState,
+    snapshot: &MenuSnapshot,
     running_apps: &[AppTarget],
 ) -> MenuHandles {
-    let (menu, handles) = build_menu(state, running_apps);
+    let (menu, handles) = build_menu(snapshot, running_apps);
     let _ = tray.set_menu(Some(Box::new(menu)));
     handles
 }

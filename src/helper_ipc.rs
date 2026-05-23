@@ -3,7 +3,6 @@ use crate::process_util;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,8 +75,7 @@ impl HelperClient {
     }
 
     pub fn is_available(&self) -> bool {
-        Path::new(&self.socket_path).exists()
-            && UnixStream::connect(&self.socket_path).is_ok()
+        UnixStream::connect(&self.socket_path).is_ok()
     }
 
     fn request(&self, request: HelperRequest) -> Result<HelperResponse, String> {

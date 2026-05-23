@@ -1,9 +1,7 @@
 use crate::app_target::AppTarget;
 use crate::duration_parser::format_remaining_secs;
-use crate::sleep_mode::{ActiveSleepHold, SleepMode};
+use crate::sleep_mode::SleepMode;
 use serde::{Deserialize, Serialize};
-
-pub use crate::sleep_mode::SleepMode as TrayMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeLimitPreset {
@@ -43,8 +41,6 @@ impl TimeLimitPreset {
         },
     ];
 }
-
-pub type ActiveMode = ActiveSleepHold;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TrayConfig {

@@ -1,11 +1,21 @@
 use crate::app_target::AppTarget;
+use crate::helper_ipc::HelperClient;
 use crate::install;
 use crate::macos_apps;
-use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
+use crate::sleep_mode::{ActiveSleepHold, EntirelyPolicy, SleepMode};
 use crate::tray_mode::{self, TrayConfig};
 use crate::tray_icons;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
+
+/// Menu bar settings used to build the tray menu (no runtime session state).
+#[derive(Debug, Clone)]
+pub struct MenuSnapshot {
+    pub mode: SleepMode,
+    pub time_limit_secs: Option<u64>,
+    pub wait_for_app: Option<AppTarget>,
+    pub start_at_login: bool,
+}
 
 pub struct AppState {
     pub mode: SleepMode,
@@ -30,6 +40,15 @@ impl AppState {
             app_saw_running: false,
             last_tooltip: None,
             start_at_login: install::tray_launch_agent_installed(),
+        }
+    }
+
+    pub fn menu_snapshot(&self) -> MenuSnapshot {
+        MenuSnapshot {
+            mode: self.mode,
+            time_limit_secs: self.time_limit_secs,
+            wait_for_app: self.wait_for_app.clone(),
+            start_at_login: self.start_at_login,
         }
     }
 
@@ -139,19 +158,31 @@ impl AppState {
         Ok(())
     }
 
-    pub fn enable(&mut self) -> Result<(), String> {
-        if self.mode == SleepMode::Entirely
-            && !crate::helper_ipc::HelperClient::new().is_available()
-        {
-            install::install_helper_privileged()?;
-            if !crate::helper_ipc::HelperClient::new().is_available() {
-                return Err(
-                    "helper is not running after install; try: sudo caffeinate2 install-helper"
-                        .to_string(),
-                );
-            }
+    fn ensure_helper_for_entirely(&self) -> Result<(), String> {
+        if self.mode != SleepMode::Entirely {
+            return Ok(());
         }
-        self.active = Some(self.mode.enable().map_err(enable_error_message)?);
+        let client = HelperClient::new();
+        if client.is_available() {
+            return Ok(());
+        }
+        install::install_helper_privileged()?;
+        if !client.is_available() {
+            return Err(
+                "helper is not running after install; try: sudo caffeinate2 install-helper"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn enable(&mut self) -> Result<(), String> {
+        self.ensure_helper_for_entirely()?;
+        self.active = Some(
+            self.mode
+                .enable(false, EntirelyPolicy::HelperRequired)
+                .map_err(|e| e.to_string())?,
+        );
         self.active_until = self
             .time_limit_secs
             .map(|secs| Instant::now() + Duration::from_secs(secs));
@@ -207,28 +238,5 @@ impl AppState {
         }
         self.start_at_login = enabled;
         Ok(())
-    }
-
-    pub fn snapshot_for_menu(&self) -> Self {
-        Self {
-            mode: self.mode,
-            time_limit_secs: self.time_limit_secs,
-            wait_for_app: self.wait_for_app.clone(),
-            active: None,
-            active_until: None,
-            app_saw_running: false,
-            last_tooltip: None,
-            start_at_login: self.start_at_login,
-        }
-    }
-}
-
-fn enable_error_message(error: EnableError) -> String {
-    match error {
-        EnableError::HelperUnavailable => {
-            "failed to enable sleep prevention (entirely mode requires the helper)".to_string()
-        }
-        EnableError::Iokit(code) => format!("failed to enable sleep prevention (IOKit: {code:X})"),
-        EnableError::Ipc(message) => message,
     }
 }
