@@ -16,24 +16,13 @@ pub enum SleepMode {
     Entirely,
 }
 
-/// When the privileged helper is required but not reachable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelperMissingAction {
-    /// Fail with [`EnableError::HelperUnavailable`].
-    Error,
-    /// Run privileged install, then retry hold once (menu bar).
-    InstallPrivileged,
-}
-
 /// How to acquire entirely-mode sleep prevention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntirelyPolicy {
     /// Prefer helper; fall back to in-process lockfile when the helper is unreachable (CLI).
     HelperOrLocalFallback,
-    /// Helper required; optional install-if-missing (tray).
-    HelperRequired {
-        on_missing: HelperMissingAction,
-    },
+    /// Helper required; fails with [`EnableError::HelperUnavailable`] when unreachable.
+    HelperRequired,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,34 +64,15 @@ fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHol
                 .map_err(|e| EnableError::Ipc(e.to_string())),
             Err(error) => Err(EnableError::Ipc(error)),
         },
-        EntirelyPolicy::HelperRequired { on_missing } => try_acquire_helper(&client, on_missing)
-            .map(EntirelyHold::Helper),
-    }
-}
-
-fn try_acquire_helper(
-    client: &HelperClient,
-    on_missing: HelperMissingAction,
-) -> Result<HelperHoldGuard, EnableError> {
-    match HelperHoldGuard::try_acquire(client) {
-        Ok(guard) => Ok(guard),
-        Err(error) if is_connect_error(&error) => match on_missing {
-            HelperMissingAction::Error => Err(EnableError::HelperUnavailable),
-            HelperMissingAction::InstallPrivileged => {
-                crate::install::install_helper_privileged().map_err(EnableError::Ipc)?;
-                HelperHoldGuard::try_acquire(client).map_err(|error| {
-                    if is_connect_error(&error) {
-                        EnableError::Ipc(
-                            "helper is not running after install; try: sudo caffeinate2 install-helper"
-                                .to_string(),
-                        )
-                    } else {
-                        EnableError::Ipc(error)
-                    }
-                })
-            }
-        },
-        Err(error) => Err(EnableError::Ipc(error)),
+        EntirelyPolicy::HelperRequired => HelperHoldGuard::try_acquire(&client)
+            .map(EntirelyHold::Helper)
+            .map_err(|error| {
+                if is_connect_error(&error) {
+                    EnableError::HelperUnavailable
+                } else {
+                    EnableError::Ipc(error)
+                }
+            }),
     }
 }
 
@@ -235,10 +205,8 @@ impl SleepModeSet {
     }
 }
 
-/// Entirely policy for the menu bar (helper required; install if missing).
-pub const TRAY_ENTIRELY_POLICY: EntirelyPolicy = EntirelyPolicy::HelperRequired {
-    on_missing: HelperMissingAction::InstallPrivileged,
-};
+/// Entirely policy for the menu bar (helper required).
+pub const TRAY_ENTIRELY_POLICY: EntirelyPolicy = EntirelyPolicy::HelperRequired;
 
 #[cfg(test)]
 mod tests {

@@ -106,7 +106,7 @@ impl Args {
 mod tests {
     use super::*;
 
-    pub fn parse_args(args: &[&str]) -> Args {
+    pub(crate) fn parse_args(args: &[&str]) -> Args {
         Cli::try_parse_from(args).unwrap().args
     }
 }

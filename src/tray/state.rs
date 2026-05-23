@@ -7,6 +7,22 @@ use crate::tray_icons;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
 
+/// Persisted tray preferences (saved to disk).
+#[derive(Debug, Clone)]
+struct TraySettings {
+    mode: SleepMode,
+    time_limit_secs: Option<u64>,
+    wait_for_app: Option<AppTarget>,
+}
+
+/// Runtime state while sleep prevention is active.
+struct ActiveTraySession {
+    #[allow(dead_code)]
+    hold: ActiveSleepHold,
+    until: Option<Instant>,
+    app_saw_running: bool,
+}
+
 /// Menu bar settings used to build the tray menu (no runtime session state).
 #[derive(Debug, Clone)]
 pub struct MenuSnapshot {
@@ -17,26 +33,22 @@ pub struct MenuSnapshot {
 }
 
 pub struct AppState {
-    pub mode: SleepMode,
-    pub time_limit_secs: Option<u64>,
-    pub wait_for_app: Option<AppTarget>,
-    pub active: Option<ActiveSleepHold>,
-    pub active_until: Option<Instant>,
-    pub app_saw_running: bool,
-    pub last_tooltip: Option<String>,
-    pub start_at_login: bool,
+    settings: TraySettings,
+    session: Option<ActiveTraySession>,
+    last_tooltip: Option<String>,
+    start_at_login: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let config = tray_mode::load_config();
         Self {
-            mode: config.mode,
-            time_limit_secs: config.time_limit_secs,
-            wait_for_app: config.wait_for_app,
-            active: None,
-            active_until: None,
-            app_saw_running: false,
+            settings: TraySettings {
+                mode: config.mode,
+                time_limit_secs: config.time_limit_secs,
+                wait_for_app: config.wait_for_app,
+            },
+            session: None,
             last_tooltip: None,
             start_at_login: install::tray_launch_agent_installed(),
         }
@@ -44,9 +56,9 @@ impl AppState {
 
     pub fn menu_snapshot(&self) -> MenuSnapshot {
         MenuSnapshot {
-            mode: self.mode,
-            time_limit_secs: self.time_limit_secs,
-            wait_for_app: self.wait_for_app.clone(),
+            mode: self.settings.mode,
+            time_limit_secs: self.settings.time_limit_secs,
+            wait_for_app: self.settings.wait_for_app.clone(),
             start_at_login: self.start_at_login,
         }
     }
@@ -54,9 +66,9 @@ impl AppState {
     fn config(&self) -> TrayConfig {
         TrayConfig {
             version: tray_mode::CONFIG_VERSION,
-            mode: self.mode,
-            time_limit_secs: self.time_limit_secs,
-            wait_for_app: self.wait_for_app.clone(),
+            mode: self.settings.mode,
+            time_limit_secs: self.settings.time_limit_secs,
+            wait_for_app: self.settings.wait_for_app.clone(),
         }
     }
 
@@ -65,12 +77,17 @@ impl AppState {
     }
 
     pub fn is_on(&self) -> bool {
-        self.active.is_some()
+        self.session.is_some()
     }
 
     pub fn waiting_for_app_launch(&self) -> bool {
-        self.wait_for_app.as_ref().is_some_and(|app| {
-            self.is_on() && !self.app_saw_running && !macos_apps::is_bundle_running(&app.bundle_id)
+        self.settings.wait_for_app.as_ref().is_some_and(|app| {
+            self.is_on()
+                && !self
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.app_saw_running)
+                && !macos_apps::is_bundle_running(&app.bundle_id)
         })
     }
 
@@ -90,14 +107,16 @@ impl AppState {
 
     pub fn update_tooltip(&mut self, tray: &TrayIcon) {
         let tooltip = if self.is_on() {
-            let remaining = self.active_until.map(|until| {
-                until
-                    .saturating_duration_since(Instant::now())
-                    .as_secs()
+            let remaining = self.session.as_ref().and_then(|session| {
+                session.until.map(|until| {
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs()
+                })
             });
             tray_mode::format_active_tooltip(
                 remaining,
-                self.wait_for_app.as_ref(),
+                self.settings.wait_for_app.as_ref(),
                 self.waiting_for_app_launch(),
             )
         } else {
@@ -109,40 +128,42 @@ impl AppState {
         }
     }
 
-    pub fn clear_active(&mut self) {
-        self.active = None;
-        self.active_until = None;
-        self.app_saw_running = false;
+    pub fn invalidate_tooltip(&mut self) {
+        self.last_tooltip = None;
+    }
+
+    pub fn stop_session(&mut self) {
+        self.session = None;
         self.last_tooltip = None;
     }
 
     pub fn check_timeout(&mut self) -> bool {
-        if self.active.is_some()
-            && self
-                .active_until
+        if self.session.as_ref().is_some_and(|session| {
+            session
+                .until
                 .is_some_and(|until| Instant::now() >= until)
-        {
-            self.clear_active();
+        }) {
+            self.stop_session();
             return true;
         }
         false
     }
 
     pub fn check_app_watch(&mut self) -> bool {
-        let Some(app) = self.wait_for_app.as_ref() else {
+        let Some(app) = self.settings.wait_for_app.as_ref() else {
             return false;
         };
-        if self.active.is_none() {
+        let Some(session) = self.session.as_mut() else {
             return false;
-        }
+        };
 
         if macos_apps::is_bundle_running(&app.bundle_id) {
-            self.app_saw_running = true;
+            session.app_saw_running = true;
             return false;
         }
 
-        if self.app_saw_running {
-            self.clear_active();
+        if session.app_saw_running {
+            self.stop_session();
             return true;
         }
 
@@ -150,62 +171,95 @@ impl AppState {
     }
 
     pub fn toggle(&mut self) -> Result<(), EnableError> {
-        if self.active.is_some() {
-            self.clear_active();
+        if self.session.is_some() {
+            self.stop_session();
             return Ok(());
         }
-        self.enable()
+        self.start_session()
     }
 
-    pub fn enable(&mut self) -> Result<(), EnableError> {
-        self.active = Some(
-            self.mode
-                .enable(false, TRAY_ENTIRELY_POLICY)?,
-        );
-        self.active_until = self
-            .time_limit_secs
-            .map(|secs| Instant::now() + Duration::from_secs(secs));
-        self.app_saw_running = self
-            .wait_for_app
-            .as_ref()
-            .is_some_and(|app| macos_apps::is_bundle_running(&app.bundle_id));
+    fn acquire_hold(mode: SleepMode) -> Result<ActiveSleepHold, EnableError> {
+        match mode.enable(false, TRAY_ENTIRELY_POLICY) {
+            Err(EnableError::HelperUnavailable) if mode == SleepMode::Entirely => {
+                install::install_helper_privileged().map_err(EnableError::Ipc)?;
+                mode.enable(false, TRAY_ENTIRELY_POLICY).map_err(|error| match error {
+                    EnableError::HelperUnavailable => EnableError::Ipc(
+                        "helper is not running after install; try: sudo caffeinate2 install-helper"
+                            .to_string(),
+                    ),
+                    other => other,
+                })
+            }
+            other => other,
+        }
+    }
+
+    pub fn start_session(&mut self) -> Result<(), EnableError> {
+        let hold = Self::acquire_hold(self.settings.mode)?;
+        self.session = Some(ActiveTraySession {
+            hold,
+            until: self
+                .settings
+                .time_limit_secs
+                .map(|secs| Instant::now() + Duration::from_secs(secs)),
+            app_saw_running: self
+                .settings
+                .wait_for_app
+                .as_ref()
+                .is_some_and(|app| macos_apps::is_bundle_running(&app.bundle_id)),
+        });
         self.last_tooltip = None;
         Ok(())
     }
 
     pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), EnableError> {
-        let was_on = self.active.is_some();
-        self.clear_active();
-        self.mode = mode;
-        self.save_config().map_err(|e| EnableError::Ipc(e))?;
-        if was_on {
-            self.enable()?;
+        if mode == self.settings.mode {
+            return Ok(());
         }
-        Ok(())
+        let was_on = self.is_on();
+        let previous_mode = self.settings.mode;
+        if was_on {
+            self.stop_session();
+            self.settings.mode = mode;
+            match self.start_session() {
+                Ok(()) => {
+                    self.save_config().map_err(EnableError::Ipc)?;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.settings.mode = previous_mode;
+                    let _ = self.start_session();
+                    Err(error)
+                }
+            }
+        } else {
+            self.settings.mode = mode;
+            self.save_config().map_err(EnableError::Ipc)?;
+            Ok(())
+        }
     }
 
     pub fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), String> {
-        self.time_limit_secs = time_limit_secs;
-        if self.is_on() {
-            self.active_until =
+        self.settings.time_limit_secs = time_limit_secs;
+        if let Some(session) = self.session.as_mut() {
+            session.until =
                 time_limit_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
             self.last_tooltip = None;
         }
-        self.save_config()?;
-        Ok(())
+        self.save_config()
     }
 
     pub fn set_wait_for_app(&mut self, wait_for_app: Option<AppTarget>) -> Result<(), String> {
-        self.wait_for_app = wait_for_app;
-        if self.is_on() {
-            self.app_saw_running = self
+        self.settings.wait_for_app = wait_for_app;
+        if let Some(session) = self.session.as_mut() {
+            session.app_saw_running = self
+                .settings
                 .wait_for_app
                 .as_ref()
                 .is_some_and(|app| macos_apps::is_bundle_running(&app.bundle_id));
             self.last_tooltip = None;
         }
-        self.save_config()?;
-        Ok(())
+        self.save_config()
     }
 
     pub fn set_start_at_login(&mut self, enabled: bool) -> Result<(), String> {

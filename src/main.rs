@@ -75,7 +75,7 @@ fn main() {
         return;
     }
 
-    let mut args = cli.args;
+    let args = cli.args;
     let mut sleep_modes = args.sleep_modes();
     sleep_modes.apply_defaults();
 

@@ -112,6 +112,6 @@ pub fn run() -> Result<(), String> {
     }
 
     let mut s = state.lock().expect("state lock");
-    s.clear_active();
+    s.stop_session();
     Ok(())
 }

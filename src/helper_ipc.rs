@@ -1,7 +1,7 @@
 use crate::entirely::EntirelyCoordinator;
 use crate::process_util;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,37 +12,27 @@ pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum HelperRequest {
     Hold,
-    Release,
     Status,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HelperResponse {
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub holders: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sleep_disabled: Option<bool>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HelperResponse {
+    HoldOk,
+    Status {
+        holders: usize,
+        sleep_disabled: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 impl HelperResponse {
-    pub fn success() -> Self {
-        Self {
-            ok: true,
-            error: None,
-            holders: None,
-            sleep_disabled: None,
-        }
-    }
-
-    pub fn err(message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            error: Some(message.into()),
-            holders: None,
-            sleep_disabled: None,
+    pub fn into_result(self) -> Result<Self, String> {
+        match self {
+            HelperResponse::Error { message } => Err(message),
+            other => Ok(other),
         }
     }
 }
@@ -83,7 +73,7 @@ impl HelperClient {
         self.try_connect().is_ok()
     }
 
-    fn configure_timeouts(stream: &UnixStream) -> Result<(), String> {
+    fn configure_rpc_timeouts(stream: &UnixStream) -> Result<(), String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| format!("set timeout: {e}"))?;
@@ -92,57 +82,36 @@ impl HelperClient {
             .map_err(|e| format!("set timeout: {e}"))
     }
 
-    fn exchange(stream: &mut UnixStream, request: HelperRequest) -> Result<HelperResponse, String> {
-        stream
-            .write_all(encode_request(&request).as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        stream.flush().map_err(|e| format!("flush failed: {e}"))?;
-
+    fn read_response(stream: &mut UnixStream) -> Result<HelperResponse, String> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader
             .read_line(&mut line)
             .map_err(|e| format!("read failed: {e}"))?;
-        decode_response(&line).map_err(|e| format!("invalid response: {e}"))
+        decode_response(&line)
+            .map_err(|e| format!("invalid response: {e}"))
+            .and_then(|response| response.into_result())
     }
 
-    fn request(&self, request: HelperRequest) -> Result<HelperResponse, String> {
-        let mut stream = self.try_connect()?;
-        Self::configure_timeouts(&stream)?;
-        Self::exchange(&mut stream, request)
-    }
-
-    pub fn hold(&self) -> Result<(), String> {
-        let response = self.request(HelperRequest::Hold)?;
-        if response.ok {
-            Ok(())
-        } else {
-            Err(response.error.unwrap_or_else(|| "hold failed".to_string()))
-        }
-    }
-
-    pub fn release(&self) -> Result<(), String> {
-        let response = self.request(HelperRequest::Release)?;
-        if response.ok {
-            Ok(())
-        } else {
-            Err(response
-                .error
-                .unwrap_or_else(|| "release failed".to_string()))
-        }
+    fn write_request(stream: &mut UnixStream, request: HelperRequest) -> Result<(), String> {
+        stream
+            .write_all(encode_request(&request).as_bytes())
+            .map_err(|e| format!("write failed: {e}"))?;
+        stream.flush().map_err(|e| format!("flush failed: {e}"))
     }
 
     pub fn status(&self) -> Result<(usize, bool), String> {
-        let response = self.request(HelperRequest::Status)?;
-        if !response.ok {
-            return Err(response
-                .error
-                .unwrap_or_else(|| "status failed".to_string()));
+        let mut stream = self.try_connect()?;
+        Self::configure_rpc_timeouts(&stream)?;
+        Self::write_request(&mut stream, HelperRequest::Status)?;
+        match Self::read_response(&mut stream)? {
+            HelperResponse::Status {
+                holders,
+                sleep_disabled,
+            } => Ok((holders, sleep_disabled)),
+            HelperResponse::HoldOk => Err("unexpected hold_ok for status".to_string()),
+            HelperResponse::Error { message } => Err(message),
         }
-        Ok((
-            response.holders.unwrap_or(0),
-            response.sleep_disabled.unwrap_or(false),
-        ))
     }
 }
 
@@ -150,28 +119,37 @@ pub fn is_connect_error(message: &str) -> bool {
     message.starts_with("connect failed:")
 }
 
+/// Keeps a helper hold alive for as long as this guard owns the connection.
 pub struct HelperHoldGuard {
-    client: HelperClient,
-    held: bool,
+    #[allow(dead_code)]
+    stream: UnixStream,
 }
 
 impl HelperHoldGuard {
     pub fn try_acquire(client: &HelperClient) -> Result<Self, String> {
-        client.hold()?;
-        Ok(Self {
-            client: client.clone(),
-            held: true,
-        })
-    }
-}
-
-impl Drop for HelperHoldGuard {
-    fn drop(&mut self) {
-        if self.held {
-            if let Err(e) = self.client.release() {
-                eprintln!("Error releasing helper hold: {e}");
-            }
+        let mut stream = client.try_connect()?;
+        Self::write_hold_request(&mut stream)?;
+        match Self::read_hold_response(&mut stream)? {
+            HelperResponse::HoldOk => Ok(Self { stream }),
+            HelperResponse::Status { .. } => Err("unexpected status for hold".to_string()),
+            HelperResponse::Error { message } => Err(message),
         }
+    }
+
+    fn write_hold_request(stream: &mut UnixStream) -> Result<(), String> {
+        stream
+            .write_all(encode_request(&HelperRequest::Hold).as_bytes())
+            .map_err(|e| format!("write failed: {e}"))?;
+        stream.flush().map_err(|e| format!("flush failed: {e}"))
+    }
+
+    fn read_hold_response(stream: &mut UnixStream) -> Result<HelperResponse, String> {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("read failed: {e}"))?;
+        decode_response(&line).map_err(|e| format!("invalid response: {e}"))
     }
 }
 
@@ -186,53 +164,94 @@ pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId
 
 #[cfg(target_os = "macos")]
 pub fn serve_connection(
-    stream: UnixStream,
+    mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
 ) -> Result<(), String> {
-    use std::io::BufRead;
-
     let peer = match peer_process_id(&stream) {
         Ok(id) => id,
-        Err(e) => return write_response_on_stream(stream, HelperResponse::err(e)),
+        Err(e) => {
+            return write_response_on_stream(
+                &mut stream,
+                HelperResponse::Error { message: e },
+            );
+        }
     };
 
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
-        return write_response_on_stream(stream, HelperResponse::err("failed to read request"));
+        return write_response_on_stream(
+            &mut stream,
+            HelperResponse::Error {
+                message: "failed to read request".to_string(),
+            },
+        );
     }
 
     let request = match decode_request(&line) {
         Ok(req) => req,
         Err(e) => {
             return write_response_on_stream(
-                stream,
-                HelperResponse::err(format!("invalid request: {e}")),
+                &mut stream,
+                HelperResponse::Error {
+                    message: format!("invalid request: {e}"),
+                },
             );
         }
     };
 
-    let response = match request {
-        HelperRequest::Hold => match coordinator.hold(peer) {
-            Ok(()) => HelperResponse::success(),
-            Err(e) => HelperResponse::err(e.to_string()),
-        },
-        HelperRequest::Release => match coordinator.release(peer) {
-            Ok(()) => HelperResponse::success(),
-            Err(e) => HelperResponse::err(e.to_string()),
-        },
+    match request {
+        HelperRequest::Hold => serve_hold_connection(stream, coordinator, peer),
         HelperRequest::Status => {
-            let holders = coordinator.holder_count().unwrap_or(0);
-            HelperResponse {
-                ok: true,
-                error: None,
-                holders: Some(holders),
-                sleep_disabled: Some(holders > 0),
-            }
+            let response = match coordinator.status() {
+                Ok(status) => HelperResponse::Status {
+                    holders: status.holders,
+                    sleep_disabled: status.sleep_disabled,
+                },
+                Err(e) => HelperResponse::Error {
+                    message: e.to_string(),
+                },
+            };
+            write_response_on_stream(&mut stream, response)
         }
-    };
+    }
+}
 
-    write_response_on_stream(stream, response)
+#[cfg(target_os = "macos")]
+fn serve_hold_connection(
+    mut stream: UnixStream,
+    coordinator: &Arc<EntirelyCoordinator>,
+    peer: crate::lockfile::ProcessId,
+) -> Result<(), String> {
+    if let Err(e) = coordinator.hold(peer) {
+        return write_response_on_stream(
+            &mut stream,
+            HelperResponse::Error {
+                message: e.to_string(),
+            },
+        );
+    }
+
+    if let Err(e) = write_response_on_stream(&mut stream, HelperResponse::HoldOk) {
+        let _ = coordinator.release(peer);
+        return Err(e);
+    }
+
+    let mut reader = BufReader::new(&stream);
+    let mut buf = [0u8; 256];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    if let Err(e) = coordinator.release(peer) {
+        eprintln!("Error releasing helper hold for peer {peer}: {e}");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,11 +267,9 @@ mod tests {
 
     #[test]
     fn round_trip_status_response() {
-        let resp = HelperResponse {
-            ok: true,
-            error: None,
-            holders: Some(2),
-            sleep_disabled: Some(true),
+        let resp = HelperResponse::Status {
+            holders: 2,
+            sleep_disabled: true,
         };
         let decoded = decode_response(&encode_response(&resp)).unwrap();
         assert_eq!(decoded, resp);
@@ -263,11 +280,19 @@ mod tests {
         assert!(is_connect_error("connect failed: No such file"));
         assert!(!is_connect_error("hold failed"));
     }
+
+    #[test]
+    fn error_response_into_result() {
+        let resp = HelperResponse::Error {
+            message: "nope".to_string(),
+        };
+        assert_eq!(resp.into_result().unwrap_err(), "nope");
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn write_response_on_stream(
-    mut stream: UnixStream,
+    stream: &mut UnixStream,
     response: HelperResponse,
 ) -> Result<(), String> {
     stream

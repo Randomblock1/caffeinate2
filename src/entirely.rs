@@ -3,7 +3,8 @@ use crate::{
     power_management,
     process_util,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
@@ -25,13 +26,10 @@ pub fn cli_fallback_lock_path() -> PathBuf {
     }
 }
 
-pub fn lockfile_holder_count(lock_path: &Path) -> Result<usize, std::io::Error> {
-    let content = std::fs::read_to_string(lock_path).unwrap_or_default();
-    Ok(content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| line.parse::<ProcessId>().ok())
-        .count())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntirelyStatus {
+    pub holders: usize,
+    pub sleep_disabled: bool,
 }
 
 struct EntirelyCoordinatorInner {
@@ -39,6 +37,7 @@ struct EntirelyCoordinatorInner {
     lock_file_path: PathBuf,
     sleep_disabler: Arc<SleepDisabler>,
     process_checker: Arc<ProcessChecker>,
+    sleep_disabled: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -59,6 +58,7 @@ impl EntirelyCoordinator {
                 lock_file_path,
                 sleep_disabler,
                 process_checker,
+                sleep_disabled: AtomicBool::new(false),
             }),
         }
     }
@@ -111,6 +111,7 @@ impl EntirelyCoordinator {
                 ))
                 .into());
             }
+            inner.sleep_disabled.store(true, Ordering::SeqCst);
         } else if inner.verbose {
             eprintln!("Other holders running. Sleep already disabled.");
         }
@@ -141,11 +142,27 @@ impl EntirelyCoordinator {
                 ))
                 .into());
             }
+            inner.sleep_disabled.store(false, Ordering::SeqCst);
         } else if inner.verbose {
             eprintln!("Other holders still running. Keeping sleep disabled.");
         }
 
         Ok(())
+    }
+
+    pub fn status(
+        &self,
+    ) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
+        let inner = &self.inner;
+        let holders = lockfile::prune_lockfile(
+            inner.verbose,
+            &inner.lock_file_path,
+            inner.process_checker.as_ref(),
+        )?;
+        Ok(EntirelyStatus {
+            holders,
+            sleep_disabled: inner.sleep_disabled.load(Ordering::SeqCst),
+        })
     }
 
     pub fn hold_current_process(
@@ -160,9 +177,6 @@ impl EntirelyCoordinator {
         })
     }
 
-    pub fn holder_count(&self) -> Result<usize, std::io::Error> {
-        lockfile_holder_count(&self.inner.lock_file_path)
-    }
 }
 
 pub struct EntirelyHoldGuard {
@@ -279,7 +293,7 @@ mod tests {
         let lock_path = temp_lock_path();
 
         let sleep_disabler =
-            Arc::new(Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1)) as SleepDisabler);
+            Arc::new(Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1u32)) as SleepDisabler);
 
         let process_checker: Arc<ProcessChecker> =
             Arc::new(|_pid: i32, _start: ProcessStartTime| false);

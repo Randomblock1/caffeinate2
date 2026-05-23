@@ -18,6 +18,50 @@ pub struct MenuHandles {
     pub quit_id: MenuId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuCommand {
+    Quit,
+    ToggleStartAtLogin,
+    ClearWaitForApp,
+    ChooseApp,
+    SelectWaitForApp(AppTarget),
+    SetMode(SleepMode),
+    SetTimeLimit(Option<u64>),
+}
+
+impl MenuHandles {
+    pub fn resolve(&self, event_id: &MenuId) -> Option<MenuCommand> {
+        if event_id == &self.quit_id {
+            return Some(MenuCommand::Quit);
+        }
+        if event_id == &self.start_at_login_id {
+            return Some(MenuCommand::ToggleStartAtLogin);
+        }
+        if event_id == &self.until_app_off_id {
+            return Some(MenuCommand::ClearWaitForApp);
+        }
+        if event_id == &self.choose_app_id {
+            return Some(MenuCommand::ChooseApp);
+        }
+        for (id, app, _) in &self.until_app_items {
+            if event_id == id {
+                return Some(MenuCommand::SelectWaitForApp(app.clone()));
+            }
+        }
+        for (id, mode, _) in &self.mode_items {
+            if event_id == id {
+                return Some(MenuCommand::SetMode(*mode));
+            }
+        }
+        for (id, secs, _) in &self.time_limit_items {
+            if event_id == id {
+                return Some(MenuCommand::SetTimeLimit(*secs));
+            }
+        }
+        None
+    }
+}
+
 pub fn running_apps_menu_key(apps: &[AppTarget]) -> Vec<(String, String)> {
     apps.iter()
         .map(|a| (a.bundle_id.clone(), a.name.clone()))
@@ -159,74 +203,77 @@ pub enum MenuAction {
     Unhandled,
 }
 
+pub fn dispatch_command(
+    command: MenuCommand,
+    handles: &MenuHandles,
+    state: &mut AppState,
+    tray: &tray_icon::TrayIcon,
+) -> MenuAction {
+    match command {
+        MenuCommand::Quit => MenuAction::Quit,
+        MenuCommand::ChooseApp => MenuAction::Unhandled,
+        MenuCommand::ToggleStartAtLogin => {
+            let new_val = !state.menu_snapshot().start_at_login;
+            if let Err(e) = state.set_start_at_login(new_val) {
+                eprintln!("{e}");
+            } else {
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
+            }
+            MenuAction::Handled
+        }
+        MenuCommand::ClearWaitForApp => {
+            if let Err(e) = state.set_wait_for_app(None) {
+                eprintln!("{e}");
+            } else {
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
+            }
+            MenuAction::Handled
+        }
+        MenuCommand::SelectWaitForApp(app) => {
+            if let Err(e) = state.set_wait_for_app(Some(app)) {
+                eprintln!("{e}");
+            } else {
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
+                if state.is_on() {
+                    state.invalidate_tooltip();
+                    state.update_tooltip(tray);
+                }
+            }
+            MenuAction::Handled
+        }
+        MenuCommand::SetMode(mode) => {
+            if let Err(e) = state.set_mode(mode) {
+                eprintln!("{e}");
+            } else {
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
+            }
+            state.set_icon(tray);
+            MenuAction::Handled
+        }
+        MenuCommand::SetTimeLimit(secs) => {
+            if let Err(e) = state.set_time_limit(secs) {
+                eprintln!("{e}");
+            } else {
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
+                if state.is_on() {
+                    state.update_tooltip(tray);
+                }
+            }
+            MenuAction::Handled
+        }
+    }
+}
+
 pub fn handle_menu_event(
     event_id: &MenuId,
     handles: &MenuHandles,
     state: &mut AppState,
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
-    if event_id == &handles.quit_id {
-        return MenuAction::Quit;
+    match handles.resolve(event_id) {
+        Some(command) => dispatch_command(command, handles, state, tray),
+        None => MenuAction::Unhandled,
     }
-    if event_id == &handles.start_at_login_id {
-        let new_val = !state.start_at_login;
-        if let Err(e) = state.set_start_at_login(new_val) {
-            eprintln!("{e}");
-        } else {
-            sync_menu_to_snapshot(handles, &state.menu_snapshot());
-        }
-        return MenuAction::Handled;
-    }
-    if event_id == &handles.until_app_off_id {
-        if let Err(e) = state.set_wait_for_app(None) {
-            eprintln!("{e}");
-        } else {
-            sync_menu_to_snapshot(handles, &state.menu_snapshot());
-        }
-        return MenuAction::Handled;
-    }
-    if event_id == &handles.choose_app_id {
-        return MenuAction::Unhandled;
-    }
-    for (id, app, _) in &handles.until_app_items {
-        if event_id == id {
-            if let Err(e) = state.set_wait_for_app(Some(app.clone())) {
-                eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
-                if state.is_on() {
-                    state.last_tooltip = None;
-                    state.update_tooltip(tray);
-                }
-            }
-            return MenuAction::Handled;
-        }
-    }
-    for (id, mode, _) in &handles.mode_items {
-        if event_id == id {
-            if let Err(e) = state.set_mode(*mode) {
-                eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
-            }
-            state.set_icon(tray);
-            return MenuAction::Handled;
-        }
-    }
-    for (id, secs, _) in &handles.time_limit_items {
-        if event_id == id {
-            if let Err(e) = state.set_time_limit(*secs) {
-                eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
-                if state.is_on() {
-                    state.update_tooltip(tray);
-                }
-            }
-            return MenuAction::Handled;
-        }
-    }
-    MenuAction::Unhandled
 }
 
 pub fn handle_choose_app(
@@ -237,7 +284,7 @@ pub fn handle_choose_app(
     if let Err(e) = state.set_wait_for_app(Some(choice)) {
         eprintln!("{e}");
     } else if state.is_on() {
-        state.last_tooltip = None;
+        state.invalidate_tooltip();
         state.update_tooltip(tray);
     }
     Some(macos_apps::running_app_choices())
