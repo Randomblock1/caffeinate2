@@ -92,7 +92,7 @@ fn main() {
         Ok(active) => active,
         Err(e) => {
             eprintln!("Error: {e}");
-            if sleep_modes.entirely {
+            if sleep_modes.contains(sleep_mode::SleepMode::Entirely) {
                 eprintln!(
                     "Hint: install the privileged helper with: sudo caffeinate2 install-helper"
                 );
@@ -269,22 +269,22 @@ fn main() {
 mod tests {
     use super::*;
     use crate::cli::tests::parse_args;
-    use sleep_mode::SleepModeSet;
+    use sleep_mode::{SleepMode, SleepModeSet};
 
     #[test]
     fn defaults_to_system_assertion_when_no_assertion_flags_are_set() {
         let mut sleep_modes = parse_args(&["caffeinate2"]).sleep_modes();
         sleep_modes.apply_defaults();
-        assert!(sleep_modes.system);
+        assert!(sleep_modes.contains(SleepMode::System));
         assert_eq!(sleep_modes.selected_labels(), vec!["System"]);
     }
 
     #[test]
     fn explicit_assertion_flags_do_not_add_default_system_assertion() {
         let sleep_modes = parse_args(&["caffeinate2", "--display", "--user-active"]).sleep_modes();
-        assert!(sleep_modes.display);
-        assert!(sleep_modes.user_active);
-        assert!(!sleep_modes.system);
+        assert!(sleep_modes.contains(SleepMode::Display));
+        assert!(sleep_modes.contains(SleepMode::UserActive));
+        assert!(!sleep_modes.contains(SleepMode::System));
         assert_eq!(
             sleep_modes.selected_labels(),
             vec!["Display", "User active"]
@@ -293,14 +293,10 @@ mod tests {
 
     #[test]
     fn dry_run_creates_no_assertions() {
-        let sleep_modes = SleepModeSet {
-            display: true,
-            disk: true,
-            system: true,
-            system_on_ac: true,
-            entirely: true,
-            user_active: true,
-        };
+        let mut sleep_modes = SleepModeSet::default();
+        for mode in SleepMode::all() {
+            sleep_modes.insert(mode);
+        }
         let active = sleep_modes.enable_all(false, true).unwrap();
         assert!(active.is_empty());
     }

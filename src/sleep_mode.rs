@@ -1,6 +1,8 @@
+use crate::entirely::{EntirelyCoordinator, EntirelyHoldGuard};
+use crate::helper_ipc::{HelperClient, HelperHoldGuard, is_connect_error};
 use crate::power_management::{self, AssertionType, PowerAssertion};
-use crate::process_lock::{acquire_entirely, EntirelyHold};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -14,13 +16,24 @@ pub enum SleepMode {
     Entirely,
 }
 
+/// When the privileged helper is required but not reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperMissingAction {
+    /// Fail with [`EnableError::HelperUnavailable`].
+    Error,
+    /// Run privileged install, then retry hold once (menu bar).
+    InstallPrivileged,
+}
+
 /// How to acquire entirely-mode sleep prevention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntirelyPolicy {
-    /// Helper daemon required (menu bar); no local lockfile fallback.
-    HelperRequired,
-    /// Prefer helper; fall back to in-process lockfile when unavailable (CLI).
+    /// Prefer helper; fall back to in-process lockfile when the helper is unreachable (CLI).
     HelperOrLocalFallback,
+    /// Helper required; optional install-if-missing (tray).
+    HelperRequired {
+        on_missing: HelperMissingAction,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +56,55 @@ impl std::fmt::Display for EnableError {
 }
 
 impl std::error::Error for EnableError {}
+
+/// RAII hold for entirely mode (helper IPC or local lockfile).
+pub enum EntirelyHold {
+    Local(EntirelyHoldGuard),
+    Helper(HelperHoldGuard),
+}
+
+fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHold, EnableError> {
+    let client = HelperClient::new();
+
+    match policy {
+        EntirelyPolicy::HelperOrLocalFallback => match HelperHoldGuard::try_acquire(&client) {
+            Ok(guard) => Ok(EntirelyHold::Helper(guard)),
+            Err(error) if is_connect_error(&error) => EntirelyCoordinator::cli_fallback(verbose)
+                .hold_current_process()
+                .map(EntirelyHold::Local)
+                .map_err(|e| EnableError::Ipc(e.to_string())),
+            Err(error) => Err(EnableError::Ipc(error)),
+        },
+        EntirelyPolicy::HelperRequired { on_missing } => try_acquire_helper(&client, on_missing)
+            .map(EntirelyHold::Helper),
+    }
+}
+
+fn try_acquire_helper(
+    client: &HelperClient,
+    on_missing: HelperMissingAction,
+) -> Result<HelperHoldGuard, EnableError> {
+    match HelperHoldGuard::try_acquire(client) {
+        Ok(guard) => Ok(guard),
+        Err(error) if is_connect_error(&error) => match on_missing {
+            HelperMissingAction::Error => Err(EnableError::HelperUnavailable),
+            HelperMissingAction::InstallPrivileged => {
+                crate::install::install_helper_privileged().map_err(EnableError::Ipc)?;
+                HelperHoldGuard::try_acquire(client).map_err(|error| {
+                    if is_connect_error(&error) {
+                        EnableError::Ipc(
+                            "helper is not running after install; try: sudo caffeinate2 install-helper"
+                                .to_string(),
+                        )
+                    } else {
+                        EnableError::Ipc(error)
+                    }
+                })
+            }
+        },
+        Err(error) => Err(EnableError::Ipc(error)),
+    }
+}
 
 impl SleepMode {
     pub fn label(self) -> &'static str {
@@ -86,11 +148,16 @@ impl SleepMode {
             SleepMode::UserActive => power_management::declare_user_activity(true, verbose)
                 .map(ActiveSleepHold::Assertion)
                 .map_err(EnableError::Iokit),
-            SleepMode::Entirely => acquire_entirely(verbose, entirely_policy)
-                .map(ActiveSleepHold::Entirely),
+            SleepMode::Entirely => {
+                acquire_entirely(verbose, entirely_policy).map(ActiveSleepHold::Entirely)
+            }
             mode => {
-                let assertion_type =
-                    mode.assertion_type().expect("non-entirely modes have assertions");
+                let Some(assertion_type) = mode.assertion_type() else {
+                    return Err(EnableError::Ipc(format!(
+                        "no IOKit assertion for {}",
+                        mode.label()
+                    )));
+                };
                 power_management::create_assertion(assertion_type, true, verbose)
                     .map(ActiveSleepHold::Assertion)
                     .map_err(EnableError::Iokit)
@@ -117,27 +184,22 @@ impl ActiveSession {
     }
 }
 
-/// CLI flags for one or more simultaneous sleep modes.
+/// Enabled sleep modes (CLI may enable several at once).
 #[derive(Debug, Clone, Default)]
-pub struct SleepModeSet {
-    pub display: bool,
-    pub disk: bool,
-    pub system: bool,
-    pub system_on_ac: bool,
-    pub entirely: bool,
-    pub user_active: bool,
-}
+pub struct SleepModeSet(HashSet<SleepMode>);
 
 impl SleepModeSet {
+    pub fn insert(&mut self, mode: SleepMode) {
+        self.0.insert(mode);
+    }
+
+    pub fn contains(&self, mode: SleepMode) -> bool {
+        self.0.contains(&mode)
+    }
+
     pub fn apply_defaults(&mut self) {
-        if !(self.display
-            || self.disk
-            || self.system
-            || self.system_on_ac
-            || self.entirely
-            || self.user_active)
-        {
-            self.system = true;
+        if self.0.is_empty() {
+            self.0.insert(SleepMode::System);
         }
     }
 
@@ -148,18 +210,7 @@ impl SleepModeSet {
     pub fn iter_enabled(&self) -> impl Iterator<Item = SleepMode> + '_ {
         SleepMode::all()
             .into_iter()
-            .filter(|mode| self.is_enabled(*mode))
-    }
-
-    pub fn is_enabled(&self, mode: SleepMode) -> bool {
-        match mode {
-            SleepMode::Display => self.display,
-            SleepMode::Disk => self.disk,
-            SleepMode::System => self.system,
-            SleepMode::SystemOnAc => self.system_on_ac,
-            SleepMode::Entirely => self.entirely,
-            SleepMode::UserActive => self.user_active,
-        }
+            .filter(|mode| self.0.contains(mode))
     }
 
     pub fn enable_all(
@@ -184,6 +235,11 @@ impl SleepModeSet {
     }
 }
 
+/// Entirely policy for the menu bar (helper required; install if missing).
+pub const TRAY_ENTIRELY_POLICY: EntirelyPolicy = EntirelyPolicy::HelperRequired {
+    on_missing: HelperMissingAction::InstallPrivileged,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,17 +248,25 @@ mod tests {
     fn defaults_to_system_when_no_flags_set() {
         let mut set = SleepModeSet::default();
         set.apply_defaults();
-        assert!(set.system);
+        assert!(set.contains(SleepMode::System));
         assert_eq!(set.selected_labels(), vec!["System"]);
     }
 
     #[test]
     fn explicit_flags_skip_default_system() {
-        let set = SleepModeSet {
-            display: true,
-            user_active: true,
-            ..Default::default()
-        };
+        let mut set = SleepModeSet::default();
+        set.insert(SleepMode::Display);
+        set.insert(SleepMode::UserActive);
         assert_eq!(set.selected_labels(), vec!["Display", "User active"]);
+    }
+
+    #[test]
+    fn dry_run_enables_none() {
+        let mut set = SleepModeSet::default();
+        for mode in SleepMode::all() {
+            set.insert(mode);
+        }
+        let active = set.enable_all(false, true).unwrap();
+        assert!(active.is_empty());
     }
 }

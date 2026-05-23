@@ -3,6 +3,8 @@ use crate::duration_parser::format_remaining_secs;
 use crate::sleep_mode::SleepMode;
 use serde::{Deserialize, Serialize};
 
+pub const CONFIG_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeLimitPreset {
     pub label: &'static str,
@@ -44,12 +46,48 @@ impl TimeLimitPreset {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TrayConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     #[serde(default)]
     pub mode: SleepMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_limit_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_for_app: Option<AppTarget>,
+}
+
+fn default_config_version() -> u32 {
+    CONFIG_VERSION
+}
+
+/// Pre-1.0 flat TOML keys (`wait_for_bundle_id`, etc.).
+#[derive(Debug, Default, Deserialize)]
+struct LegacyTrayFlat {
+    #[serde(default)]
+    mode: SleepMode,
+    time_limit_secs: Option<u64>,
+    wait_for_bundle_id: Option<String>,
+    wait_for_app_name: Option<String>,
+}
+
+impl From<LegacyTrayFlat> for TrayConfig {
+    fn from(legacy: LegacyTrayFlat) -> Self {
+        let wait_for_app = legacy.wait_for_bundle_id.filter(|s| !s.is_empty()).map(|id| {
+            AppTarget {
+                bundle_id: id.clone(),
+                name: legacy
+                    .wait_for_app_name
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id),
+            }
+        });
+        TrayConfig {
+            version: CONFIG_VERSION,
+            mode: legacy.mode,
+            time_limit_secs: legacy.time_limit_secs,
+            wait_for_app,
+        }
+    }
 }
 
 pub fn config_path() -> Result<std::path::PathBuf, String> {
@@ -70,53 +108,12 @@ pub fn load_config() -> TrayConfig {
         Ok(c) => c,
         Err(_) => return TrayConfig::default(),
     };
-    match toml::from_str::<TrayConfig>(&content) {
-        Ok(config) => config,
-        Err(_) => migrate_legacy_config(&content).unwrap_or_default(),
+    if let Ok(config) = toml::from_str::<TrayConfig>(&content) {
+        return config;
     }
-}
-
-fn migrate_legacy_config(content: &str) -> Option<TrayConfig> {
-    let mut config = TrayConfig::default();
-    let mut any = false;
-    let mut bundle_id = None::<String>;
-    let mut app_name = None::<String>;
-
-    for line in content.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "mode" => {
-                let value = value.trim().trim_matches('"');
-                config.mode = toml::from_str(&format!("\"{value}\"")).ok()?;
-                any = true;
-            }
-            "time_limit_secs" => {
-                config.time_limit_secs = value.trim().parse().ok();
-                any = true;
-            }
-            "wait_for_bundle_id" => {
-                bundle_id = Some(value.trim().trim_matches('"').to_string());
-                any = true;
-            }
-            "wait_for_app_name" => {
-                app_name = Some(value.trim().trim_matches('"').to_string());
-                any = true;
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(id) = bundle_id.filter(|s| !s.is_empty()) {
-        config.wait_for_app = Some(AppTarget {
-            bundle_id: id.clone(),
-            name: app_name.unwrap_or(id),
-        });
-    }
-
-    any.then_some(config)
+    toml::from_str::<LegacyTrayFlat>(&content)
+        .map(TrayConfig::from)
+        .unwrap_or_default()
 }
 
 pub fn save_config(config: &TrayConfig) -> Result<(), String> {
@@ -124,7 +121,9 @@ pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+    let mut to_save = config.clone();
+    to_save.version = CONFIG_VERSION;
+    let content = toml::to_string_pretty(&to_save).map_err(|e| e.to_string())?;
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -173,13 +172,22 @@ mod tests {
 
     #[test]
     fn migrate_legacy_flat_wait_for_app_keys() {
-        let config = migrate_legacy_config(
+        let config = toml::from_str::<LegacyTrayFlat>(
             "mode = \"system\"\nwait_for_bundle_id = \"com.example.app\"\nwait_for_app_name = \"Example\"\n",
         )
+        .map(TrayConfig::from)
         .unwrap();
         let app = config.wait_for_app.unwrap();
         assert_eq!(app.bundle_id, "com.example.app");
         assert_eq!(app.name, "Example");
+    }
+
+    #[test]
+    fn load_config_falls_back_to_legacy_flat_format() {
+        let config = load_config_from_str(
+            "mode = \"system\"\nwait_for_bundle_id = \"com.example.app\"\n",
+        );
+        assert_eq!(config.wait_for_app.as_ref().unwrap().bundle_id, "com.example.app");
     }
 
     #[test]
@@ -213,5 +221,13 @@ name = "Example"
             format_active_tooltip(None, Some(&app), true),
             "caffeinate2 (waiting for Example)"
         );
+    }
+
+    fn load_config_from_str(content: &str) -> TrayConfig {
+        toml::from_str::<TrayConfig>(content)
+            .or_else(|_| {
+                toml::from_str::<LegacyTrayFlat>(content).map(TrayConfig::from)
+            })
+            .unwrap_or_default()
     }
 }

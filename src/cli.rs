@@ -1,4 +1,4 @@
-use crate::sleep_mode::SleepModeSet;
+use crate::sleep_mode::{SleepMode, SleepModeSet};
 use clap::{Parser, Subcommand};
 
 #[derive(Subcommand, Debug)]
@@ -79,14 +79,26 @@ pub struct Args {
 
 impl Args {
     pub fn sleep_modes(&self) -> SleepModeSet {
-        SleepModeSet {
-            display: self.display,
-            disk: self.disk,
-            system: self.system,
-            system_on_ac: self.system_on_ac,
-            entirely: self.entirely,
-            user_active: self.user_active,
+        let mut set = SleepModeSet::default();
+        if self.display {
+            set.insert(SleepMode::Display);
         }
+        if self.disk {
+            set.insert(SleepMode::Disk);
+        }
+        if self.system {
+            set.insert(SleepMode::System);
+        }
+        if self.system_on_ac {
+            set.insert(SleepMode::SystemOnAc);
+        }
+        if self.entirely {
+            set.insert(SleepMode::Entirely);
+        }
+        if self.user_active {
+            set.insert(SleepMode::UserActive);
+        }
+        set
     }
 }
 

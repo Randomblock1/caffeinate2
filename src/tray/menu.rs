@@ -1,7 +1,7 @@
 use crate::app_target::AppTarget;
 use crate::macos_apps;
 use crate::sleep_mode::SleepMode;
-use crate::tray::state::MenuSnapshot;
+use crate::tray::state::{AppState, MenuSnapshot};
 use crate::tray_mode::TimeLimitPreset;
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::menu::MenuId;
@@ -122,23 +122,25 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
     )
 }
 
-pub fn refresh_mode_checks(handles: &MenuHandles, selected: SleepMode) {
+/// Sync all checkbox items to the current menu snapshot.
+pub fn sync_menu_to_snapshot(handles: &MenuHandles, snapshot: &MenuSnapshot) {
     for (_, mode, item) in &handles.mode_items {
-        let _ = item.set_checked(*mode == selected);
+        let _ = item.set_checked(snapshot.mode == *mode);
     }
-}
-
-pub fn refresh_time_limit_checks(handles: &MenuHandles, selected: Option<u64>) {
     for (_, secs, item) in &handles.time_limit_items {
-        let _ = item.set_checked(*secs == selected);
+        let _ = item.set_checked(*secs == snapshot.time_limit_secs);
     }
-}
-
-pub fn set_until_app_checks(handles: &MenuHandles, selected: Option<&AppTarget>) {
-    let _ = handles.until_app_off.set_checked(selected.is_none());
+    let _ = handles
+        .until_app_off
+        .set_checked(snapshot.wait_for_app.is_none());
     for (_, app, item) in &handles.until_app_items {
-        let _ = item.set_checked(selected.is_some_and(|target| target.bundle_id == app.bundle_id));
+        let _ = item.set_checked(snapshot.wait_for_app.as_ref().is_some_and(|target| {
+            target.bundle_id == app.bundle_id
+        }));
     }
+    let _ = handles
+        .start_at_login
+        .set_checked(snapshot.start_at_login);
 }
 
 pub fn install_menu(
@@ -171,7 +173,7 @@ pub fn handle_menu_event(
         if let Err(e) = state.set_start_at_login(new_val) {
             eprintln!("{e}");
         } else {
-            let _ = handles.start_at_login.set_checked(new_val);
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
         return MenuAction::Handled;
     }
@@ -179,7 +181,7 @@ pub fn handle_menu_event(
         if let Err(e) = state.set_wait_for_app(None) {
             eprintln!("{e}");
         } else {
-            set_until_app_checks(handles, None);
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
         return MenuAction::Handled;
     }
@@ -191,7 +193,7 @@ pub fn handle_menu_event(
             if let Err(e) = state.set_wait_for_app(Some(app.clone())) {
                 eprintln!("{e}");
             } else {
-                set_until_app_checks(handles, Some(app));
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
                 if state.is_on() {
                     state.last_tooltip = None;
                     state.update_tooltip(tray);
@@ -205,7 +207,7 @@ pub fn handle_menu_event(
             if let Err(e) = state.set_mode(*mode) {
                 eprintln!("{e}");
             } else {
-                refresh_mode_checks(handles, *mode);
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
             }
             state.set_icon(tray);
             return MenuAction::Handled;
@@ -216,7 +218,7 @@ pub fn handle_menu_event(
             if let Err(e) = state.set_time_limit(*secs) {
                 eprintln!("{e}");
             } else {
-                refresh_time_limit_checks(handles, *secs);
+                sync_menu_to_snapshot(handles, &state.menu_snapshot());
                 if state.is_on() {
                     state.update_tooltip(tray);
                 }

@@ -1,8 +1,7 @@
 use crate::app_target::AppTarget;
-use crate::helper_ipc::HelperClient;
 use crate::install;
 use crate::macos_apps;
-use crate::sleep_mode::{ActiveSleepHold, EntirelyPolicy, SleepMode};
+use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode, TRAY_ENTIRELY_POLICY};
 use crate::tray_mode::{self, TrayConfig};
 use crate::tray_icons;
 use std::time::{Duration, Instant};
@@ -54,6 +53,7 @@ impl AppState {
 
     fn config(&self) -> TrayConfig {
         TrayConfig {
+            version: tray_mode::CONFIG_VERSION,
             mode: self.mode,
             time_limit_secs: self.time_limit_secs,
             wait_for_app: self.wait_for_app.clone(),
@@ -149,39 +149,18 @@ impl AppState {
         false
     }
 
-    pub fn toggle(&mut self) -> Result<(), String> {
+    pub fn toggle(&mut self) -> Result<(), EnableError> {
         if self.active.is_some() {
             self.clear_active();
             return Ok(());
         }
-        self.enable()?;
-        Ok(())
+        self.enable()
     }
 
-    fn ensure_helper_for_entirely(&self) -> Result<(), String> {
-        if self.mode != SleepMode::Entirely {
-            return Ok(());
-        }
-        let client = HelperClient::new();
-        if client.is_available() {
-            return Ok(());
-        }
-        install::install_helper_privileged()?;
-        if !client.is_available() {
-            return Err(
-                "helper is not running after install; try: sudo caffeinate2 install-helper"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-
-    pub fn enable(&mut self) -> Result<(), String> {
-        self.ensure_helper_for_entirely()?;
+    pub fn enable(&mut self) -> Result<(), EnableError> {
         self.active = Some(
             self.mode
-                .enable(false, EntirelyPolicy::HelperRequired)
-                .map_err(|e| e.to_string())?,
+                .enable(false, TRAY_ENTIRELY_POLICY)?,
         );
         self.active_until = self
             .time_limit_secs
@@ -194,11 +173,11 @@ impl AppState {
         Ok(())
     }
 
-    pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), String> {
+    pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), EnableError> {
         let was_on = self.active.is_some();
         self.clear_active();
         self.mode = mode;
-        self.save_config()?;
+        self.save_config().map_err(|e| EnableError::Ipc(e))?;
         if was_on {
             self.enable()?;
         }

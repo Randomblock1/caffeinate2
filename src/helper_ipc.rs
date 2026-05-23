@@ -63,6 +63,7 @@ pub fn decode_response(line: &str) -> Result<HelperResponse, serde_json::Error> 
     serde_json::from_str(line.trim())
 }
 
+#[derive(Clone)]
 pub struct HelperClient {
     socket_path: String,
 }
@@ -74,20 +75,24 @@ impl HelperClient {
         }
     }
 
-    pub fn is_available(&self) -> bool {
-        UnixStream::connect(&self.socket_path).is_ok()
+    pub fn try_connect(&self) -> Result<UnixStream, String> {
+        UnixStream::connect(&self.socket_path).map_err(|e| format!("connect failed: {e}"))
     }
 
-    fn request(&self, request: HelperRequest) -> Result<HelperResponse, String> {
-        let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|e| format!("connect failed: {e}"))?;
+    pub fn is_available(&self) -> bool {
+        self.try_connect().is_ok()
+    }
+
+    fn configure_timeouts(stream: &UnixStream) -> Result<(), String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| format!("set timeout: {e}"))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| format!("set timeout: {e}"))?;
+            .map_err(|e| format!("set timeout: {e}"))
+    }
 
+    fn exchange(stream: &mut UnixStream, request: HelperRequest) -> Result<HelperResponse, String> {
         stream
             .write_all(encode_request(&request).as_bytes())
             .map_err(|e| format!("write failed: {e}"))?;
@@ -99,6 +104,12 @@ impl HelperClient {
             .read_line(&mut line)
             .map_err(|e| format!("read failed: {e}"))?;
         decode_response(&line).map_err(|e| format!("invalid response: {e}"))
+    }
+
+    fn request(&self, request: HelperRequest) -> Result<HelperResponse, String> {
+        let mut stream = self.try_connect()?;
+        Self::configure_timeouts(&stream)?;
+        Self::exchange(&mut stream, request)
     }
 
     pub fn hold(&self) -> Result<(), String> {
@@ -135,17 +146,20 @@ impl HelperClient {
     }
 }
 
+pub fn is_connect_error(message: &str) -> bool {
+    message.starts_with("connect failed:")
+}
+
 pub struct HelperHoldGuard {
     client: HelperClient,
     held: bool,
 }
 
 impl HelperHoldGuard {
-    pub fn acquire() -> Result<Self, String> {
-        let client = HelperClient::new();
+    pub fn try_acquire(client: &HelperClient) -> Result<Self, String> {
         client.hold()?;
         Ok(Self {
-            client,
+            client: client.clone(),
             held: true,
         })
     }
@@ -166,7 +180,7 @@ pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId
     use nix::sys::socket::getsockopt;
     use nix::sys::socket::sockopt::LocalPeerPid;
 
-    let pid = getsockopt(&stream, LocalPeerPid).map_err(|e| e.to_string())?;
+    let pid = getsockopt(stream, LocalPeerPid).map_err(|e| e.to_string())?;
     process_util::process_id_from_pid(pid).map_err(|e| e.to_string())
 }
 
@@ -242,6 +256,12 @@ mod tests {
         };
         let decoded = decode_response(&encode_response(&resp)).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn connect_error_detection() {
+        assert!(is_connect_error("connect failed: No such file"));
+        assert!(!is_connect_error("hold failed"));
     }
 }
 

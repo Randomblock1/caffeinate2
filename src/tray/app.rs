@@ -1,7 +1,7 @@
 use crate::macos_apps;
 use crate::tray::menu::{
     build_menu, handle_choose_app, handle_menu_event, install_menu, running_apps_menu_key,
-    MenuAction,
+    sync_menu_to_snapshot, MenuAction,
 };
 use crate::tray::state::AppState;
 use crate::tray_icons;
@@ -76,9 +76,9 @@ pub fn run() -> Result<(), String> {
                     menu_apps_key = running_apps_menu_key(&apps);
                     let snapshot = state.lock().expect("state lock").menu_snapshot();
                     *handles.lock().expect("handles lock") = install_menu(&tray, &snapshot, &apps);
-                    let selected = state.lock().expect("state lock").wait_for_app.clone();
+                    let snapshot = state.lock().expect("state lock").menu_snapshot();
                     let h = handles.lock().expect("handles lock");
-                    crate::tray::menu::set_until_app_checks(&h, selected.as_ref());
+                    sync_menu_to_snapshot(&h, &snapshot);
                 }
                 continue;
             }

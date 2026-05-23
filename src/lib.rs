@@ -7,8 +7,6 @@ pub mod power_management;
 #[cfg(target_os = "macos")]
 pub mod sleep_mode;
 #[cfg(target_os = "macos")]
-pub mod process_lock;
-#[cfg(target_os = "macos")]
 pub mod process_util;
 #[cfg(target_os = "macos")]
 pub mod entirely;
