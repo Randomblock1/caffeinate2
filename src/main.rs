@@ -88,6 +88,23 @@ fn main() {
         sleep_modes.selected_labels().join(", ")
     );
 
+    // Parse the timeout before enabling any sleep prevention: a bad -t value
+    // must not toggle the system sleep setting and then exit without
+    // releasing it (process::exit skips destructors, and the entirely-mode
+    // hold has system-wide effects beyond this process's lifetime).
+    let parsed_timeout = match args
+        .timeout
+        .as_deref()
+        .map(duration_parser::parse_duration)
+        .transpose()
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
     let active = match sleep_modes.enable_all(args.verbose, args.dry_run) {
         Ok(active) => active,
         Err(e) => {
@@ -167,15 +184,7 @@ fn main() {
             let timeout = args.timeout.is_some();
             let waitfor = args.waitfor.is_some();
             if timeout {
-                match duration_parser::parse_duration(
-                    args.timeout.as_ref().expect("Timeout should be present"),
-                ) {
-                    Ok(d) => duration = d,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        process::exit(1);
-                    }
-                }
+                duration = parsed_timeout.expect("Timeout should be present");
                 end_time += duration;
                 sleep_str += &format!(
                     "for {}",
@@ -237,10 +246,20 @@ fn main() {
                     Ok(WaitForPidResult::TimedOut) => {}
                     Err(WaitForPidError::NotFound) => {
                         println!("PID {pid} not found");
+                        // Release holds before exiting: process::exit skips
+                        // destructors, and an entirely-mode hold would leave
+                        // system sleep disabled (until the helper reaps it,
+                        // or indefinitely with the root CLI fallback).
+                        if let Ok(mut guard) = active.lock() {
+                            let _ = guard.take();
+                        }
                         process::exit(1);
                     }
                     Err(WaitForPidError::Kevent(e)) => {
                         eprintln!("kevent error waiting for PID {pid}: {e}");
+                        if let Ok(mut guard) = active.lock() {
+                            let _ = guard.take();
+                        }
                         process::exit(1);
                     }
                 }
@@ -249,7 +268,11 @@ fn main() {
         WaitMode::UntilInterrupt => {
             sleep_str += "until Ctrl+C pressed.";
             println!("{sleep_str}");
-            thread::park();
+            // park() may return spuriously; loop so only the SIGINT handler
+            // (which exits the process) can end the session.
+            loop {
+                thread::park();
+            }
         }
     }
 
