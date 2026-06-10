@@ -35,6 +35,25 @@ impl HelperResponse {
             other => Ok(other),
         }
     }
+
+    pub fn into_hold_ok(self) -> Result<(), String> {
+        match self.into_result()? {
+            HelperResponse::HoldOk => Ok(()),
+            HelperResponse::Status { .. } => Err("unexpected status response for hold".to_string()),
+            HelperResponse::Error { message } => Err(message),
+        }
+    }
+
+    pub fn into_status(self) -> Result<(usize, bool), String> {
+        match self.into_result()? {
+            HelperResponse::Status {
+                holders,
+                sleep_disabled,
+            } => Ok((holders, sleep_disabled)),
+            HelperResponse::HoldOk => Err("unexpected hold_ok response for status".to_string()),
+            HelperResponse::Error { message } => Err(message),
+        }
+    }
 }
 
 pub fn encode_request(request: &HelperRequest) -> String {
@@ -51,6 +70,55 @@ pub fn encode_response(response: &HelperResponse) -> String {
 
 pub fn decode_response(line: &str) -> Result<HelperResponse, serde_json::Error> {
     serde_json::from_str(line.trim())
+}
+
+fn configure_rpc_timeouts(stream: &UnixStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("set timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("set timeout: {e}"))
+}
+
+fn write_request(stream: &mut UnixStream, request: &HelperRequest) -> Result<(), String> {
+    stream
+        .write_all(encode_request(request).as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    stream.flush().map_err(|e| format!("flush failed: {e}"))
+}
+
+fn read_line(stream: &mut UnixStream) -> Result<String, String> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok(line)
+}
+
+fn read_response_line(stream: &mut UnixStream) -> Result<HelperResponse, String> {
+    let line = read_line(stream)?;
+    decode_response(&line).map_err(|e| format!("invalid response: {e}"))
+}
+
+fn read_request_line(stream: &mut UnixStream) -> Result<HelperRequest, String> {
+    let line = read_line(stream)?;
+    decode_request(&line).map_err(|e| format!("invalid request: {e}"))
+}
+
+fn rpc(
+    socket_path: &str,
+    request: HelperRequest,
+    with_timeouts: bool,
+) -> Result<HelperResponse, String> {
+    let mut stream =
+        UnixStream::connect(socket_path).map_err(|e| format!("connect failed: {e}"))?;
+    if with_timeouts {
+        configure_rpc_timeouts(&stream)?;
+    }
+    write_request(&mut stream, &request)?;
+    read_response_line(&mut stream)
 }
 
 #[derive(Clone)]
@@ -73,45 +141,8 @@ impl HelperClient {
         self.try_connect().is_ok()
     }
 
-    fn configure_rpc_timeouts(stream: &UnixStream) -> Result<(), String> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| format!("set timeout: {e}"))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| format!("set timeout: {e}"))
-    }
-
-    fn read_response(stream: &mut UnixStream) -> Result<HelperResponse, String> {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read failed: {e}"))?;
-        decode_response(&line)
-            .map_err(|e| format!("invalid response: {e}"))
-            .and_then(|response| response.into_result())
-    }
-
-    fn write_request(stream: &mut UnixStream, request: HelperRequest) -> Result<(), String> {
-        stream
-            .write_all(encode_request(&request).as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        stream.flush().map_err(|e| format!("flush failed: {e}"))
-    }
-
     pub fn status(&self) -> Result<(usize, bool), String> {
-        let mut stream = self.try_connect()?;
-        Self::configure_rpc_timeouts(&stream)?;
-        Self::write_request(&mut stream, HelperRequest::Status)?;
-        match Self::read_response(&mut stream)? {
-            HelperResponse::Status {
-                holders,
-                sleep_disabled,
-            } => Ok((holders, sleep_disabled)),
-            HelperResponse::HoldOk => Err("unexpected hold_ok for status".to_string()),
-            HelperResponse::Error { message } => Err(message),
-        }
+        rpc(&self.socket_path, HelperRequest::Status, true)?.into_status()
     }
 }
 
@@ -128,28 +159,9 @@ pub struct HelperHoldGuard {
 impl HelperHoldGuard {
     pub fn try_acquire(client: &HelperClient) -> Result<Self, String> {
         let mut stream = client.try_connect()?;
-        Self::write_hold_request(&mut stream)?;
-        match Self::read_hold_response(&mut stream)? {
-            HelperResponse::HoldOk => Ok(Self { stream }),
-            HelperResponse::Status { .. } => Err("unexpected status for hold".to_string()),
-            HelperResponse::Error { message } => Err(message),
-        }
-    }
-
-    fn write_hold_request(stream: &mut UnixStream) -> Result<(), String> {
-        stream
-            .write_all(encode_request(&HelperRequest::Hold).as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        stream.flush().map_err(|e| format!("flush failed: {e}"))
-    }
-
-    fn read_hold_response(stream: &mut UnixStream) -> Result<HelperResponse, String> {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read failed: {e}"))?;
-        decode_response(&line).map_err(|e| format!("invalid response: {e}"))
+        write_request(&mut stream, &HelperRequest::Hold)?;
+        read_response_line(&mut stream)?.into_hold_ok()?;
+        Ok(Self { stream })
     }
 }
 
@@ -177,25 +189,12 @@ pub fn serve_connection(
         }
     };
 
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return write_response_on_stream(
-            &mut stream,
-            HelperResponse::Error {
-                message: "failed to read request".to_string(),
-            },
-        );
-    }
-
-    let request = match decode_request(&line) {
+    let request = match read_request_line(&mut stream) {
         Ok(req) => req,
         Err(e) => {
             return write_response_on_stream(
                 &mut stream,
-                HelperResponse::Error {
-                    message: format!("invalid request: {e}"),
-                },
+                HelperResponse::Error { message: e },
             );
         }
     };
@@ -287,6 +286,20 @@ mod tests {
             message: "nope".to_string(),
         };
         assert_eq!(resp.into_result().unwrap_err(), "nope");
+    }
+
+    #[test]
+    fn status_response_into_status() {
+        let resp = HelperResponse::Status {
+            holders: 3,
+            sleep_disabled: false,
+        };
+        assert_eq!(resp.into_status().unwrap(), (3, false));
+    }
+
+    #[test]
+    fn hold_ok_response_into_hold_ok() {
+        assert!(HelperResponse::HoldOk.into_hold_ok().is_ok());
     }
 }
 

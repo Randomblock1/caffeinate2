@@ -11,45 +11,38 @@ pub const TRAY_LAUNCH_AGENT_LABEL: &str = "com.randomblock1.caffeinate2-tray";
 
 const HELPER_PLIST_TEMPLATE: &str =
     include_str!("../resources/com.randomblock1.caffeinate2.helper.plist");
+const TRAY_PLIST_TEMPLATE: &str =
+    include_str!("../resources/com.randomblock1.caffeinate2-tray.plist");
 
-pub fn resolve_cli_binary() -> Result<PathBuf, String> {
+fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == "caffeinate2" {
+    if name == binary_name {
         return Ok(exe);
     }
     let sibling = exe
         .parent()
-        .map(|p| p.join("caffeinate2"))
-        .ok_or_else(|| "could not resolve CLI binary path".to_string())?;
+        .map(|p| p.join(binary_name))
+        .ok_or_else(|| format!("could not resolve {binary_name} path"))?;
     if sibling.exists() {
         Ok(sibling)
     } else {
         Err(format!(
-            "caffeinate2 CLI not found next to {}; install caffeinate2 with --features full",
+            "{binary_name} not found next to {}; {build_hint}",
             exe.display()
         ))
     }
 }
 
+pub fn resolve_cli_binary() -> Result<PathBuf, String> {
+    resolve_sibling_binary(
+        "caffeinate2",
+        "install caffeinate2 with --features full",
+    )
+}
+
 pub fn resolve_helper_source() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == "caffeinate2-helper" {
-        return Ok(exe);
-    }
-    let sibling = exe
-        .parent()
-        .map(|p| p.join("caffeinate2-helper"))
-        .ok_or_else(|| "could not resolve helper binary path".to_string())?;
-    if sibling.exists() {
-        Ok(sibling)
-    } else {
-        Err(format!(
-            "caffeinate2-helper not found next to {}; build with --features helper",
-            exe.display()
-        ))
-    }
+    resolve_sibling_binary("caffeinate2-helper", "build with --features helper-bin")
 }
 
 pub fn helper_plist_content(helper_path: &Path) -> String {
@@ -57,26 +50,7 @@ pub fn helper_plist_content(helper_path: &Path) -> String {
 }
 
 pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{TRAY_LAUNCH_AGENT_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{tray}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-</dict>
-</plist>
-"#,
-        tray = tray_path.display()
-    )
+    TRAY_PLIST_TEMPLATE.replace("__TRAY_PATH__", &tray_path.display().to_string())
 }
 
 pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
@@ -144,6 +118,10 @@ pub fn install_helper_privileged() -> Result<(), String> {
     }
 }
 
+fn gui_launchctl_domain() -> String {
+    format!("gui/{}", nix::unistd::getuid().as_raw())
+}
+
 pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
     if let Some(parent) = plist_path.parent() {
@@ -151,21 +129,15 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     }
     fs::write(&plist_path, tray_launch_agent_plist(tray_path)).map_err(|e| e.to_string())?;
 
-    let uid = nix::unistd::getuid().as_raw();
-    let target = format!("gui/{uid}");
-    run_launchctl(&["bootstrap", &target, &plist_path.display().to_string()])?;
+    let domain = gui_launchctl_domain();
+    run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()])?;
     Ok(())
 }
 
 pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
-    let uid = nix::unistd::getuid().as_raw();
-    let target = format!("gui/{uid}");
-    let _ = run_launchctl(&[
-        "bootout",
-        &target,
-        &format!("{TRAY_LAUNCH_AGENT_LABEL}"),
-    ]);
+    let domain = gui_launchctl_domain();
+    let _ = run_launchctl(&["bootout", &domain, TRAY_LAUNCH_AGENT_LABEL]);
     let _ = fs::remove_file(plist_path);
     Ok(())
 }
@@ -222,9 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn tray_plist_contains_executable() {
+    fn tray_plist_substitutes_path() {
         let content = tray_launch_agent_plist(Path::new("/Users/test/.cargo/bin/caffeinate2-tray"));
-        assert!(content.contains("caffeinate2-tray"));
+        assert!(content.contains("/Users/test/.cargo/bin/caffeinate2-tray"));
         assert!(content.contains(TRAY_LAUNCH_AGENT_LABEL));
+        assert!(!content.contains("__TRAY_PATH__"));
     }
 }

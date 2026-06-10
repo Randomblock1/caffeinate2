@@ -2,7 +2,7 @@ use libc::{S_IFMT, S_IFREG};
 use nix::fcntl::{Flock, FlockArg, OFlag};
 use nix::sys::stat::{Mode, fchmod, fstat, lstat};
 use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -61,14 +61,7 @@ impl std::str::FromStr for ProcessId {
 
 pub type ProcessChecker = dyn Fn(i32, ProcessStartTime) -> bool + Send + Sync;
 
-/// Returns true when the global sleep state should change.
-pub(crate) fn update_lockfile(
-    add: bool,
-    verbose: bool,
-    path: &Path,
-    process_checker: &ProcessChecker,
-    current_proc: &ProcessId,
-) -> Result<bool, std::io::Error> {
+fn open_validated_lockfile(path: &Path) -> Result<Flock<File>, std::io::Error> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -77,7 +70,7 @@ pub(crate) fn update_lockfile(
         .custom_flags(OFlag::O_NOFOLLOW.bits())
         .open(path)?;
 
-    let mut file = match Flock::lock(file, FlockArg::LockExclusive) {
+    let file = match Flock::lock(file, FlockArg::LockExclusive) {
         Ok(f) => f,
         Err((_, e)) => return Err(std::io::Error::other(e)),
     };
@@ -112,16 +105,39 @@ pub(crate) fn update_lockfile(
     )
     .map_err(std::io::Error::other)?;
 
+    Ok(file)
+}
+
+fn read_holder_set(file: &mut Flock<File>) -> Result<HashSet<ProcessId>, std::io::Error> {
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-
-    let mut pids: HashSet<ProcessId> = content
+    Ok(content
         .lines()
         .filter_map(|line| line.parse::<ProcessId>().ok())
-        .collect();
+        .collect())
+}
 
+fn write_holder_set(file: &mut Flock<File>, pids: &HashSet<ProcessId>) -> Result<(), std::io::Error> {
+    use std::ops::DerefMut;
+
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    let mut writer = BufWriter::new(file.deref_mut());
+    for p in pids {
+        writeln!(writer, "{}", p)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn prune_stale_holders(
+    pids: &mut HashSet<ProcessId>,
+    verbose: bool,
+    process_checker: &ProcessChecker,
+    pin: Option<&ProcessId>,
+) {
     pids.retain(|p| {
-        if p == current_proc {
+        if pin == Some(p) {
             return true;
         }
         if process_checker(p.pid, p.start_time) {
@@ -136,118 +152,55 @@ pub(crate) fn update_lockfile(
             false
         }
     });
+}
 
-    let active_count_before = pids.len();
+fn mutate_lockfile<R>(
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+    pin: Option<&ProcessId>,
+    mutate: impl FnOnce(&mut HashSet<ProcessId>) -> Result<R, std::io::Error>,
+) -> Result<R, std::io::Error> {
+    let mut file = open_validated_lockfile(path)?;
+    let mut pids = read_holder_set(&mut file)?;
+    prune_stale_holders(&mut pids, verbose, process_checker, pin);
+    let result = mutate(&mut pids)?;
+    write_holder_set(&mut file, &pids)?;
+    Ok(result)
+}
 
-    if add {
-        pids.insert(*current_proc);
-    } else {
-        pids.remove(current_proc);
-    }
-
-    let active_count_after = pids.len();
-
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    {
-        let mut writer = BufWriter::new(&mut *file);
-        for p in &pids {
-            writeln!(writer, "{}", p)?;
+/// Returns true when the global sleep state should change.
+pub(crate) fn update_lockfile(
+    add: bool,
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+    current_proc: &ProcessId,
+) -> Result<bool, std::io::Error> {
+    mutate_lockfile(verbose, path, process_checker, Some(current_proc), |pids| {
+        let active_count_before = pids.len();
+        if add {
+            pids.insert(*current_proc);
+        } else {
+            pids.remove(current_proc);
         }
-        writer.flush()?;
-    }
-
-    let should_toggle = if add {
-        active_count_before == 0
-    } else {
-        active_count_after == 0
-    };
-
-    Ok(should_toggle)
+        let active_count_after = pids.len();
+        Ok(if add {
+            active_count_before == 0
+        } else {
+            active_count_after == 0
+        })
+    })
 }
 
 /// Prune stale lockfile entries under an exclusive lock and return the live holder count.
+#[cfg(target_os = "macos")]
 pub(crate) fn prune_lockfile(
     verbose: bool,
     path: &Path,
     process_checker: &ProcessChecker,
 ) -> Result<usize, std::io::Error> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(LOCK_FILE_MODE)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
-
-    let mut file = match Flock::lock(file, FlockArg::LockExclusive) {
-        Ok(f) => f,
-        Err((_, e)) => return Err(std::io::Error::other(e)),
-    };
-
-    let file_stat = fstat(file.as_fd()).map_err(std::io::Error::other)?;
-    if (file_stat.st_mode & S_IFMT) != S_IFREG {
-        return Err(std::io::Error::other("Lockfile is not a regular file"));
-    }
-
-    let current_uid = nix::unistd::getuid().as_raw();
-    if file_stat.st_uid != current_uid {
-        return Err(std::io::Error::other(
-            "Lockfile is not owned by current user",
-        ));
-    }
-
-    let path_stat = lstat(path).map_err(|e| {
-        std::io::Error::other(format!("Lockfile path disappeared during acquisition: {e}"))
-    })?;
-    if (path_stat.st_mode & S_IFMT) != S_IFREG
-        || file_stat.st_dev != path_stat.st_dev
-        || file_stat.st_ino != path_stat.st_ino
-    {
-        return Err(std::io::Error::other(
-            "Lockfile was replaced during acquisition",
-        ));
-    }
-
-    fchmod(
-        file.as_fd(),
-        Mode::from_bits_truncate(LOCK_FILE_MODE as libc::mode_t),
-    )
-    .map_err(std::io::Error::other)?;
-
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-
-    let mut pids: HashSet<ProcessId> = content
-        .lines()
-        .filter_map(|line| line.parse::<ProcessId>().ok())
-        .collect();
-
-    pids.retain(|p| {
-        if process_checker(p.pid, p.start_time) {
-            true
-        } else {
-            if verbose {
-                println!(
-                    "Removing stale process {}:{} from lockfile",
-                    p.pid, p.start_time
-                );
-            }
-            false
-        }
-    });
-
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    {
-        let mut writer = BufWriter::new(&mut *file);
-        for p in &pids {
-            writeln!(writer, "{}", p)?;
-        }
-        writer.flush()?;
-    }
-
-    Ok(pids.len())
+    mutate_lockfile(verbose, path, process_checker, None, |pids| Ok(pids.len()))
 }
 
 #[cfg(test)]

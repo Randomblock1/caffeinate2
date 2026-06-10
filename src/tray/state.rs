@@ -1,19 +1,11 @@
 use crate::app_target::AppTarget;
 use crate::install;
 use crate::macos_apps;
-use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode, TRAY_ENTIRELY_POLICY};
+use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
 use crate::tray_mode::{self, TrayConfig};
 use crate::tray_icons;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
-
-/// Persisted tray preferences (saved to disk).
-#[derive(Debug, Clone)]
-struct TraySettings {
-    mode: SleepMode,
-    time_limit_secs: Option<u64>,
-    wait_for_app: Option<AppTarget>,
-}
 
 /// Runtime state while sleep prevention is active.
 struct ActiveTraySession {
@@ -33,7 +25,7 @@ pub struct MenuSnapshot {
 }
 
 pub struct AppState {
-    settings: TraySettings,
+    config: TrayConfig,
     session: Option<ActiveTraySession>,
     last_tooltip: Option<String>,
     start_at_login: bool,
@@ -41,13 +33,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let config = tray_mode::load_config();
         Self {
-            settings: TraySettings {
-                mode: config.mode,
-                time_limit_secs: config.time_limit_secs,
-                wait_for_app: config.wait_for_app,
-            },
+            config: tray_mode::load_config(),
             session: None,
             last_tooltip: None,
             start_at_login: install::tray_launch_agent_installed(),
@@ -56,24 +43,15 @@ impl AppState {
 
     pub fn menu_snapshot(&self) -> MenuSnapshot {
         MenuSnapshot {
-            mode: self.settings.mode,
-            time_limit_secs: self.settings.time_limit_secs,
-            wait_for_app: self.settings.wait_for_app.clone(),
+            mode: self.config.mode,
+            time_limit_secs: self.config.time_limit_secs,
+            wait_for_app: self.config.wait_for_app.clone(),
             start_at_login: self.start_at_login,
         }
     }
 
-    fn config(&self) -> TrayConfig {
-        TrayConfig {
-            version: tray_mode::CONFIG_VERSION,
-            mode: self.settings.mode,
-            time_limit_secs: self.settings.time_limit_secs,
-            wait_for_app: self.settings.wait_for_app.clone(),
-        }
-    }
-
     fn save_config(&self) -> Result<(), String> {
-        tray_mode::save_config(&self.config())
+        tray_mode::save_config(&self.config)
     }
 
     pub fn is_on(&self) -> bool {
@@ -81,7 +59,7 @@ impl AppState {
     }
 
     pub fn waiting_for_app_launch(&self) -> bool {
-        self.settings.wait_for_app.as_ref().is_some_and(|app| {
+        self.config.wait_for_app.as_ref().is_some_and(|app| {
             self.is_on()
                 && !self
                     .session
@@ -116,7 +94,7 @@ impl AppState {
             });
             tray_mode::format_active_tooltip(
                 remaining,
-                self.settings.wait_for_app.as_ref(),
+                self.config.wait_for_app.as_ref(),
                 self.waiting_for_app_launch(),
             )
         } else {
@@ -150,7 +128,7 @@ impl AppState {
     }
 
     pub fn check_app_watch(&mut self) -> bool {
-        let Some(app) = self.settings.wait_for_app.as_ref() else {
+        let Some(app) = self.config.wait_for_app.as_ref() else {
             return false;
         };
         let Some(session) = self.session.as_mut() else {
@@ -178,32 +156,16 @@ impl AppState {
         self.start_session()
     }
 
-    fn acquire_hold(mode: SleepMode) -> Result<ActiveSleepHold, EnableError> {
-        match mode.enable(false, TRAY_ENTIRELY_POLICY) {
-            Err(EnableError::HelperUnavailable) if mode == SleepMode::Entirely => {
-                install::install_helper_privileged().map_err(EnableError::Ipc)?;
-                mode.enable(false, TRAY_ENTIRELY_POLICY).map_err(|error| match error {
-                    EnableError::HelperUnavailable => EnableError::Ipc(
-                        "helper is not running after install; try: sudo caffeinate2 install-helper"
-                            .to_string(),
-                    ),
-                    other => other,
-                })
-            }
-            other => other,
-        }
-    }
-
     pub fn start_session(&mut self) -> Result<(), EnableError> {
-        let hold = Self::acquire_hold(self.settings.mode)?;
+        let hold = self.config.mode.enable_for_tray()?;
         self.session = Some(ActiveTraySession {
             hold,
             until: self
-                .settings
+                .config
                 .time_limit_secs
                 .map(|secs| Instant::now() + Duration::from_secs(secs)),
             app_saw_running: self
-                .settings
+                .config
                 .wait_for_app
                 .as_ref()
                 .is_some_and(|app| macos_apps::is_bundle_running(&app.bundle_id)),
@@ -213,34 +175,26 @@ impl AppState {
     }
 
     pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), EnableError> {
-        if mode == self.settings.mode {
+        if mode == self.config.mode {
             return Ok(());
         }
-        let was_on = self.is_on();
-        let previous_mode = self.settings.mode;
-        if was_on {
+        let previous_mode = self.config.mode;
+        if self.is_on() {
             self.stop_session();
-            self.settings.mode = mode;
-            match self.start_session() {
-                Ok(()) => {
-                    self.save_config().map_err(EnableError::Ipc)?;
-                    Ok(())
-                }
-                Err(error) => {
-                    self.settings.mode = previous_mode;
-                    let _ = self.start_session();
-                    Err(error)
-                }
+            self.config.mode = mode;
+            if let Err(error) = self.start_session() {
+                self.config.mode = previous_mode;
+                let _ = self.start_session();
+                return Err(error);
             }
         } else {
-            self.settings.mode = mode;
-            self.save_config().map_err(EnableError::Ipc)?;
-            Ok(())
+            self.config.mode = mode;
         }
+        self.save_config().map_err(EnableError::Ipc)
     }
 
     pub fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), String> {
-        self.settings.time_limit_secs = time_limit_secs;
+        self.config.time_limit_secs = time_limit_secs;
         if let Some(session) = self.session.as_mut() {
             session.until =
                 time_limit_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
@@ -250,10 +204,10 @@ impl AppState {
     }
 
     pub fn set_wait_for_app(&mut self, wait_for_app: Option<AppTarget>) -> Result<(), String> {
-        self.settings.wait_for_app = wait_for_app;
+        self.config.wait_for_app = wait_for_app;
         if let Some(session) = self.session.as_mut() {
             session.app_saw_running = self
-                .settings
+                .config
                 .wait_for_app
                 .as_ref()
                 .is_some_and(|app| macos_apps::is_bundle_running(&app.bundle_id));

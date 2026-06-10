@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
 
-pub type SleepDisabler = Box<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
+pub type SleepDisabler = Arc<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
 
 pub fn helper_lock_path() -> PathBuf {
     PathBuf::from(HELPER_LOCK_PATH)
@@ -35,7 +35,7 @@ pub struct EntirelyStatus {
 struct EntirelyCoordinatorInner {
     verbose: bool,
     lock_file_path: PathBuf,
-    sleep_disabler: Arc<SleepDisabler>,
+    sleep_disabler: SleepDisabler,
     process_checker: Arc<ProcessChecker>,
     sleep_disabled: AtomicBool,
 }
@@ -49,7 +49,7 @@ impl EntirelyCoordinator {
     pub fn with_options(
         verbose: bool,
         lock_file_path: PathBuf,
-        sleep_disabler: Arc<SleepDisabler>,
+        sleep_disabler: SleepDisabler,
         process_checker: Arc<ProcessChecker>,
     ) -> Self {
         Self {
@@ -67,7 +67,7 @@ impl EntirelyCoordinator {
         Self::with_options(
             verbose,
             helper_lock_path(),
-            Arc::new(Box::new(power_management::set_sleep_disabled)),
+            Arc::new(power_management::set_sleep_disabled),
             Arc::new(|pid, start| process_util::default_process_checker(pid, start)),
         )
     }
@@ -76,7 +76,7 @@ impl EntirelyCoordinator {
         Self::with_options(
             verbose,
             cli_fallback_lock_path(),
-            Arc::new(Box::new(power_management::set_sleep_disabled)),
+            Arc::new(power_management::set_sleep_disabled),
             Arc::new(|pid, start| process_util::default_process_checker(pid, start)),
         )
     }
@@ -176,7 +176,6 @@ impl EntirelyCoordinator {
             active: true,
         })
     }
-
 }
 
 pub struct EntirelyHoldGuard {
@@ -255,10 +254,10 @@ mod tests {
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
         let sleep_calls_clone = sleep_calls.clone();
 
-        let sleep_disabler = Arc::new(Box::new(move |state: bool, _verbose: bool| {
+        let sleep_disabler: SleepDisabler = Arc::new(move |state: bool, _verbose: bool| {
             sleep_calls_clone.lock().unwrap().push(state);
             Ok(())
-        }) as SleepDisabler);
+        });
 
         let process_checker: Arc<ProcessChecker> =
             Arc::new(|_pid: i32, _start: ProcessStartTime| false);
@@ -292,8 +291,8 @@ mod tests {
     fn sleep_disable_failure_rolls_back_lockfile_entry() {
         let lock_path = temp_lock_path();
 
-        let sleep_disabler =
-            Arc::new(Box::new(|_state: bool, _verbose: bool| Err(0xE000_02C1u32)) as SleepDisabler);
+        let sleep_disabler: SleepDisabler =
+            Arc::new(|_state: bool, _verbose: bool| Err(0xE000_02C1u32));
 
         let process_checker: Arc<ProcessChecker> =
             Arc::new(|_pid: i32, _start: ProcessStartTime| false);

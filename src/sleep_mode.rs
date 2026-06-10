@@ -134,6 +134,23 @@ impl SleepMode {
             }
         }
     }
+
+    /// Enable sleep prevention for the tray, installing the privileged helper for entirely mode when needed.
+    pub fn enable_for_tray(self) -> Result<ActiveSleepHold, EnableError> {
+        match self.enable(false, TRAY_ENTIRELY_POLICY) {
+            Err(EnableError::HelperUnavailable) if self == SleepMode::Entirely => {
+                crate::install::install_helper_privileged().map_err(EnableError::Ipc)?;
+                self.enable(false, TRAY_ENTIRELY_POLICY).map_err(|error| match error {
+                    EnableError::HelperUnavailable => EnableError::Ipc(
+                        "helper is not running after install; try: sudo caffeinate2 install-helper"
+                            .to_string(),
+                    ),
+                    other => other,
+                })
+            }
+            other => other,
+        }
+    }
 }
 
 /// One active sleep-prevention hold (IOKit assertion or entirely-mode lock).
