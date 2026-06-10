@@ -79,7 +79,8 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
         menu.append(&item).expect("append mode item");
     }
 
-    menu.append(&PredefinedMenuItem::separator()).expect("separator");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("separator");
 
     let time_limit_submenu = Submenu::new("Time limit", true);
     let mut time_limit_items = Vec::new();
@@ -106,22 +107,34 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
         .append(&off_item)
         .expect("append until app off");
 
+    // Include the configured target even when it isn't running (e.g. chosen
+    // via the open panel before launch), so the active selection stays
+    // visible and checked instead of the submenu showing nothing selected.
+    let configured_not_running = snapshot.wait_for_app.as_ref().filter(|target| {
+        !running_apps
+            .iter()
+            .any(|app| app.bundle_id == target.bundle_id)
+    });
+
     let mut until_app_items = Vec::new();
-    if !running_apps.is_empty() {
+    if !running_apps.is_empty() || configured_not_running.is_some() {
         until_app_submenu
             .append(&PredefinedMenuItem::separator())
             .expect("separator");
-        for app in running_apps {
+        let configured = configured_not_running
+            .map(|target| (target.clone(), format!("{} (not running)", target.name)));
+        let running = running_apps
+            .iter()
+            .map(|app| (app.clone(), app.name.clone()));
+        for (app, label) in configured.into_iter().chain(running) {
             let checked = snapshot
                 .wait_for_app
                 .as_ref()
                 .is_some_and(|w| w.bundle_id == app.bundle_id);
-            let item = CheckMenuItem::new(&app.name, true, checked, None);
+            let item = CheckMenuItem::new(&label, true, checked, None);
             let id = item.id().clone();
-            until_app_items.push((id, app.clone(), item.clone()));
-            until_app_submenu
-                .append(&item)
-                .expect("append running app");
+            until_app_items.push((id, app, item.clone()));
+            until_app_submenu.append(&item).expect("append running app");
         }
     }
 
@@ -137,14 +150,15 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
     menu.append(&until_app_submenu)
         .expect("append until app submenu");
 
-    menu.append(&PredefinedMenuItem::separator()).expect("separator");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("separator");
 
-    let start_at_login =
-        CheckMenuItem::new("Start at login", true, snapshot.start_at_login, None);
+    let start_at_login = CheckMenuItem::new("Start at login", true, snapshot.start_at_login, None);
     let start_at_login_id = start_at_login.id().clone();
     menu.append(&start_at_login).expect("append login item");
 
-    menu.append(&PredefinedMenuItem::separator()).expect("separator");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("separator");
 
     let quit = MenuItem::new("Quit", true, None);
     let quit_id = quit.id().clone();
@@ -169,22 +183,23 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
 /// Sync all checkbox items to the current menu snapshot.
 pub fn sync_menu_to_snapshot(handles: &MenuHandles, snapshot: &MenuSnapshot) {
     for (_, mode, item) in &handles.mode_items {
-        let _ = item.set_checked(snapshot.mode == *mode);
+        item.set_checked(snapshot.mode == *mode);
     }
     for (_, secs, item) in &handles.time_limit_items {
-        let _ = item.set_checked(*secs == snapshot.time_limit_secs);
+        item.set_checked(*secs == snapshot.time_limit_secs);
     }
-    let _ = handles
+    handles
         .until_app_off
         .set_checked(snapshot.wait_for_app.is_none());
     for (_, app, item) in &handles.until_app_items {
-        let _ = item.set_checked(snapshot.wait_for_app.as_ref().is_some_and(|target| {
-            target.bundle_id == app.bundle_id
-        }));
+        item.set_checked(
+            snapshot
+                .wait_for_app
+                .as_ref()
+                .is_some_and(|target| target.bundle_id == app.bundle_id),
+        );
     }
-    let _ = handles
-        .start_at_login
-        .set_checked(snapshot.start_at_login);
+    handles.start_at_login.set_checked(snapshot.start_at_login);
 }
 
 pub fn install_menu(
@@ -193,7 +208,7 @@ pub fn install_menu(
     running_apps: &[AppTarget],
 ) -> MenuHandles {
     let (menu, handles) = build_menu(snapshot, running_apps);
-    let _ = tray.set_menu(Some(Box::new(menu)));
+    tray.set_menu(Some(Box::new(menu)));
     handles
 }
 
@@ -232,6 +247,14 @@ pub fn dispatch_command(
             }
         }
         MenuCommand::SetMode(mode) => {
+            // Switching an active session to Entirely can block on the helper
+            // install prompt and socket wait; surface progress in the tooltip
+            // before the blocking work starts. set_icon below restores it.
+            if state.is_on() && mode == SleepMode::Entirely {
+                let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
+                state.invalidate_tooltip();
+                crate::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+            }
             if let Err(e) = state.set_mode(mode) {
                 eprintln!("{e}");
             }

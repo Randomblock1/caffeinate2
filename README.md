@@ -39,7 +39,7 @@ Run `caffeinate2-tray` after installing with `--features full`.
 - **Left click:** toggle the selected sleep mode on/off.
 - **Right click:** choose mode (Display, Disk, System, System on AC, User active, Entirely), set an optional **Time limit** (Off, 15 minutes, 30 minutes, 1 hour, and so on), optionally set **Until app quits** (pick a running app or **Choose application…** for any `.app`), toggle **Start at login**, or Quit.
 
-When a time limit is set, left-clicking to start sleep prevention automatically turns it off again after that duration (similar to `caffeinate2 -t`). **Until app quits** keeps prevention on until every instance of the chosen app has exited; if the app is not running when you turn on, caffeinate2 waits for it to launch first. The target is remembered by bundle ID (for example `Codex.app` stays matched across restarts). Time limit and until-app quit whichever comes first. The menu bar tooltip shows remaining time and/or app status while active.
+When a time limit is set, left-clicking to start sleep prevention automatically turns it off again after that duration (similar to `caffeinate2 -t`). Changing the time limit while sleep prevention is active restarts the countdown from that moment (it is not measured from when the session started). **Until app quits** keeps prevention on until every instance of the chosen app has exited; if the app is not running when you turn on, caffeinate2 waits for it to launch first. The target is remembered by bundle ID (for example `Codex.app` stays matched across restarts). Time limit and until-app quit whichever comes first. The menu bar tooltip shows remaining time and/or app status while active.
 
 Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
 

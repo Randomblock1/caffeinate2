@@ -1,7 +1,8 @@
 use crate::macos_apps;
+use crate::sleep_mode::SleepMode;
 use crate::tray::menu::{
-    build_menu, handle_choose_app, handle_menu_event, install_menu, running_apps_menu_key,
-    MenuAction,
+    MenuAction, build_menu, handle_choose_app, handle_menu_event, install_menu,
+    running_apps_menu_key,
 };
 use crate::tray::state::AppState;
 use crate::tray_icons;
@@ -21,9 +22,10 @@ pub fn run() -> Result<(), String> {
     // tray-icon requires a running main-thread event loop before creating the icon.
     crate::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
 
-    let icon_off_rgba = tray_icons::decode_icon_rgba(tray_icons::ICON_OFF)?;
-    let icon_off = Icon::from_rgba(icon_off_rgba, tray_icons::ICON_SIZE, tray_icons::ICON_SIZE)
-        .map_err(|e| e.to_string())?;
+    let (icon_off_rgba, icon_width, icon_height) =
+        tray_icons::decode_icon_rgba(tray_icons::ICON_OFF)?;
+    let icon_off =
+        Icon::from_rgba(icon_off_rgba, icon_width, icon_height).map_err(|e| e.to_string())?;
 
     // Everything below runs on the main thread only; muda menu items are not
     // Send, so no locking or sharing is involved.
@@ -92,6 +94,13 @@ pub fn run() -> Result<(), String> {
                 // thread. `set_icon` below re-syncs icon and tooltip to the
                 // real state, reverting the flip if the toggle failed.
                 AppState::show_icon_state(&tray, !state.is_on());
+                // Turning Entirely on can additionally block on the helper
+                // install (admin prompt + up to ~5s of socket retries);
+                // surface that in the tooltip while it runs.
+                if !state.is_on() && state.menu_snapshot().mode == SleepMode::Entirely {
+                    let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
+                    state.invalidate_tooltip();
+                }
                 crate::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
                 if let Err(e) = state.toggle() {
                     eprintln!("{e}");

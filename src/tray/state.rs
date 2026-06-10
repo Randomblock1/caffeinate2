@@ -2,8 +2,8 @@ use crate::app_target::AppTarget;
 use crate::install;
 use crate::macos_apps;
 use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
-use crate::tray_mode::{self, TrayConfig};
 use crate::tray_icons;
+use crate::tray_mode::{self, TrayConfig};
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
 
@@ -60,7 +60,9 @@ impl AppState {
 
     /// True while a timed session is active (tooltip countdown needs 1s ticks).
     pub fn needs_tick(&self) -> bool {
-        self.session.as_ref().is_some_and(|session| session.until.is_some())
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.until.is_some())
     }
 
     /// How long to wait before the next loop iteration, or `None` to block
@@ -77,10 +79,7 @@ impl AppState {
     pub fn waiting_for_app_launch(&self) -> bool {
         self.config.wait_for_app.as_ref().is_some_and(|app| {
             self.is_on()
-                && !self
-                    .session
-                    .as_ref()
-                    .is_some_and(|s| s.app_saw_running)
+                && !self.session.as_ref().is_some_and(|s| s.app_saw_running)
                 && !macos_apps::is_bundle_running(&app.bundle_id)
         })
     }
@@ -94,10 +93,14 @@ impl AppState {
         } else {
             tray_icons::ICON_OFF
         };
-        if let Ok(rgba) = tray_icons::decode_icon_rgba(bytes) {
-            if let Ok(icon) = Icon::from_rgba(rgba, tray_icons::ICON_SIZE, tray_icons::ICON_SIZE) {
+        let icon = tray_icons::decode_icon_rgba(bytes).and_then(|(rgba, width, height)| {
+            Icon::from_rgba(rgba, width, height).map_err(|e| e.to_string())
+        });
+        match icon {
+            Ok(icon) => {
                 let _ = tray.set_icon_with_as_template(Some(icon), true);
             }
+            Err(e) => eprintln!("failed to decode tray icon: {e}"),
         }
     }
 
@@ -109,11 +112,9 @@ impl AppState {
     pub fn update_tooltip(&mut self, tray: &TrayIcon) {
         let tooltip = if self.is_on() {
             let remaining = self.session.as_ref().and_then(|session| {
-                session.until.map(|until| {
-                    until
-                        .saturating_duration_since(Instant::now())
-                        .as_secs()
-                })
+                session
+                    .until
+                    .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
             });
             tray_mode::format_active_tooltip(
                 remaining,
@@ -139,11 +140,11 @@ impl AppState {
     }
 
     pub fn check_timeout(&mut self) -> bool {
-        if self.session.as_ref().is_some_and(|session| {
-            session
-                .until
-                .is_some_and(|until| Instant::now() >= until)
-        }) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.until.is_some_and(|until| Instant::now() >= until))
+        {
             self.stop_session();
             return true;
         }
@@ -216,11 +217,13 @@ impl AppState {
         self.save_config().map_err(EnableError::Ipc)
     }
 
+    /// Set (or clear) the time limit. Deliberately restarts the countdown
+    /// from now when a session is active, rather than rebasing on the
+    /// session start (documented in the README).
     pub fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), String> {
         self.config.time_limit_secs = time_limit_secs;
         if let Some(session) = self.session.as_mut() {
-            session.until =
-                time_limit_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+            session.until = time_limit_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
             self.last_tooltip = None;
         }
         self.save_config()
