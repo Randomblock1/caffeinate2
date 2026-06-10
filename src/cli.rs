@@ -1,28 +1,32 @@
 use crate::sleep_mode::{SleepMode, SleepModeSet};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
-#[derive(Subcommand, Debug)]
+/// One-shot maintenance action selected via an exclusive flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceCommand {
-    /// Install the privileged helper for entirely mode (requires root).
     InstallHelper,
-    /// Remove the privileged helper (requires root).
     UninstallHelper,
-    /// Internal entry point used after administrator authorization.
-    #[command(hide = true, name = "install-helper-internal")]
     InstallHelperInternal,
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<MaintenanceCommand>,
-    #[command(flatten)]
-    pub args: Args,
-}
-
-#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Install the privileged helper for entirely mode
+    /// (prompts for administrator authorization; or run with sudo).
+    /// Cannot be combined with other options.
+    #[arg(long, exclusive = true)]
+    pub install_helper: bool,
+
+    /// Remove the privileged helper (requires root).
+    /// Cannot be combined with other options.
+    #[arg(long, exclusive = true)]
+    pub uninstall_helper: bool,
+
+    /// Internal entry point used after administrator authorization.
+    #[arg(long, exclusive = true, hide = true)]
+    pub install_helper_internal: bool,
+
     /// Verbose mode
     #[arg(short, long)]
     pub verbose: bool,
@@ -78,6 +82,19 @@ pub struct Args {
 }
 
 impl Args {
+    pub fn maintenance_command(&self) -> Option<MaintenanceCommand> {
+        // The flags are `exclusive`, so clap guarantees at most one is set.
+        if self.install_helper {
+            Some(MaintenanceCommand::InstallHelper)
+        } else if self.uninstall_helper {
+            Some(MaintenanceCommand::UninstallHelper)
+        } else if self.install_helper_internal {
+            Some(MaintenanceCommand::InstallHelperInternal)
+        } else {
+            None
+        }
+    }
+
     pub fn sleep_modes(&self) -> SleepModeSet {
         let mut set = SleepModeSet::default();
         if self.display {
@@ -104,5 +121,5 @@ impl Args {
 
 #[cfg(test)]
 pub(crate) fn parse_args(args: &[&str]) -> Args {
-    Cli::try_parse_from(args).unwrap().args
+    Args::try_parse_from(args).unwrap()
 }

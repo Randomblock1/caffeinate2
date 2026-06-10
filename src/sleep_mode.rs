@@ -151,7 +151,7 @@ impl SleepMode {
                     }
                 }
                 Err(EnableError::Ipc(
-                    "helper is not running after install; try: sudo caffeinate2 install-helper"
+                    "helper is not running after install; try: sudo caffeinate2 --install-helper"
                         .to_string(),
                 ))
             }

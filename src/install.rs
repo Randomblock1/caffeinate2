@@ -67,7 +67,7 @@ pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
 
 pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     if !nix::unistd::Uid::effective().is_root() {
-        return Err("install-helper must run as root".to_string());
+        return Err("--install-helper must run as root".to_string());
     }
 
     let dest = PathBuf::from(HELPER_INSTALL_PATH);
@@ -95,7 +95,7 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
 
 pub fn uninstall_helper() -> Result<(), String> {
     if !nix::unistd::Uid::effective().is_root() {
-        return Err("uninstall-helper must run as root".to_string());
+        return Err("--uninstall-helper must run as root".to_string());
     }
 
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
@@ -120,7 +120,7 @@ pub fn install_helper_privileged() -> Result<(), String> {
     // it needs both layers of quoting or paths with spaces break.
     let cli_escaped = applescript_escape(&sh_single_quote(&cli.display().to_string()));
     let script = format!(
-        "do shell script \"{cli_escaped} install-helper-internal\" with administrator privileges"
+        "do shell script \"{cli_escaped} --install-helper-internal\" with administrator privileges"
     );
     let status = Command::new("osascript")
         .arg("-e")

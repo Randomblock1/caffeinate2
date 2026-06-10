@@ -8,7 +8,7 @@ use caffeinate2::{duration_parser, install, sleep_mode};
 #[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
-use cli::{Cli, MaintenanceCommand};
+use cli::{Args, MaintenanceCommand};
 #[cfg(target_os = "macos")]
 use nix::unistd;
 #[cfg(target_os = "macos")]
@@ -38,7 +38,7 @@ fn run_maintenance(command: MaintenanceCommand) {
         }
         MaintenanceCommand::UninstallHelper => {
             if !nix::unistd::Uid::effective().is_root() {
-                eprintln!("Error: uninstall-helper must run as root (try sudo).");
+                eprintln!("Error: --uninstall-helper must run as root (try sudo).");
                 process::exit(1);
             }
             if let Err(e) = install::uninstall_helper() {
@@ -49,7 +49,7 @@ fn run_maintenance(command: MaintenanceCommand) {
         }
         MaintenanceCommand::InstallHelperInternal => {
             if !nix::unistd::Uid::effective().is_root() {
-                eprintln!("Error: install-helper-internal must run as root.");
+                eprintln!("Error: --install-helper-internal must run as root.");
                 process::exit(1);
             }
             let source = match install::resolve_helper_source() {
@@ -69,13 +69,25 @@ fn run_maintenance(command: MaintenanceCommand) {
 
 #[cfg(target_os = "macos")]
 fn main() {
-    let cli = Cli::parse();
-    if let Some(command) = cli.command {
+    let args = Args::parse();
+    if let Some(command) = args.maintenance_command() {
         run_maintenance(command);
         return;
     }
 
-    let args = cli.args;
+    // Catch verb-style invocations from the old subcommand syntax so they
+    // error out instead of running e.g. `/bin/sh -c install-helper` while
+    // preventing sleep.
+    if let Some(first) = args.command.as_ref().and_then(|c| c.first())
+        && matches!(
+            first.as_str(),
+            "install-helper" | "uninstall-helper" | "install-helper-internal"
+        )
+    {
+        eprintln!("Error: '{first}' is not a command to run. Did you mean: caffeinate2 --{first}?");
+        process::exit(2);
+    }
+
     let mut sleep_modes = args.sleep_modes();
     sleep_modes.apply_defaults();
 
@@ -111,7 +123,7 @@ fn main() {
             eprintln!("Error: {e}");
             if sleep_modes.contains(sleep_mode::SleepMode::Entirely) {
                 eprintln!(
-                    "Hint: install the privileged helper with: sudo caffeinate2 install-helper"
+                    "Hint: install the privileged helper with: sudo caffeinate2 --install-helper"
                 );
             }
             process::exit(1);

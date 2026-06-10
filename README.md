@@ -52,11 +52,11 @@ Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid
 **One-time setup** (either method):
 
 1. Tray: select **Entirely** and approve the administrator dialog when prompted, or
-2. CLI: `sudo caffeinate2 install-helper`
+2. CLI: `sudo caffeinate2 --install-helper`
 
 After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
 
-Remove the helper: `sudo caffeinate2 uninstall-helper`
+Remove the helper: `sudo caffeinate2 --uninstall-helper`
 
 ## Usage
 
@@ -78,12 +78,10 @@ Options:
   -u, --user-active         Declare the user is active. If the display is off, this option turns it on and prevents it from going into idle sleep
   -t, --timeout <DURATION>  Wait for X seconds. Also supports time units (like "1 day 2 hours 3mins 4s")
   -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
+      --install-helper      Install the privileged helper for entirely mode (admin prompt or sudo)
+      --uninstall-helper    Remove the privileged helper (requires root)
   -h, --help                Print help
   -V, --version             Print version
-
-Subcommands:
-  install-helper            Install privileged helper for entirely mode (root)
-  uninstall-helper          Remove privileged helper (root)
 ```
 
 ## Sleep Timers (in order of priority)
