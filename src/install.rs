@@ -134,10 +134,6 @@ pub fn install_helper_privileged() -> Result<(), String> {
     }
 }
 
-fn gui_launchctl_domain() -> String {
-    format!("gui/{}", nix::unistd::getuid().as_raw())
-}
-
 pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
     if let Some(parent) = plist_path.parent() {
@@ -152,11 +148,19 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
 
 pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
-    // bootout takes a service target (`gui/<uid>/<label>`), not a bare label.
-    let service_target = format!("{}/{TRAY_LAUNCH_AGENT_LABEL}", gui_launchctl_domain());
-    let _ = run_launchctl(&["bootout", &service_target]);
-    let _ = fs::remove_file(plist_path);
-    Ok(())
+    // Only remove the plist; launchd won't start the agent at the next login.
+    // Do NOT boot out the loaded service: when the tray was started by launchd
+    // (the common case after enabling start-at-login), the current process *is*
+    // that service, and bootout would terminate the running app the instant the
+    // user unchecks the menu item.
+    match fs::remove_file(&plist_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "failed to remove {}: {e}",
+            plist_path.display()
+        )),
+    }
 }
 
 pub fn tray_launch_agent_installed() -> bool {
