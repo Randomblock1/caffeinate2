@@ -85,8 +85,11 @@ impl AppState {
         })
     }
 
-    pub fn set_icon(&mut self, tray: &TrayIcon) {
-        let bytes = if self.is_on() {
+    /// Set the tray image for the given on/off state without touching the
+    /// session or tooltip. Used to flip the icon optimistically before a
+    /// potentially slow toggle (e.g. the helper RPC in Entirely mode).
+    pub fn show_icon_state(tray: &TrayIcon, on: bool) {
+        let bytes = if on {
             tray_icons::ICON_ON
         } else {
             tray_icons::ICON_OFF
@@ -96,6 +99,10 @@ impl AppState {
                 let _ = tray.set_icon_with_as_template(Some(icon), true);
             }
         }
+    }
+
+    pub fn set_icon(&mut self, tray: &TrayIcon) {
+        Self::show_icon_state(tray, self.is_on());
         self.update_tooltip(tray);
     }
 

@@ -77,12 +77,22 @@ pub fn run() -> Result<(), String> {
         }
 
         while let Ok(event) = tray_events.try_recv() {
+            // Toggle on mouse-down: native menu bar items respond at press
+            // time, so waiting for mouse-up reads as lag.
             if let TrayIconEvent::Click {
                 button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Up,
+                button_state: tray_icon::MouseButtonState::Down,
                 ..
             } = event
             {
+                // Optimistically show the target state and pump one run-loop
+                // pass so the new image is committed to the menu bar *before*
+                // the potentially slow hold acquisition/release (helper RPC +
+                // IOPMSetSystemPowerSetting in Entirely mode) blocks this
+                // thread. `set_icon` below re-syncs icon and tooltip to the
+                // real state, reverting the flip if the toggle failed.
+                AppState::show_icon_state(&tray, !state.is_on());
+                crate::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
                 if let Err(e) = state.toggle() {
                     eprintln!("{e}");
                 }
