@@ -13,8 +13,36 @@ pub fn init_tray_app() {
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn wake_event_loop() {
+    use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_core_foundation::CFRunLoop;
+    use objc2_foundation::{MainThreadMarker, NSPoint};
 
+    // `pump_event_loop` blocks in `nextEventMatchingMask:untilDate:…`, which
+    // only returns when an actual event arrives or the date expires; a bare
+    // run-loop wake-up is not an event and leaves it blocked. Post an empty
+    // application-defined event to force it to return.
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(event) =
+            NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined,
+                NSPoint::new(0.0, 0.0),
+                NSEventModifierFlags::empty(),
+                0.0,
+                0,
+                None,
+                0,
+                0,
+                0,
+            )
+        {
+            app.postEvent_atStart(&event, true);
+            return;
+        }
+    }
+
+    // Off the main thread NSApplication is unavailable; nudging the main run
+    // loop is the best we can do.
     if let Some(run_loop) = CFRunLoop::main() {
         run_loop.wake_up();
     }

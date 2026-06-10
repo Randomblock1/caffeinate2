@@ -34,6 +34,7 @@ objc2-io-kit = "0.3"
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
     "NSEvent",
+    "NSGraphicsContext",
     "NSWorkspace",
     "NSRunningApplication",
     "NSOpenPanel",

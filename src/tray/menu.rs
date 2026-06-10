@@ -210,58 +210,48 @@ pub fn dispatch_command(
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
     match command {
-        MenuCommand::Quit => MenuAction::Quit,
-        MenuCommand::ChooseApp => MenuAction::Unhandled,
+        MenuCommand::Quit => return MenuAction::Quit,
+        MenuCommand::ChooseApp => return MenuAction::Unhandled,
         MenuCommand::ToggleStartAtLogin => {
             let new_val = !state.menu_snapshot().start_at_login;
             if let Err(e) = state.set_start_at_login(new_val) {
                 eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
             }
-            MenuAction::Handled
         }
         MenuCommand::ClearWaitForApp => {
             if let Err(e) = state.set_wait_for_app(None) {
                 eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
             }
-            MenuAction::Handled
         }
         MenuCommand::SelectWaitForApp(app) => {
             if let Err(e) = state.set_wait_for_app(Some(app)) {
                 eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
-                if state.is_on() {
-                    state.invalidate_tooltip();
-                    state.update_tooltip(tray);
-                }
+            } else if state.is_on() {
+                state.invalidate_tooltip();
+                state.update_tooltip(tray);
             }
-            MenuAction::Handled
         }
         MenuCommand::SetMode(mode) => {
             if let Err(e) = state.set_mode(mode) {
                 eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
             }
             state.set_icon(tray);
-            MenuAction::Handled
         }
         MenuCommand::SetTimeLimit(secs) => {
             if let Err(e) = state.set_time_limit(secs) {
                 eprintln!("{e}");
-            } else {
-                sync_menu_to_snapshot(handles, &state.menu_snapshot());
-                if state.is_on() {
-                    state.update_tooltip(tray);
-                }
+            } else if state.is_on() {
+                state.update_tooltip(tray);
             }
-            MenuAction::Handled
         }
     }
+
+    // Always re-sync the checkboxes: muda auto-toggles the clicked item before
+    // this handler runs, so a failed state change (e.g. a cancelled admin
+    // prompt when enabling Entirely mode) would otherwise leave the menu
+    // showing a state that was never applied.
+    sync_menu_to_snapshot(handles, &state.menu_snapshot());
+    MenuAction::Handled
 }
 
 pub fn handle_menu_event(
