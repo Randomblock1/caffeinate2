@@ -137,6 +137,12 @@ pub struct HelperClient {
     socket_path: String,
 }
 
+impl Default for HelperClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HelperClient {
     pub fn new() -> Self {
         Self {
@@ -185,8 +191,14 @@ impl HelperHoldGuard {
         if self.released {
             return Ok(());
         }
+        // Only mark released on success so Drop retries a failed explicit
+        // release; otherwise a transient helper outage strands the hold for
+        // as long as this process lives (the reaper only prunes dead pids).
+        // Release is idempotent on the helper side, so a duplicate after a
+        // lost response is harmless.
+        rpc(&self.client.socket_path, HelperRequest::Release, true)?.into_release_ok()?;
         self.released = true;
-        rpc(&self.client.socket_path, HelperRequest::Release, true)?.into_release_ok()
+        Ok(())
     }
 }
 
@@ -198,6 +210,17 @@ impl Drop for HelperHoldGuard {
             eprintln!("Error releasing helper hold: {e}");
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_response_on_stream(
+    stream: &mut UnixStream,
+    response: HelperResponse,
+) -> Result<(), String> {
+    stream
+        .write_all(encode_response(&response).as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -221,20 +244,14 @@ pub fn serve_connection(
     let peer = match peer_process_id(&stream) {
         Ok(id) => id,
         Err(e) => {
-            return write_response_on_stream(
-                &mut stream,
-                HelperResponse::Error { message: e },
-            );
+            return write_response_on_stream(&mut stream, HelperResponse::Error { message: e });
         }
     };
 
     let request = match read_request_line(&mut stream) {
         Ok(req) => req,
         Err(e) => {
-            return write_response_on_stream(
-                &mut stream,
-                HelperResponse::Error { message: e },
-            );
+            return write_response_on_stream(&mut stream, HelperResponse::Error { message: e });
         }
     };
 
@@ -374,15 +391,4 @@ mod tests {
         assert!(HelperResponse::ReleaseOk.into_release_ok().is_ok());
         assert!(HelperResponse::HoldOk.into_release_ok().is_err());
     }
-}
-
-#[cfg(target_os = "macos")]
-fn write_response_on_stream(
-    stream: &mut UnixStream,
-    response: HelperResponse,
-) -> Result<(), String> {
-    stream
-        .write_all(encode_response(&response).as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())
 }

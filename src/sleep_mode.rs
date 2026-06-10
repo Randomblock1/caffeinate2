@@ -58,10 +58,20 @@ fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHol
     match policy {
         EntirelyPolicy::HelperOrLocalFallback => match HelperHoldGuard::try_acquire(&client) {
             Ok(guard) => Ok(EntirelyHold::Helper(guard)),
-            Err(error) if is_connect_error(&error) => EntirelyCoordinator::cli_fallback(verbose)
-                .hold_current_process()
-                .map(EntirelyHold::Local)
-                .map_err(|e| EnableError::Ipc(e.to_string())),
+            Err(error) if is_connect_error(&error) => {
+                // The local fallback toggles the system SleepDisabled setting
+                // directly, which only works as root. Fail fast with a clear
+                // error instead of writing a lockfile entry and surfacing the
+                // IOKit not-privileged code.
+                if nix::unistd::Uid::effective().is_root() {
+                    EntirelyCoordinator::cli_fallback(verbose)
+                        .hold_current_process()
+                        .map(EntirelyHold::Local)
+                        .map_err(|e| EnableError::Ipc(e.to_string()))
+                } else {
+                    Err(EnableError::HelperUnavailable)
+                }
+            }
             Err(error) => Err(EnableError::Ipc(error)),
         },
         EntirelyPolicy::HelperRequired => HelperHoldGuard::try_acquire(&client)
@@ -207,11 +217,7 @@ impl SleepModeSet {
             .filter(|mode| self.0.contains(mode))
     }
 
-    pub fn enable_all(
-        &self,
-        verbose: bool,
-        dry_run: bool,
-    ) -> Result<ActiveSession, EnableError> {
+    pub fn enable_all(&self, verbose: bool, dry_run: bool) -> Result<ActiveSession, EnableError> {
         if dry_run {
             return Ok(ActiveSession::default());
         }
