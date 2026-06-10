@@ -1,3 +1,6 @@
+use crate::entirely;
+use crate::helper_ipc;
+use crate::power_management;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -91,7 +94,11 @@ pub fn uninstall_helper() -> Result<(), String> {
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
     let _ = fs::remove_file(HELPER_PLIST_PATH);
     let _ = fs::remove_file(HELPER_INSTALL_PATH);
-    let _ = fs::remove_file("/var/run/caffeinate2.sock");
+    let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
+    // Nobody can send Release to the removed helper; drop any holder state and
+    // make sure the persistent SleepDisabled setting isn't left on.
+    let _ = fs::remove_file(entirely::HELPER_LOCK_PATH);
+    let _ = power_management::set_sleep_disabled(false, false);
     Ok(())
 }
 
@@ -102,7 +109,9 @@ pub fn install_helper_privileged() -> Result<(), String> {
     }
 
     let cli = resolve_cli_binary()?;
-    let cli_escaped = shell_escape(&cli.display().to_string());
+    // The path is embedded in a shell command inside an AppleScript string, so
+    // it needs both layers of quoting or paths with spaces break.
+    let cli_escaped = applescript_escape(&sh_single_quote(&cli.display().to_string()));
     let script = format!(
         "do shell script \"{cli_escaped} install-helper-internal\" with administrator privileges"
     );
@@ -128,9 +137,9 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(&plist_path, tray_launch_agent_plist(tray_path)).map_err(|e| e.to_string())?;
-
-    let domain = gui_launchctl_domain();
-    run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()])?;
+    // Don't bootstrap the agent now: RunAtLoad would immediately launch a
+    // second tray instance next to the one the user is clicking in. launchd
+    // picks up ~/Library/LaunchAgents plists at the next login.
     Ok(())
 }
 
@@ -148,8 +157,12 @@ pub fn tray_launch_agent_installed() -> bool {
         .unwrap_or(false)
 }
 
-fn shell_escape(path: &str) -> String {
-    path.replace('\\', "\\\\").replace('"', "\\\"")
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn launchctl_bootstrap_system(plist_path: &str) -> Result<(), String> {
@@ -191,6 +204,17 @@ mod tests {
         let content = helper_plist_content(Path::new("/usr/local/libexec/caffeinate2/caffeinate2-helper"));
         assert!(content.contains("/usr/local/libexec/caffeinate2/caffeinate2-helper"));
         assert!(!content.contains("__HELPER_PATH__"));
+    }
+
+    #[test]
+    fn privileged_install_quoting_survives_spaces_and_quotes() {
+        assert_eq!(
+            sh_single_quote("/Users/a b/caffeinate2"),
+            "'/Users/a b/caffeinate2'"
+        );
+        assert_eq!(sh_single_quote("it's"), r"'it'\''s'");
+        assert_eq!(applescript_escape(r"'it'\''s'"), r#"'it'\\''s'"#);
+        assert_eq!(applescript_escape("say \"hi\""), r#"say \"hi\""#);
     }
 
     #[test]

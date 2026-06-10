@@ -5,7 +5,8 @@ use objc2_app_kit::{
     NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel, NSRunningApplication,
     NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSURL};
+use objc2_foundation::{MainThreadMarker, NSArray, NSBundle, NSString, NSURL};
+use objc2_uniform_type_identifiers::UTTypeApplicationBundle;
 
 pub fn running_app_choices() -> Vec<AppTarget> {
     if MainThreadMarker::new().is_none() {
@@ -66,7 +67,11 @@ pub fn choose_app_bundle() -> Option<AppTarget> {
     panel.setCanChooseFiles(true);
     panel.setCanChooseDirectories(false);
     panel.setAllowsMultipleSelection(false);
-    panel.setTreatsFilePackagesAsDirectories(true);
+    // Keep .app bundles selectable as files; treating packages as directories
+    // would make the panel browse into them instead.
+    panel.setTreatsFilePackagesAsDirectories(false);
+    let app_bundle_type = unsafe { UTTypeApplicationBundle };
+    panel.setAllowedContentTypes(&NSArray::from_slice(&[app_bundle_type]));
 
     let response = panel.runModal();
     if response != NSModalResponseOK {

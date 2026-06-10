@@ -5,7 +5,7 @@ use crate::{
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
 
@@ -38,6 +38,9 @@ struct EntirelyCoordinatorInner {
     sleep_disabler: SleepDisabler,
     process_checker: Arc<ProcessChecker>,
     sleep_disabled: AtomicBool,
+    /// Serializes hold/release/reconcile so concurrent connections can't
+    /// interleave their lockfile reads with each other's sleep toggles.
+    ops: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -59,6 +62,7 @@ impl EntirelyCoordinator {
                 sleep_disabler,
                 process_checker,
                 sleep_disabled: AtomicBool::new(false),
+                ops: Mutex::new(()),
             }),
         }
     }
@@ -86,6 +90,7 @@ impl EntirelyCoordinator {
         process_id: ProcessId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
+        let _ops = inner.ops.lock().expect("ops lock");
         let should_disable = lockfile::update_lockfile(
             true,
             inner.verbose,
@@ -124,6 +129,7 @@ impl EntirelyCoordinator {
         process_id: ProcessId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
+        let _ops = inner.ops.lock().expect("ops lock");
         let should_enable = lockfile::update_lockfile(
             false,
             inner.verbose,
@@ -150,10 +156,61 @@ impl EntirelyCoordinator {
         Ok(())
     }
 
+    /// Re-sync the global sleep setting with the lockfile after a (re)start.
+    ///
+    /// Prunes dead holders, then disables sleep if live holders remain or
+    /// re-enables it if none do, so a helper crash can't leave the system
+    /// SleepDisabled setting stuck.
+    pub fn reconcile_startup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reconcile_with(true)
+    }
+
+    /// Periodic reaper: prune holders whose processes have died and converge
+    /// the sleep setting to `holders > 0`.
+    ///
+    /// Only acts when the desired state differs from the state this
+    /// coordinator last applied, so it doesn't fight a manual
+    /// `pmset disablesleep` made outside of any holds.
+    pub fn reconcile(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reconcile_with(false)
+    }
+
+    fn reconcile_with(
+        &self,
+        force: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let inner = &self.inner;
+        let _ops = inner.ops.lock().expect("ops lock");
+        let holders = lockfile::prune_lockfile(
+            inner.verbose,
+            &inner.lock_file_path,
+            inner.process_checker.as_ref(),
+        )?;
+        let disable = holders > 0;
+        if !force && disable == inner.sleep_disabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if inner.verbose {
+            eprintln!(
+                "Reconcile: {holders} live holder(s); {} system sleep.",
+                if disable { "disabling" } else { "enabling" }
+            );
+        }
+        if let Err(code) = (inner.sleep_disabler)(disable, inner.verbose) {
+            return Err(std::io::Error::other(format!(
+                "Failed to reconcile sleep state (IOKit error: {code:X})"
+            ))
+            .into());
+        }
+        inner.sleep_disabled.store(disable, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn status(
         &self,
     ) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
+        let _ops = inner.ops.lock().expect("ops lock");
         let holders = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,

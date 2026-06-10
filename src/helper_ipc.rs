@@ -1,17 +1,22 @@
 use crate::entirely::EntirelyCoordinator;
 use crate::process_util;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
 
+/// Holds are keyed by the requesting process (pid + start time, taken from the
+/// socket peer), not by the connection. Each request is a short RPC on its own
+/// connection, so holds survive helper restarts: the lockfile is the source of
+/// truth and the helper reaps holders whose processes have died.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum HelperRequest {
     Hold,
+    Release,
     Status,
 }
 
@@ -19,6 +24,7 @@ pub enum HelperRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HelperResponse {
     HoldOk,
+    ReleaseOk,
     Status {
         holders: usize,
         sleep_disabled: bool,
@@ -39,8 +45,14 @@ impl HelperResponse {
     pub fn into_hold_ok(self) -> Result<(), String> {
         match self.into_result()? {
             HelperResponse::HoldOk => Ok(()),
-            HelperResponse::Status { .. } => Err("unexpected status response for hold".to_string()),
-            HelperResponse::Error { message } => Err(message),
+            other => Err(format!("unexpected response for hold: {other:?}")),
+        }
+    }
+
+    pub fn into_release_ok(self) -> Result<(), String> {
+        match self.into_result()? {
+            HelperResponse::ReleaseOk => Ok(()),
+            other => Err(format!("unexpected response for release: {other:?}")),
         }
     }
 
@@ -50,8 +62,7 @@ impl HelperResponse {
                 holders,
                 sleep_disabled,
             } => Ok((holders, sleep_disabled)),
-            HelperResponse::HoldOk => Err("unexpected hold_ok response for status".to_string()),
-            HelperResponse::Error { message } => Err(message),
+            other => Err(format!("unexpected response for status: {other:?}")),
         }
     }
 }
@@ -150,18 +161,42 @@ pub fn is_connect_error(message: &str) -> bool {
     message.starts_with("connect failed:")
 }
 
-/// Keeps a helper hold alive for as long as this guard owns the connection.
+/// RAII guard for a helper-managed hold.
+///
+/// The hold is registered against this process in the helper's lockfile and
+/// released by an explicit RPC on drop. If this process dies without
+/// releasing (or the helper is unreachable at drop time), the helper's
+/// periodic reconcile reaps the entry once the process is gone.
 pub struct HelperHoldGuard {
-    #[allow(dead_code)]
-    stream: UnixStream,
+    client: HelperClient,
+    released: bool,
 }
 
 impl HelperHoldGuard {
     pub fn try_acquire(client: &HelperClient) -> Result<Self, String> {
-        let mut stream = client.try_connect()?;
-        write_request(&mut stream, &HelperRequest::Hold)?;
-        read_response_line(&mut stream)?.into_hold_ok()?;
-        Ok(Self { stream })
+        rpc(&client.socket_path, HelperRequest::Hold, true)?.into_hold_ok()?;
+        Ok(Self {
+            client: client.clone(),
+            released: false,
+        })
+    }
+
+    pub fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        rpc(&self.client.socket_path, HelperRequest::Release, true)?.into_release_ok()
+    }
+}
+
+impl Drop for HelperHoldGuard {
+    fn drop(&mut self) {
+        if !self.released
+            && let Err(e) = self.release()
+        {
+            eprintln!("Error releasing helper hold: {e}");
+        }
     }
 }
 
@@ -179,6 +214,10 @@ pub fn serve_connection(
     mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
 ) -> Result<(), String> {
+    // Bound the whole RPC so a client that connects and sends nothing can't
+    // pin a helper thread forever.
+    configure_rpc_timeouts(&stream)?;
+
     let peer = match peer_process_id(&stream) {
         Ok(id) => id,
         Err(e) => {
@@ -199,69 +238,96 @@ pub fn serve_connection(
         }
     };
 
-    match request {
-        HelperRequest::Hold => serve_hold_connection(stream, coordinator, peer),
-        HelperRequest::Status => {
-            let response = match coordinator.status() {
-                Ok(status) => HelperResponse::Status {
-                    holders: status.holders,
-                    sleep_disabled: status.sleep_disabled,
-                },
-                Err(e) => HelperResponse::Error {
-                    message: e.to_string(),
-                },
-            };
-            write_response_on_stream(&mut stream, response)
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn serve_hold_connection(
-    mut stream: UnixStream,
-    coordinator: &Arc<EntirelyCoordinator>,
-    peer: crate::lockfile::ProcessId,
-) -> Result<(), String> {
-    if let Err(e) = coordinator.hold(peer) {
-        return write_response_on_stream(
-            &mut stream,
-            HelperResponse::Error {
+    // Hold and Release act on the peer's own process identity, so a client
+    // can never release another process's hold.
+    let response = match request {
+        HelperRequest::Hold => match coordinator.hold(peer) {
+            Ok(()) => HelperResponse::HoldOk,
+            Err(e) => HelperResponse::Error {
                 message: e.to_string(),
             },
-        );
-    }
-
-    if let Err(e) = write_response_on_stream(&mut stream, HelperResponse::HoldOk) {
-        let _ = coordinator.release(peer);
-        return Err(e);
-    }
-
-    let mut reader = BufReader::new(&stream);
-    let mut buf = [0u8; 256];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-
-    if let Err(e) = coordinator.release(peer) {
-        eprintln!("Error releasing helper hold for peer {peer}: {e}");
-    }
-
-    Ok(())
+        },
+        HelperRequest::Release => match coordinator.release(peer) {
+            Ok(()) => HelperResponse::ReleaseOk,
+            Err(e) => HelperResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        HelperRequest::Status => match coordinator.status() {
+            Ok(status) => HelperResponse::Status {
+                holders: status.holders,
+                sleep_disabled: status.sleep_disabled,
+            },
+            Err(e) => HelperResponse::Error {
+                message: e.to_string(),
+            },
+        },
+    };
+    write_response_on_stream(&mut stream, response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entirely::SleepDisabler;
+    use crate::process_util;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hold_status_release_round_trip_over_socket() {
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("caffeinate2_ipc_{}.sock", std::process::id()));
+        let lock_path = dir.join(format!("caffeinate2_ipc_{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_server = sleep_calls.clone();
+        let disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_server.lock().unwrap().push(state);
+            Ok(())
+        });
+        let coordinator = Arc::new(EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            disabler,
+            Arc::new(process_util::default_process_checker),
+        ));
+        let server = std::thread::spawn(move || {
+            // One connection each for hold, status, and release.
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                serve_connection(stream, &coordinator).unwrap();
+            }
+        });
+
+        let client = HelperClient {
+            socket_path: sock_path.display().to_string(),
+        };
+        let mut guard = HelperHoldGuard::try_acquire(&client).unwrap();
+        assert_eq!(client.status().unwrap(), (1, true));
+        guard.release().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![true, false]);
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
 
     #[test]
     fn round_trip_request() {
-        let req = HelperRequest::Hold;
-        let decoded = decode_request(&encode_request(&req)).unwrap();
-        assert_eq!(decoded, req);
+        for req in [
+            HelperRequest::Hold,
+            HelperRequest::Release,
+            HelperRequest::Status,
+        ] {
+            let decoded = decode_request(&encode_request(&req)).unwrap();
+            assert_eq!(decoded, req);
+        }
     }
 
     #[test]
@@ -300,6 +366,13 @@ mod tests {
     #[test]
     fn hold_ok_response_into_hold_ok() {
         assert!(HelperResponse::HoldOk.into_hold_ok().is_ok());
+        assert!(HelperResponse::ReleaseOk.into_hold_ok().is_err());
+    }
+
+    #[test]
+    fn release_ok_response_into_release_ok() {
+        assert!(HelperResponse::ReleaseOk.into_release_ok().is_ok());
+        assert!(HelperResponse::HoldOk.into_release_ok().is_err());
     }
 }
 

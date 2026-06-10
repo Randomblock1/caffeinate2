@@ -58,6 +58,22 @@ impl AppState {
         self.session.is_some()
     }
 
+    /// True while a timed session is active (tooltip countdown needs 1s ticks).
+    pub fn needs_tick(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.until.is_some())
+    }
+
+    /// How long to wait before the next loop iteration, or `None` to block
+    /// indefinitely until an event arrives.
+    pub fn pump_timeout(&self) -> Option<Duration> {
+        if !self.needs_tick() {
+            return None;
+        }
+        let until = self.session.as_ref()?.until?;
+        let remaining = until.saturating_duration_since(Instant::now());
+        Some(remaining.min(Duration::from_secs(1)))
+    }
+
     pub fn waiting_for_app_launch(&self) -> bool {
         self.config.wait_for_app.as_ref().is_some_and(|app| {
             self.is_on()
@@ -77,7 +93,7 @@ impl AppState {
         };
         if let Ok(rgba) = tray_icons::decode_icon_rgba(bytes) {
             if let Ok(icon) = Icon::from_rgba(rgba, tray_icons::ICON_SIZE, tray_icons::ICON_SIZE) {
-                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_icon_with_as_template(Some(icon), true);
             }
         }
         self.update_tooltip(tray);

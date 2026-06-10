@@ -140,13 +140,20 @@ impl SleepMode {
         match self.enable(false, TRAY_ENTIRELY_POLICY) {
             Err(EnableError::HelperUnavailable) if self == SleepMode::Entirely => {
                 crate::install::install_helper_privileged().map_err(EnableError::Ipc)?;
-                self.enable(false, TRAY_ENTIRELY_POLICY).map_err(|error| match error {
-                    EnableError::HelperUnavailable => EnableError::Ipc(
-                        "helper is not running after install; try: sudo caffeinate2 install-helper"
-                            .to_string(),
-                    ),
-                    other => other,
-                })
+                // launchd starts the helper asynchronously; give the socket a
+                // few seconds to appear before declaring failure.
+                for _ in 0..25 {
+                    match self.enable(false, TRAY_ENTIRELY_POLICY) {
+                        Err(EnableError::HelperUnavailable) => {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        other => return other,
+                    }
+                }
+                Err(EnableError::Ipc(
+                    "helper is not running after install; try: sudo caffeinate2 install-helper"
+                        .to_string(),
+                ))
             }
             other => other,
         }
