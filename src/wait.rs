@@ -93,7 +93,7 @@ pub fn wait_for_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::tests::parse_args;
+    use crate::cli::parse_args;
 
     #[test]
     fn wait_mode_matches_cli_priority() {

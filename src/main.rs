@@ -268,7 +268,7 @@ fn main() {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::cli::tests::parse_args;
+    use crate::cli::parse_args;
     use sleep_mode::{SleepMode, SleepModeSet};
 
     #[test]
