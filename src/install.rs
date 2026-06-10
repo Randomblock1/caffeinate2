@@ -74,6 +74,13 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // Reinstall path: stop any loaded helper before replacing its binary, and
+    // unlink the old file so the copy gets a fresh inode. Overwriting a running
+    // executable in place invalidates its code signature and the kernel kills
+    // the process mid-write; bootstrap below would also no-op while the old
+    // service is still loaded.
+    let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
+    let _ = fs::remove_file(&dest);
     fs::copy(source_helper, &dest).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o755);
@@ -145,8 +152,9 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
 
 pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
-    let domain = gui_launchctl_domain();
-    let _ = run_launchctl(&["bootout", &domain, TRAY_LAUNCH_AGENT_LABEL]);
+    // bootout takes a service target (`gui/<uid>/<label>`), not a bare label.
+    let service_target = format!("{}/{TRAY_LAUNCH_AGENT_LABEL}", gui_launchctl_domain());
+    let _ = run_launchctl(&["bootout", &service_target]);
     let _ = fs::remove_file(plist_path);
     Ok(())
 }
@@ -173,7 +181,8 @@ fn launchctl_bootstrap_system(plist_path: &str) -> Result<(), String> {
 }
 
 fn launchctl_bootout_system(label: &str) -> Result<(), String> {
-    if run_launchctl(&["bootout", "system", label]).is_ok() {
+    // bootout takes a service target (`system/<label>`), not a bare label.
+    if run_launchctl(&["bootout", &format!("system/{label}")]).is_ok() {
         return Ok(());
     }
     run_launchctl(&["unload", "-w", &format!("/Library/LaunchDaemons/{label}.plist")])

@@ -73,7 +73,7 @@ pub struct Args {
     pub waitfor: Option<i32>,
 
     /// Wait for given command to complete (takes priority above timeout and pid)
-    #[arg()]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Option<Vec<String>>,
 }
 

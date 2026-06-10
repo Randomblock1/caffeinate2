@@ -44,6 +44,19 @@ fn timespec_from_duration(duration: Duration) -> libc::timespec {
     }
 }
 
+/// `NOTE_EXITSTATUS` delivers the raw `wait(2)` status word, not the exit
+/// code: a normal exit N arrives as `N << 8`. Decode it like a shell would
+/// (128 + signal number for signal deaths).
+fn exit_code_from_wait_status(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        status
+    }
+}
+
 pub fn wait_for_pid(
     pid: i32,
     timeout: Option<Duration>,
@@ -86,7 +99,9 @@ pub fn wait_for_pid(
             )))
         }
     } else {
-        Ok(WaitForPidResult::Exited(event.data() as i32))
+        Ok(WaitForPidResult::Exited(exit_code_from_wait_status(
+            event.data() as i32,
+        )))
     }
 }
 
@@ -94,6 +109,19 @@ pub fn wait_for_pid(
 mod tests {
     use super::*;
     use crate::cli::parse_args;
+
+    #[test]
+    fn wait_status_decodes_normal_exit() {
+        assert_eq!(exit_code_from_wait_status(0), 0);
+        assert_eq!(exit_code_from_wait_status(3 << 8), 3);
+        assert_eq!(exit_code_from_wait_status(255 << 8), 255);
+    }
+
+    #[test]
+    fn wait_status_decodes_signal_death() {
+        assert_eq!(exit_code_from_wait_status(libc::SIGTERM), 128 + 15);
+        assert_eq!(exit_code_from_wait_status(libc::SIGKILL), 128 + 9);
+    }
 
     #[test]
     fn wait_mode_matches_cli_priority() {
