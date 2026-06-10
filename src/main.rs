@@ -4,7 +4,7 @@ mod cli;
 mod wait;
 
 #[cfg(target_os = "macos")]
-use caffeinate2::{duration_parser, install, sleep_mode};
+use caffeinate2::{duration_parser, helper_ipc, install, sleep_mode};
 #[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
@@ -12,9 +12,12 @@ use cli::{Args, MaintenanceCommand};
 #[cfg(target_os = "macos")]
 use nix::unistd;
 #[cfg(target_os = "macos")]
-use signal_hook::{consts::SIGINT, iterator::Signals};
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 #[cfg(target_os = "macos")]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(target_os = "macos")]
 use std::process;
 #[cfg(target_os = "macos")]
@@ -24,7 +27,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
-use wait::{wait_for_pid, wait_mode, WaitForPidError, WaitForPidResult, WaitMode};
+use wait::{WaitForPidError, WaitForPidResult, WaitMode, wait_for_pid, wait_mode};
 
 #[cfg(target_os = "macos")]
 fn run_maintenance(command: MaintenanceCommand) {
@@ -46,6 +49,28 @@ fn run_maintenance(command: MaintenanceCommand) {
                 process::exit(1);
             }
             println!("Uninstalled caffeinate2 helper.");
+        }
+        MaintenanceCommand::Status => {
+            let client = helper_ipc::HelperClient::new();
+            match client.status() {
+                Ok((holders, sleep_disabled)) => {
+                    println!("Helper: running");
+                    println!("Entirely-mode holders: {holders}");
+                    println!(
+                        "System sleep disabled by helper: {}",
+                        if sleep_disabled { "yes" } else { "no" }
+                    );
+                }
+                Err(e) if helper_ipc::is_connect_error(&e) => {
+                    println!(
+                        "Helper: not running (install with: sudo caffeinate2 --install-helper)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
         }
         MaintenanceCommand::InstallHelperInternal => {
             if !nix::unistd::Uid::effective().is_root() {
@@ -81,7 +106,7 @@ fn main() {
     if let Some(first) = args.command.as_ref().and_then(|c| c.first())
         && matches!(
             first.as_str(),
-            "install-helper" | "uninstall-helper" | "install-helper-internal"
+            "install-helper" | "uninstall-helper" | "install-helper-internal" | "status"
         )
     {
         eprintln!("Error: '{first}' is not a command to run. Did you mean: caffeinate2 --{first}?");
@@ -123,7 +148,7 @@ fn main() {
             eprintln!("Error: {e}");
             if sleep_modes.contains(sleep_mode::SleepMode::Entirely) {
                 eprintln!(
-                    "Hint: install the privileged helper with: sudo caffeinate2 --install-helper"
+                    "Hint: install the privileged helper with: sudo caffeinate2 --install-helper (or run caffeinate2 itself with sudo)"
                 );
             }
             process::exit(1);
@@ -135,7 +160,11 @@ fn main() {
     let exit_code = Arc::new(AtomicI32::new(0));
     let exit_code_signal = Arc::clone(&exit_code);
 
-    let mut signals = Signals::new([SIGINT]).expect("Failed to create signal iterator");
+    // Also catch SIGTERM/SIGHUP (kill, logout): exiting without releasing an
+    // entirely-mode hold would leave system sleep disabled until the helper
+    // reaps the dead process (or indefinitely with the root CLI fallback).
+    let mut signals =
+        Signals::new([SIGINT, SIGTERM, SIGHUP]).expect("Failed to create signal iterator");
     thread::spawn(move || {
         if signals.forever().next().is_some() {
             println!("\nStopping...");
@@ -182,10 +211,12 @@ fn main() {
                 .spawn()
                 .expect("Failed to execute command");
 
-            let code = child
-                .wait()
-                .expect("Command wasn't running")
+            let status = child.wait().expect("Command wasn't running");
+            // Match the -w decoding: report signal deaths as 128 + signal
+            // number instead of masking them as success.
+            let code = status
                 .code()
+                .or_else(|| status.signal().map(|signal| 128 + signal))
                 .unwrap_or(0);
             exit_code.store(code, Ordering::Relaxed);
         }
@@ -198,10 +229,7 @@ fn main() {
             if timeout {
                 duration = parsed_timeout.expect("Timeout should be present");
                 end_time += duration;
-                sleep_str += &format!(
-                    "for {}",
-                    duration_parser::format_duration_human(duration)
-                );
+                sleep_str += &format!("for {}", duration_parser::format_duration_human(duration));
             }
 
             print!("{sleep_str}");
@@ -250,10 +278,7 @@ fn main() {
                         print!("PID {pid} finished ");
                         let now = chrono::Local::now();
                         print!("{} ", now.format(SHORT_FMT));
-                        println!(
-                            "with exit code {}",
-                            exit_code.load(Ordering::Relaxed)
-                        );
+                        println!("with exit code {}", exit_code.load(Ordering::Relaxed));
                     }
                     Ok(WaitForPidResult::TimedOut) => {}
                     Err(WaitForPidError::NotFound) => {

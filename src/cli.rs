@@ -7,6 +7,7 @@ pub enum MaintenanceCommand {
     InstallHelper,
     UninstallHelper,
     InstallHelperInternal,
+    Status,
 }
 
 #[derive(Parser, Debug)]
@@ -26,6 +27,11 @@ pub struct Args {
     /// Internal entry point used after administrator authorization.
     #[arg(long, exclusive = true, hide = true)]
     pub install_helper_internal: bool,
+
+    /// Show entirely-mode helper status (holders and sleep state).
+    /// Cannot be combined with other options.
+    #[arg(long, exclusive = true)]
+    pub status: bool,
 
     /// Verbose mode
     #[arg(short, long)]
@@ -90,6 +96,8 @@ impl Args {
             Some(MaintenanceCommand::UninstallHelper)
         } else if self.install_helper_internal {
             Some(MaintenanceCommand::InstallHelperInternal)
+        } else if self.status {
+            Some(MaintenanceCommand::Status)
         } else {
             None
         }

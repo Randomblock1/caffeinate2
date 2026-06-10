@@ -58,6 +58,8 @@ After that, `caffeinate2 -e` and tray Entirely use the helper without further pa
 
 Remove the helper: `sudo caffeinate2 --uninstall-helper`
 
+Check helper state (is it running, how many holds, is sleep disabled): `caffeinate2 --status`
+
 ## Usage
 
 ```plaintext
@@ -80,6 +82,7 @@ Options:
   -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
       --install-helper      Install the privileged helper for entirely mode (admin prompt or sudo)
       --uninstall-helper    Remove the privileged helper (requires root)
+      --status              Show entirely-mode helper status (holders and sleep state)
   -h, --help                Print help
   -V, --version             Print version
 ```
