@@ -115,7 +115,7 @@ impl SleepMode {
         entirely_policy: EntirelyPolicy,
     ) -> Result<ActiveSleepHold, EnableError> {
         match self {
-            SleepMode::UserActive => power_management::declare_user_activity(true, verbose)
+            SleepMode::UserActive => power_management::declare_user_activity(verbose)
                 .map(ActiveSleepHold::Assertion)
                 .map_err(EnableError::Iokit),
             SleepMode::Entirely => {
@@ -128,7 +128,7 @@ impl SleepMode {
                         mode.label()
                     )));
                 };
-                power_management::create_assertion(assertion_type, true, verbose)
+                power_management::create_assertion(assertion_type, verbose)
                     .map(ActiveSleepHold::Assertion)
                     .map_err(EnableError::Iokit)
             }

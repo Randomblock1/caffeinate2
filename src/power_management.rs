@@ -2,8 +2,7 @@
 use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue};
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionRelease,
-    IOPMUserActiveType, kIOPMAssertionLevelOff, kIOPMAssertionLevelOn, kIOReturnBadArgument,
-    kIOReturnNotFound,
+    IOPMUserActiveType, kIOPMAssertionLevelOn, kIOReturnBadArgument, kIOReturnNotFound,
 };
 use std::{fmt, mem::MaybeUninit};
 
@@ -51,16 +50,11 @@ impl Drop for PowerAssertion {
 
 pub fn create_assertion(
     assertion_type: AssertionType,
-    state: bool,
     verbose: bool,
 ) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
     let type_ = CFString::from_str(assertion_type.as_str());
-    let level = if state {
-        kIOPMAssertionLevelOn
-    } else {
-        kIOPMAssertionLevelOff
-    };
+    let level = kIOPMAssertionLevelOn;
     let mut id = MaybeUninit::uninit();
 
     let status = unsafe {
@@ -119,20 +113,18 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
     }
 }
 
-pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertion, u32> {
+pub fn declare_user_activity(verbose: bool) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
-    let level = if state {
-        kIOPMAssertionLevelOn
-    } else {
-        kIOPMAssertionLevelOff
-    };
-
     let mut id = MaybeUninit::uninit();
 
-    let level_typed: IOPMUserActiveType = unsafe { std::mem::transmute(level) };
-
+    // Declaring activity is inherently "active now"; the only choice is the
+    // activity type, and Local means a user is physically at this machine.
     let status = unsafe {
-        IOPMAssertionDeclareUserActivity(Some(&assertion_name), level_typed, id.as_mut_ptr())
+        IOPMAssertionDeclareUserActivity(
+            Some(&assertion_name),
+            IOPMUserActiveType::Local,
+            id.as_mut_ptr(),
+        )
     };
     if status != 0 {
         return Err(status as u32);
@@ -225,7 +217,7 @@ mod tests {
         ];
 
         for assertion_type in types {
-            let assertion = create_assertion(assertion_type, true, false).unwrap();
+            let assertion = create_assertion(assertion_type, false).unwrap();
             println!(
                 "Successfully created assertion type: {} with ID: {}",
                 assertion_type, assertion.id
@@ -236,7 +228,7 @@ mod tests {
     #[test]
     #[ignore = "declares real user activity through IOKit"]
     fn smoke_declare_user_activity() {
-        let assertion = declare_user_activity(true, true).unwrap();
+        let assertion = declare_user_activity(true).unwrap();
         println!("Declared user activity with ID: {}", assertion.id);
     }
 
