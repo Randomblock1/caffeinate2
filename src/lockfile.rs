@@ -117,7 +117,10 @@ fn read_holder_set(file: &mut Flock<File>) -> Result<HashSet<ProcessId>, std::io
         .collect())
 }
 
-fn write_holder_set(file: &mut Flock<File>, pids: &HashSet<ProcessId>) -> Result<(), std::io::Error> {
+fn write_holder_set(
+    file: &mut Flock<File>,
+    pids: &HashSet<ProcessId>,
+) -> Result<(), std::io::Error> {
     use std::ops::DerefMut;
 
     file.seek(SeekFrom::Start(0))?;

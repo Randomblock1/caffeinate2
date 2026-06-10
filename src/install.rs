@@ -38,10 +38,7 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
 }
 
 pub fn resolve_cli_binary() -> Result<PathBuf, String> {
-    resolve_sibling_binary(
-        "caffeinate2",
-        "install caffeinate2 with --features full",
-    )
+    resolve_sibling_binary("caffeinate2", "install caffeinate2 with --features full")
 }
 
 pub fn resolve_helper_source() -> Result<PathBuf, String> {
@@ -60,9 +57,9 @@ pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is not set".to_string())?;
-    Ok(home.join("Library/LaunchAgents").join(format!(
-        "{TRAY_LAUNCH_AGENT_LABEL}.plist"
-    )))
+    Ok(home
+        .join("Library/LaunchAgents")
+        .join(format!("{TRAY_LAUNCH_AGENT_LABEL}.plist")))
 }
 
 pub fn install_helper(source_helper: &Path) -> Result<(), String> {
@@ -82,7 +79,9 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
     let _ = fs::remove_file(&dest);
     fs::copy(source_helper, &dest).map_err(|e| e.to_string())?;
-    let mut perms = fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+    let mut perms = fs::metadata(&dest)
+        .map_err(|e| e.to_string())?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
 
@@ -156,10 +155,7 @@ pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     match fs::remove_file(&plist_path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "failed to remove {}: {e}",
-            plist_path.display()
-        )),
+        Err(e) => Err(format!("failed to remove {}: {e}", plist_path.display())),
     }
 }
 
@@ -189,7 +185,11 @@ fn launchctl_bootout_system(label: &str) -> Result<(), String> {
     if run_launchctl(&["bootout", &format!("system/{label}")]).is_ok() {
         return Ok(());
     }
-    run_launchctl(&["unload", "-w", &format!("/Library/LaunchDaemons/{label}.plist")])
+    run_launchctl(&[
+        "unload",
+        "-w",
+        &format!("/Library/LaunchDaemons/{label}.plist"),
+    ])
 }
 
 fn run_launchctl(args: &[&str]) -> Result<(), String> {
@@ -214,7 +214,9 @@ mod tests {
 
     #[test]
     fn helper_plist_substitutes_path() {
-        let content = helper_plist_content(Path::new("/usr/local/libexec/caffeinate2/caffeinate2-helper"));
+        let content = helper_plist_content(Path::new(
+            "/usr/local/libexec/caffeinate2/caffeinate2-helper",
+        ));
         assert!(content.contains("/usr/local/libexec/caffeinate2/caffeinate2-helper"));
         assert!(!content.contains("__HELPER_PATH__"));
     }

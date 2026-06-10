@@ -51,8 +51,7 @@ pub fn wake_event_loop() {
 /// Forward tray/menu events to channels. `tray-icon` and `muda` only deliver
 /// events through `set_event_handler`; `receiver()` is disabled once a handler is set.
 #[cfg(all(target_os = "macos", feature = "tray"))]
-pub fn install_tray_event_handlers(
-) -> (
+pub fn install_tray_event_handlers() -> (
     std::sync::mpsc::Receiver<tray_icon::TrayIconEvent>,
     std::sync::mpsc::Receiver<muda::MenuEvent>,
 ) {
@@ -78,7 +77,8 @@ pub fn install_tray_event_handlers(
 /// Keeps NSWorkspace launch/terminate observers registered for the app lifetime.
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub struct WorkspaceObserverGuard {
-    _launch: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
+    _launch:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
     _terminate:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
     _launch_block: block2::RcBlock<dyn Fn(std::ptr::NonNull<objc2_foundation::NSNotification>)>,
@@ -88,8 +88,7 @@ pub struct WorkspaceObserverGuard {
 /// Register observers for app launch/quit. The returned flag is set (and the
 /// event loop woken) whenever the running-apps set may have changed.
 #[cfg(all(target_os = "macos", feature = "tray"))]
-pub fn install_workspace_observers(
-) -> (
+pub fn install_workspace_observers() -> (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     WorkspaceObserverGuard,
 ) {
@@ -107,15 +106,18 @@ pub fn install_workspace_observers(
     let dirty_launch = Arc::clone(&dirty);
     let dirty_terminate = Arc::clone(&dirty);
 
-    let launch_block = RcBlock::new(move |_notification: NonNull<objc2_foundation::NSNotification>| {
-        dirty_launch.store(true, Ordering::Relaxed);
-        wake_event_loop();
-    });
-    let terminate_block =
-        RcBlock::new(move |_notification: NonNull<objc2_foundation::NSNotification>| {
+    let launch_block = RcBlock::new(
+        move |_notification: NonNull<objc2_foundation::NSNotification>| {
+            dirty_launch.store(true, Ordering::Relaxed);
+            wake_event_loop();
+        },
+    );
+    let terminate_block = RcBlock::new(
+        move |_notification: NonNull<objc2_foundation::NSNotification>| {
             dirty_terminate.store(true, Ordering::Relaxed);
             wake_event_loop();
-        });
+        },
+    );
 
     let workspace = NSWorkspace::sharedWorkspace();
     let center = workspace.notificationCenter();
@@ -155,7 +157,7 @@ pub fn install_workspace_observers(
 /// `None` blocks until an event arrives or [`wake_event_loop`] is called.
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn pump_event_loop(timeout: Option<std::time::Duration>) {
-    use objc2_app_kit::{NSEventMask, NSApplication};
+    use objc2_app_kit::{NSApplication, NSEventMask};
     use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode};
 
     let Some(mtm) = MainThreadMarker::new() else {

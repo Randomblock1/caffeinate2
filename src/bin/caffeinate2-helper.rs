@@ -43,10 +43,12 @@ fn run() -> Result<(), String> {
     // Reap holders that died without sending Release (crashed or killed
     // clients) and converge the sleep setting.
     let reaper = Arc::clone(&coordinator);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(RECONCILE_INTERVAL);
-        if let Err(e) = reaper.reconcile() {
-            eprintln!("periodic reconcile failed: {e}");
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(RECONCILE_INTERVAL);
+            if let Err(e) = reaper.reconcile() {
+                eprintln!("periodic reconcile failed: {e}");
+            }
         }
     });
 

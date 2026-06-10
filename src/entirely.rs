@@ -1,7 +1,6 @@
 use crate::{
     lockfile::{self, ProcessChecker, ProcessId},
-    power_management,
-    process_util,
+    power_management, process_util,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,10 +18,7 @@ pub fn cli_fallback_lock_path() -> PathBuf {
     if nix::unistd::getuid().is_root() {
         helper_lock_path()
     } else {
-        PathBuf::from(format!(
-            "/tmp/caffeinate2_{}.lock",
-            nix::unistd::getuid()
-        ))
+        PathBuf::from(format!("/tmp/caffeinate2_{}.lock", nix::unistd::getuid()))
     }
 }
 
@@ -72,7 +68,7 @@ impl EntirelyCoordinator {
             verbose,
             helper_lock_path(),
             Arc::new(power_management::set_sleep_disabled),
-            Arc::new(|pid, start| process_util::default_process_checker(pid, start)),
+            Arc::new(process_util::default_process_checker),
         )
     }
 
@@ -81,7 +77,7 @@ impl EntirelyCoordinator {
             verbose,
             cli_fallback_lock_path(),
             Arc::new(power_management::set_sleep_disabled),
-            Arc::new(|pid, start| process_util::default_process_checker(pid, start)),
+            Arc::new(process_util::default_process_checker),
         )
     }
 
@@ -175,10 +171,7 @@ impl EntirelyCoordinator {
         self.reconcile_with(false)
     }
 
-    fn reconcile_with(
-        &self,
-        force: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn reconcile_with(&self, force: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
         let _ops = inner.ops.lock().expect("ops lock");
         let holders = lockfile::prune_lockfile(
@@ -206,9 +199,7 @@ impl EntirelyCoordinator {
         Ok(())
     }
 
-    pub fn status(
-        &self,
-    ) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn status(&self) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
         let _ops = inner.ops.lock().expect("ops lock");
         let holders = lockfile::prune_lockfile(
@@ -253,10 +244,10 @@ impl EntirelyHoldGuard {
 
 impl Drop for EntirelyHoldGuard {
     fn drop(&mut self) {
-        if self.active {
-            if let Err(e) = self.release() {
-                eprintln!("Error releasing entirely hold: {e}");
-            }
+        if self.active
+            && let Err(e) = self.release()
+        {
+            eprintln!("Error releasing entirely hold: {e}");
         }
     }
 }

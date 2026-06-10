@@ -46,7 +46,7 @@ pub fn running_app_choices() -> Vec<AppTarget> {
         }
     }
 
-    choices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    choices.sort_by_key(|choice| choice.name.to_lowercase());
     choices
 }
 

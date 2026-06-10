@@ -95,7 +95,7 @@ pub fn wait_for_pid(
             Err(WaitForPidError::NotFound)
         } else {
             Err(WaitForPidError::Kevent(nix::Error::from_raw(
-                event.data() as i32,
+                event.data() as i32
             )))
         }
     } else {
