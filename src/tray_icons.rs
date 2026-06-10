@@ -13,5 +13,7 @@ pub fn decode_icon_rgba(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(rgba.into_raw())
 }
 
+/// Pixel dimensions of the embedded PNGs. macOS scales the tray image down
+/// to menu-bar height, so a large source stays crisp on retina displays.
 #[cfg(feature = "tray")]
-pub const ICON_SIZE: u32 = 22;
+pub const ICON_SIZE: u32 = 256;
