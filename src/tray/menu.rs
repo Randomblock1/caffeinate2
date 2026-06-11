@@ -255,10 +255,14 @@ pub fn dispatch_command(
                 state.invalidate_tooltip();
                 crate::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
             }
-            if let Err(e) = state.set_mode(mode) {
-                eprintln!("{e}");
+            match state.set_mode(mode) {
+                Ok(()) => state.set_icon(tray),
+                Err(e) => {
+                    eprintln!("{e}");
+                    state.set_icon(tray);
+                    state.show_error_tooltip(tray, &e.to_string());
+                }
             }
-            state.set_icon(tray);
         }
         MenuCommand::SetTimeLimit(secs) => {
             if let Err(e) = state.set_time_limit(secs) {

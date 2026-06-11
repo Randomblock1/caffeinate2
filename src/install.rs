@@ -88,8 +88,37 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     let plist = helper_plist_content(&dest);
     fs::write(HELPER_PLIST_PATH, plist).map_err(|e| e.to_string())?;
 
+    // Best-effort: create the grant group so administrators can allow
+    // standard accounts with a single dseditgroup -o edit command. The
+    // helper authorizes admins regardless, so a failure here only matters
+    // for that workflow.
+    ensure_grant_group();
+
     launchctl_bootstrap_system(HELPER_PLIST_PATH)?;
     Ok(())
+}
+
+fn ensure_grant_group() {
+    let group = crate::authz::GRANT_GROUP;
+    let exists = Command::new("dseditgroup")
+        .args(["-o", "read", group])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if exists {
+        return;
+    }
+    match Command::new("dseditgroup")
+        .args(["-o", "create", group])
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "warning: could not create '{group}' group: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(e) => eprintln!("warning: could not create '{group}' group: {e}"),
+    }
 }
 
 pub fn uninstall_helper() -> Result<(), String> {

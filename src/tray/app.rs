@@ -102,10 +102,16 @@ pub fn run() -> Result<(), String> {
                     state.invalidate_tooltip();
                 }
                 crate::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
-                if let Err(e) = state.toggle() {
-                    eprintln!("{e}");
+                match state.toggle() {
+                    Ok(()) => state.set_icon(&tray),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        state.set_icon(&tray);
+                        // Leave the reason visible on hover (e.g. an
+                        // authorization denial with grant instructions).
+                        state.show_error_tooltip(&tray, &e.to_string());
+                    }
                 }
-                state.set_icon(&tray);
             }
         }
 

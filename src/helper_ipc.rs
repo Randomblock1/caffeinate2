@@ -167,6 +167,13 @@ pub fn is_connect_error(message: &str) -> bool {
     message.starts_with("connect failed:")
 }
 
+/// True for helper errors that mean the peer is not allowed to take
+/// entirely-mode holds (as opposed to the helper being unreachable or
+/// failing). Matches the prefix used by [`crate::authz::denial_message`].
+pub fn is_authorization_error(message: &str) -> bool {
+    message.starts_with("not authorized")
+}
+
 /// RAII guard for a helper-managed hold.
 ///
 /// The hold is registered against this process in the helper's lockfile and
@@ -232,10 +239,42 @@ pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId
     process_util::process_id_from_pid(pid).map_err(|e| e.to_string())
 }
 
+/// Authorize a Hold from this peer, failing closed: unreadable credentials
+/// deny. Uses only the kernel-supplied effective uid (LOCAL_PEERCRED);
+/// group membership is resolved by [`crate::authz`].
+#[cfg(target_os = "macos")]
+fn authorize_hold(stream: &UnixStream) -> Result<(), String> {
+    use nix::sys::socket::getsockopt;
+    use nix::sys::socket::sockopt::LocalPeerCred;
+
+    let uid = match getsockopt(stream, LocalPeerCred) {
+        Ok(cred) => cred.uid(),
+        Err(e) => {
+            return Err(format!(
+                "not authorized: could not verify peer credentials: {e}"
+            ));
+        }
+    };
+    if crate::authz::uid_may_hold(uid) {
+        Ok(())
+    } else {
+        Err(crate::authz::denial_message(uid))
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn serve_connection(
+    stream: UnixStream,
+    coordinator: &Arc<EntirelyCoordinator>,
+) -> Result<(), String> {
+    serve_connection_inner(stream, coordinator, &authorize_hold)
+}
+
+#[cfg(target_os = "macos")]
+fn serve_connection_inner(
     mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
+    authorize_hold: &dyn Fn(&UnixStream) -> Result<(), String>,
 ) -> Result<(), String> {
     // Bound the whole RPC so a client that connects and sends nothing can't
     // pin a helper thread forever.
@@ -255,13 +294,20 @@ pub fn serve_connection(
         }
     };
 
-    // Hold and Release act on the peer's own process identity, so a client
-    // can never release another process's hold.
+    // Hold is the privileged operation (it can set the system-wide
+    // SleepDisabled setting) and is gated on the peer's identity. Release
+    // stays open: it only acts on the peer's own process identity, so a
+    // client can never release another process's hold, and gating it would
+    // strand the holds of users whose grant was later revoked. Status is
+    // read-only and open to everyone.
     let response = match request {
-        HelperRequest::Hold => match coordinator.hold(peer) {
-            Ok(()) => HelperResponse::HoldOk,
-            Err(e) => HelperResponse::Error {
-                message: e.to_string(),
+        HelperRequest::Hold => match authorize_hold(&stream) {
+            Err(denial) => HelperResponse::Error { message: denial },
+            Ok(()) => match coordinator.hold(peer) {
+                Ok(()) => HelperResponse::HoldOk,
+                Err(e) => HelperResponse::Error {
+                    message: e.to_string(),
+                },
             },
         },
         HelperRequest::Release => match coordinator.release(peer) {
@@ -314,10 +360,12 @@ mod tests {
             Arc::new(process_util::default_process_checker),
         ));
         let server = std::thread::spawn(move || {
-            // One connection each for hold, status, and release.
+            // One connection each for hold, status, and release. Use a
+            // permissive authorizer so the test doesn't depend on the
+            // developer's group memberships.
             for _ in 0..3 {
                 let (stream, _) = listener.accept().unwrap();
-                serve_connection(stream, &coordinator).unwrap();
+                serve_connection_inner(stream, &coordinator, &|_| Ok(())).unwrap();
             }
         });
 
@@ -333,6 +381,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unauthorized_hold_is_denied_and_status_stays_open() {
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("caffeinate2_authz_{}.sock", std::process::id()));
+        let lock_path = dir.join(format!("caffeinate2_authz_{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let disabler: SleepDisabler = Arc::new(|_state, _verbose| Ok(()));
+        let coordinator = Arc::new(EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            disabler,
+            Arc::new(process_util::default_process_checker),
+        ));
+        let server = std::thread::spawn(move || {
+            // One denied hold, then one open status request.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                serve_connection_inner(stream, &coordinator, &|_| {
+                    Err("not authorized: test denial".to_string())
+                })
+                .unwrap();
+            }
+        });
+
+        let client = HelperClient {
+            socket_path: sock_path.display().to_string(),
+        };
+        let error = match HelperHoldGuard::try_acquire(&client) {
+            Ok(_) => panic!("hold should have been denied"),
+            Err(error) => error,
+        };
+        assert!(is_authorization_error(&error), "{error}");
+        // The denied hold must not have registered anything.
+        assert_eq!(client.status().unwrap(), (0, false));
+        server.join().unwrap();
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn authorization_error_detection() {
+        assert!(is_authorization_error("not authorized: nope"));
+        assert!(!is_authorization_error("connect failed: nope"));
     }
 
     #[test]

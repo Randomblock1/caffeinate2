@@ -1,4 +1,6 @@
 pub mod app_target;
+#[cfg(target_os = "macos")]
+pub mod authz;
 pub mod duration_parser;
 #[cfg(target_os = "macos")]
 pub mod entirely;

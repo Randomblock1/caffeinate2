@@ -56,6 +56,12 @@ Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid
 
 After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
 
+**Who can use it:** root and administrator accounts, plus members of the `caffeinate2` group (created by `--install-helper`). The helper denies everyone else, since disabling sleep entirely is otherwise a root-only setting. To allow a standard account:
+
+`sudo dseditgroup -o edit -a USERNAME -t user caffeinate2`
+
+The grant takes effect on the user's next attempt (no logout needed). Denied requests show the exact grant command; `caffeinate2 --status` works for every account.
+
 Remove the helper: `sudo caffeinate2 --uninstall-helper`
 
 Check helper state (is it running, how many holds, is sleep disabled): `caffeinate2 --status`

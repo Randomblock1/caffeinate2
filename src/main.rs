@@ -146,7 +146,12 @@ fn main() {
         Ok(active) => active,
         Err(e) => {
             eprintln!("Error: {e}");
-            if sleep_modes.contains(sleep_mode::SleepMode::Entirely) {
+            // Skip the install hint for authorization denials: the helper is
+            // installed and reachable, and the denial message already carries
+            // the grant instructions.
+            if sleep_modes.contains(sleep_mode::SleepMode::Entirely)
+                && !matches!(e, sleep_mode::EnableError::NotAuthorized(_))
+            {
                 eprintln!(
                     "Hint: install the privileged helper with: sudo caffeinate2 --install-helper (or run caffeinate2 itself with sudo)"
                 );

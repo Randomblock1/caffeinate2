@@ -134,6 +134,14 @@ impl AppState {
         self.last_tooltip = None;
     }
 
+    /// Show an error in the tooltip (e.g. a denied entirely-mode hold).
+    /// Call after `set_icon` so the icon reflects the real state; the text
+    /// persists while idle and is replaced on the next tooltip update.
+    pub fn show_error_tooltip(&mut self, tray: &TrayIcon, message: &str) {
+        let _ = tray.set_tooltip(Some(format!("caffeinate2 — {message}")));
+        self.last_tooltip = None;
+    }
+
     pub fn stop_session(&mut self) {
         self.session = None;
         self.last_tooltip = None;

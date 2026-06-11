@@ -1,5 +1,5 @@
 use crate::entirely::{EntirelyCoordinator, EntirelyHoldGuard};
-use crate::helper_ipc::{HelperClient, HelperHoldGuard, is_connect_error};
+use crate::helper_ipc::{HelperClient, HelperHoldGuard, is_authorization_error, is_connect_error};
 use crate::power_management::{self, AssertionType, PowerAssertion};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,6 +28,10 @@ pub enum EntirelyPolicy {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnableError {
     HelperUnavailable,
+    /// The helper is running but denied the hold (peer is not root, an
+    /// administrator, or a member of the grant group). The message contains
+    /// the grant instructions; installing the helper again won't help.
+    NotAuthorized(String),
     Iokit(u32),
     Ipc(String),
 }
@@ -38,6 +42,7 @@ impl std::fmt::Display for EnableError {
             EnableError::HelperUnavailable => {
                 f.write_str("entirely mode requires the privileged helper")
             }
+            EnableError::NotAuthorized(message) => f.write_str(message),
             EnableError::Iokit(code) => write!(f, "IOKit error: {code:X}"),
             EnableError::Ipc(message) => f.write_str(message),
         }
@@ -50,6 +55,17 @@ impl std::error::Error for EnableError {}
 pub enum EntirelyHold {
     Local(EntirelyHoldGuard),
     Helper(HelperHoldGuard),
+}
+
+/// Map a helper RPC error string onto the typed error the UIs dispatch on.
+fn classify_helper_error(error: String) -> EnableError {
+    if is_connect_error(&error) {
+        EnableError::HelperUnavailable
+    } else if is_authorization_error(&error) {
+        EnableError::NotAuthorized(error)
+    } else {
+        EnableError::Ipc(error)
+    }
 }
 
 fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHold, EnableError> {
@@ -72,17 +88,11 @@ fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHol
                     Err(EnableError::HelperUnavailable)
                 }
             }
-            Err(error) => Err(EnableError::Ipc(error)),
+            Err(error) => Err(classify_helper_error(error)),
         },
         EntirelyPolicy::HelperRequired => HelperHoldGuard::try_acquire(&client)
             .map(EntirelyHold::Helper)
-            .map_err(|error| {
-                if is_connect_error(&error) {
-                    EnableError::HelperUnavailable
-                } else {
-                    EnableError::Ipc(error)
-                }
-            }),
+            .map_err(classify_helper_error),
     }
 }
 
@@ -256,6 +266,22 @@ mod tests {
         set.insert(SleepMode::Display);
         set.insert(SleepMode::UserActive);
         assert_eq!(set.selected_labels(), vec!["Display", "User active"]);
+    }
+
+    #[test]
+    fn helper_errors_classify_by_prefix() {
+        assert_eq!(
+            classify_helper_error("connect failed: no socket".to_string()),
+            EnableError::HelperUnavailable
+        );
+        assert_eq!(
+            classify_helper_error("not authorized: nope".to_string()),
+            EnableError::NotAuthorized("not authorized: nope".to_string())
+        );
+        assert_eq!(
+            classify_helper_error("read failed: timeout".to_string()),
+            EnableError::Ipc("read failed: timeout".to_string())
+        );
     }
 
     #[test]
