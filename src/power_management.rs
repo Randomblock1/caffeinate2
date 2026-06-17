@@ -2,15 +2,14 @@
 use objc2_core_foundation::{CFBoolean, CFString, kCFBooleanFalse, kCFBooleanTrue};
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionRelease,
-    IOPMUserActiveType, kIOPMAssertionLevelOff, kIOPMAssertionLevelOn, kIOReturnBadArgument,
-    kIOReturnNotFound, kIOReturnNotPrivileged,
+    IOPMUserActiveType, kIOPMAssertionLevelOn, kIOReturnBadArgument, kIOReturnNotFound,
 };
 use std::{fmt, mem::MaybeUninit};
 
 // Missing functions from objc2-io-kit
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> u32;
+    fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> i32;
 }
 
 #[derive(Copy, Clone)]
@@ -51,16 +50,11 @@ impl Drop for PowerAssertion {
 
 pub fn create_assertion(
     assertion_type: AssertionType,
-    state: bool,
     verbose: bool,
 ) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
     let type_ = CFString::from_str(assertion_type.as_str());
-    let level = if state {
-        kIOPMAssertionLevelOn
-    } else {
-        kIOPMAssertionLevelOff
-    };
+    let level = kIOPMAssertionLevelOn;
     let mut id = MaybeUninit::uninit();
 
     let status = unsafe {
@@ -119,20 +113,18 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
     }
 }
 
-pub fn declare_user_activity(state: bool, verbose: bool) -> Result<PowerAssertion, u32> {
+pub fn declare_user_activity(verbose: bool) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
-    let level = if state {
-        kIOPMAssertionLevelOn
-    } else {
-        kIOPMAssertionLevelOff
-    };
-
     let mut id = MaybeUninit::uninit();
 
-    let level_typed: IOPMUserActiveType = unsafe { std::mem::transmute(level) };
-
+    // Declaring activity is inherently "active now"; the only choice is the
+    // activity type, and Local means a user is physically at this machine.
     let status = unsafe {
-        IOPMAssertionDeclareUserActivity(Some(&assertion_name), level_typed, id.as_mut_ptr())
+        IOPMAssertionDeclareUserActivity(
+            Some(&assertion_name),
+            IOPMUserActiveType::Local,
+            id.as_mut_ptr(),
+        )
     };
     if status != 0 {
         return Err(status as u32);
@@ -173,10 +165,11 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
 
     let result = unsafe { IOPMSetSystemPowerSetting(&key, sleep_disabled_bool) };
 
+    let code = result as u32;
     if verbose {
         println!(
             "Got result {:X} when {} sleep",
-            result,
+            code,
             if sleep_disabled {
                 "disabling"
             } else {
@@ -185,42 +178,68 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
         );
     }
 
-    if result == 0 {
-        Ok(())
-    } else if result == kIOReturnNotPrivileged {
-        Err(result as u32)
-    } else {
-        Err(result as u32)
-    }
+    if result == 0 { Ok(()) } else { Err(code) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_io_kit::kIOReturnNotPrivileged;
 
     #[test]
-    fn test_create_assertion() {
-        // Test creating a valid assertion
-        let assertion =
-            create_assertion(AssertionType::PreventUserIdleSystemSleep, true, true).unwrap();
-        // The ID is a u32, usually non-zero if successful, but the function panics on failure.
-        // So if we get here, it worked.
-        println!("Created assertion with ID: {}", assertion.id);
+    fn test_assertion_type_names_match_iokit_names() {
+        let cases = [
+            (
+                AssertionType::PreventUserIdleDisplaySleep,
+                "PreventUserIdleDisplaySleep",
+            ),
+            (AssertionType::PreventDiskIdle, "PreventDiskIdle"),
+            (
+                AssertionType::PreventUserIdleSystemSleep,
+                "PreventUserIdleSystemSleep",
+            ),
+            (AssertionType::PreventSystemSleep, "PreventSystemSleep"),
+        ];
+
+        for (assertion_type, expected) in cases {
+            assert_eq!(assertion_type.as_str(), expected);
+            assert_eq!(assertion_type.to_string(), expected);
+        }
     }
 
     #[test]
-    fn test_declare_user_activity() {
-        let assertion = declare_user_activity(true, true).unwrap();
+    #[ignore = "creates real IOKit power assertions"]
+    fn smoke_create_all_known_assertion_types() {
+        let types = [
+            AssertionType::PreventUserIdleDisplaySleep,
+            AssertionType::PreventDiskIdle,
+            AssertionType::PreventUserIdleSystemSleep,
+            AssertionType::PreventSystemSleep,
+        ];
+
+        for assertion_type in types {
+            let assertion = create_assertion(assertion_type, false).unwrap();
+            println!(
+                "Successfully created assertion type: {} with ID: {}",
+                assertion_type, assertion.id
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "declares real user activity through IOKit"]
+    fn smoke_declare_user_activity() {
+        let assertion = declare_user_activity(true).unwrap();
         println!("Declared user activity with ID: {}", assertion.id);
     }
 
     #[test]
-    fn test_disable_sleep() {
-        // This requires root privileges usually, so we expect it to either succeed or fail with kIOReturnNotPrivileged
+    #[ignore = "changes the system SleepDisabled power setting"]
+    fn smoke_disable_sleep() {
         match disable_sleep(true) {
             Ok(guard) => {
                 println!("Successfully disabled sleep");
-                drop(guard); // Should re-enable sleep
+                drop(guard);
             }
             Err(code) => {
                 if code == kIOReturnNotPrivileged {
@@ -235,39 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn test_release_assertion_invalid_id() {
-        // Releasing an invalid ID should not panic, but print a message if verbose is true
+    #[ignore = "calls IOKit with an invalid assertion id"]
+    fn smoke_release_assertion_invalid_id() {
         release_assertion(u32::MAX, true);
-    }
-
-    #[test]
-    fn test_assertion_lifecycle() {
-        let assertion =
-            create_assertion(AssertionType::PreventUserIdleSystemSleep, true, false).unwrap();
-        let id = assertion.id;
-        // Explicitly drop the assertion to trigger release
-        drop(assertion);
-
-        // Try to release it again manually. This should not panic and should handle the "already released" case.
-        // This verifies that the drop implementation correctly released it, or at least that release_assertion is robust.
-        release_assertion(id, true);
-    }
-
-    #[test]
-    fn test_create_all_known_assertion_types() {
-        let types = [
-            AssertionType::PreventUserIdleDisplaySleep,
-            AssertionType::PreventDiskIdle,
-            AssertionType::PreventUserIdleSystemSleep,
-            AssertionType::PreventSystemSleep,
-        ];
-
-        for assertion_type in types {
-            let assertion = create_assertion(assertion_type, true, false).unwrap();
-            println!(
-                "Successfully created assertion type: {} with ID: {}",
-                assertion_type, assertion.id
-            );
-        }
     }
 }

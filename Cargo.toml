@@ -17,13 +17,59 @@ chrono = { version = "0.4", features = ["alloc", "clock", "now", "std"] }
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 humantime = "2.3"
 libc = "0.2"
-nix = { version = "0.31", features = ["user", "event", "fs", "signal"] }
+nix = { version = "0.31", features = ["user", "event", "fs", "signal", "socket"] }
 signal-hook = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = { version = "0.8", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+tray-icon = { version = "0.21", optional = true }
+muda = { version = "0.17", optional = true }
+block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-core-foundation = "0.3.2"
 objc2-io-kit = "0.3"
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSApplication",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "NSOpenPanel",
+    "objc2-uniform-type-identifiers",
+] }
+objc2-uniform-type-identifiers = { version = "0.3", optional = true, features = [
+    "UTType",
+    "UTCoreTypes",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSString",
+    "NSArray",
+    "NSBundle",
+    "NSURL",
+    "NSDate",
+    "NSRunLoop",
+    "NSNotification",
+    "NSOperation",
+    "block2",
+] }
+
+[features]
+default = []
+helper-bin = []
+tray = [
+    "dep:toml",
+    "dep:image",
+    "dep:tray-icon",
+    "dep:muda",
+    "dep:block2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+    "dep:objc2-uniform-type-identifiers",
+]
+full = ["tray", "helper-bin"]
 
 [[bin]]
 name = "caffeinate2"
@@ -32,3 +78,13 @@ path = "src/main.rs"
 [[bin]]
 name = "sleepdetect"
 path = "src/sleepdetect.rs"
+
+[[bin]]
+name = "caffeinate2-tray"
+path = "src/bin/caffeinate2-tray.rs"
+required-features = ["tray"]
+
+[[bin]]
+name = "caffeinate2-helper"
+path = "src/bin/caffeinate2-helper.rs"
+required-features = ["helper-bin"]

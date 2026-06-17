@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: ["master"]
+    branches: ["master", "dev", "feature/*"]
   pull_request:
-    branches: ["master"]
+    branches: ["master", "dev"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,13 +15,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --features full -- -D warnings
       - name: Build
         run: cargo build --verbose
+      - name: Build (full)
+        run: cargo build --verbose --features full
       - name: Run tests
         run: cargo test --verbose
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v6
         with:
           name: debug build
-          path: target/debug/caffeinate2
+          path: |
+            target/debug/caffeinate2
+            target/debug/caffeinate2-tray
+            target/debug/caffeinate2-helper
           if-no-files-found: error

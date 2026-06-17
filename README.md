@@ -20,7 +20,53 @@ _This won't be available until version 1.0.0._
 
 ### Cargo
 
+CLI only (default):
+
 `cargo install caffeinate2`
+
+Menu bar + privileged helper:
+
+`cargo install caffeinate2 --features full`
+
+From a clone:
+
+`cargo build --release --features full`
+
+## Menu bar
+
+Run `caffeinate2-tray` after installing with `--features full`.
+
+- **Left click:** toggle the selected sleep mode on/off.
+- **Right click:** choose mode (Display, Disk, System, System on AC, User active, Entirely), set an optional **Time limit** (Off, 15 minutes, 30 minutes, 1 hour, and so on), optionally set **Until app quits** (pick a running app or **Choose application…** for any `.app`), toggle **Start at login**, or Quit.
+
+When a time limit is set, left-clicking to start sleep prevention automatically turns it off again after that duration (similar to `caffeinate2 -t`). Changing the time limit while sleep prevention is active restarts the countdown from that moment (it is not measured from when the session started). **Until app quits** keeps prevention on until every instance of the chosen app has exited; if the app is not running when you turn on, caffeinate2 waits for it to launch first. The target is remembered by bundle ID (for example `Codex.app` stays matched across restarts). Time limit and until-app quit whichever comes first. The menu bar tooltip shows remaining time and/or app status while active.
+
+Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
+
+Unsigned binaries may require running from Terminal once (right-click → Open) or allowing in Privacy & Security.
+
+## Entirely mode (no repeated sudo)
+
+Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid is closed. It uses a small privileged helper daemon.
+
+**One-time setup** (either method):
+
+1. Tray: select **Entirely** and approve the administrator dialog when prompted, or
+2. CLI: `sudo caffeinate2 --install-helper`
+
+After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
+
+**Who can use it:** root and administrator accounts, plus members of the `caffeinate2` group (created by `--install-helper`). The helper denies everyone else, since disabling sleep entirely is otherwise a root-only setting. To allow a standard account:
+
+`sudo dseditgroup -o edit -a USERNAME -t user caffeinate2`
+
+The grant takes effect on the user's next attempt (no logout needed). Denied requests show the exact grant command; `caffeinate2 --status` works for every account.
+
+Remove the helper: `sudo caffeinate2 --uninstall-helper`
+
+Check helper state (is it running, how many holds, is sleep disabled): `caffeinate2 --status`
+
+Helper install also adds `/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf` so `/var/log/caffeinate2-helper.log` is rotated.
 
 ## Usage
 
@@ -34,6 +80,7 @@ Options:
   -v, --verbose             Verbose mode
       --dry-run             Dry run. Don't actually sleep. Useful for testing
       --drop-root           Drop root privileges in command. You need root to disable sleep entirely, but some programs don't want to run as root
+      --shell               Run COMMAND through /bin/sh -c instead of executing it directly
   -d, --display             Disable display sleep
   -m, --disk                Disable disk idle sleep
   -i, --system              Disable idle system sleep. [DEFAULT]
@@ -42,6 +89,9 @@ Options:
   -u, --user-active         Declare the user is active. If the display is off, this option turns it on and prevents it from going into idle sleep
   -t, --timeout <DURATION>  Wait for X seconds. Also supports time units (like "1 day 2 hours 3mins 4s")
   -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
+      --install-helper      Install the privileged helper for entirely mode (admin prompt or sudo)
+      --uninstall-helper    Remove the privileged helper (requires root)
+      --status              Show entirely-mode helper status (holders and sleep state)
   -h, --help                Print help
   -V, --version             Print version
 ```
@@ -50,9 +100,11 @@ Options:
 
 ### Command
 
-Sleep disabled until the command completes. You should enclose the command in quotes to prevent your shell from prematurely executing or piping it, although it isn't strictly required. Timeout and PID will be ignored if a command is specified.
+Sleep disabled until the command completes. By default the command is executed directly, so arguments keep their boundaries (for example, a filename containing spaces stays one argument). Use `--shell` when you intentionally want shell features such as pipes, globbing, or `&&`. Timeout and PID will be ignored if a command is specified.
 
-`caffeinate2 'sleep 5'`
+`caffeinate2 sleep 5`
+
+`caffeinate2 --shell 'sleep 5 && echo done'`
 
 ### Timeout and PID
 
@@ -60,10 +112,10 @@ Sleep is disabled for a certain amount of time or until the program with the spe
 specified, it waits until one of them completes.
 
 Timeout can either be a number of seconds or a duration string. For example, you can pass `-t 600` or `-t 10m` to wait
-for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`, but it only looks at the
-first letter (so "3 movies" is just 3 minutes). Anything that's not a number followed by a letter will be ignored (the "
-and" in the previous example). **YOU MUST USE QUOTATION MARKS FOR THIS TO WORK.** Otherwise, it will try to parse
-anything that's past the space as a command, and ignore the timeout.
+for 10 minutes. You can create more descriptive durations, like `-t "1 hour and 30 minutes"`. Supported units include
+seconds, minutes, hours, days, weeks, months, and years, plus common short forms like `s`, `m`, `h`, and `d`.
+**YOU MUST USE QUOTATION MARKS FOR MULTI-WORD DURATIONS TO WORK.** Otherwise, it will try to parse anything that's past
+the space as a command, and ignore the timeout.
 
 For PIDs, it will wait until the specified program exits. If the program doesn't exist, it will immediately exit with an
 error. Once the program completes, caffeinate2 will exit with the same exit code as the program.
