@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tray icon: "on" / awake state.
+  The SAME outlined mug + handle as icon_off.svg (identical paths, identical
+  stroke-width/linejoin/linecap, so the outer silhouette is pixel-for-pixel
+  the same) — the only differences are that the body is filled solid and
+  steam rises above. Do NOT change the body/handle geometry or stroke here
+  without mirroring it in icon_off.svg, or the two states will misalign.
+
+  The outer <g transform> places the artwork inside the macOS menu-bar safe
+  area: the full 256px canvas maps to 22pt, and this transform scales+centers
+  the mug+steam composition into the middle 16pt (y 3pt..19pt, 3pt margins).
+  icon_off.svg wraps its mug+handle in the IDENTICAL transform, so the mug
+  occupies the same pixels in both states and the icon does not jump when
+  toggling on/off. Keep the transform string in lockstep across both files.
+  Edit freely; re-run scripts/generate_icons.sh to regenerate icon_on.png.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"
+     viewBox="0 0 256 256" fill="none">
+  <g transform="translate(14.8,10.9) scale(0.8908)">
+    <g fill="none" stroke="#000000" stroke-width="20"
+       stroke-linejoin="round" stroke-linecap="round">
+      <!-- mug body: identical outline to icon_off.svg, filled solid -->
+      <path fill="#000000"
+            d="M 44,142
+               Q 44,124 62,124
+               H 146
+               Q 164,124 164,142
+               V 196
+               Q 164,226 134,226
+               H 74
+               Q 44,226 44,196
+               Z"/>
+
+      <!-- handle: full C-loop on the straight right wall (y 142..196) -->
+      <path d="M 164,142 A 31,31 0 1 1 164,196"/>
+    </g>
+
+    <!-- steam: two parallel wisps rising over the opening (centered x 104) -->
+    <g fill="none" stroke="#000000" stroke-width="18" stroke-linecap="round">
+      <path d="M 88,92 C 98,83 98,71 88,62 C 78,53 78,41 88,36"/>
+      <path d="M 120,92 C 130,83 130,71 120,62 C 110,53 110,41 120,36"/>
+    </g>
+  </g>
+</svg>

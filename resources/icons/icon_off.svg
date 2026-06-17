@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tray icon: "off" / inactive state.
+  An outlined coffee mug, no steam. Shares the EXACT body + handle paths and
+  stroke with icon_on.svg, so the two states are pixel-identical on the
+  outside; only the fill (solid vs hollow) and the steam differ. Keep the
+  paths/stroke here and in icon_on.svg in lockstep.
+
+  The outer <g transform> is IDENTICAL to icon_on.svg's: it scales+centers the
+  artwork into the menu-bar safe area (256px canvas = 22pt; content within the
+  middle 16pt). Because the transform and the mug+handle paths match icon_on
+  exactly, the mug renders on the same pixels in both states, so toggling
+  on/off does not shift the icon. The mug alone sits low in the frame (its
+  visual mass drops without the steam above) but stays inside the 16pt band.
+  Edit freely; re-run scripts/generate_icons.sh to regenerate icon_off.png.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"
+     viewBox="0 0 256 256" fill="none">
+  <g transform="translate(14.8,10.9) scale(0.8908)">
+    <g fill="none" stroke="#000000" stroke-width="20"
+       stroke-linejoin="round" stroke-linecap="round">
+      <!-- mug body (outline): straight sides, rounded base, wider than tall -->
+      <path d="M 44,142
+               Q 44,124 62,124
+               H 146
+               Q 164,124 164,142
+               V 196
+               Q 164,226 134,226
+               H 74
+               Q 44,226 44,196
+               Z"/>
+
+      <!-- handle: full C-loop on the straight right wall (y 142..196) -->
+      <path d="M 164,142 A 31,31 0 1 1 164,196"/>
+    </g>
+  </g>
+</svg>
