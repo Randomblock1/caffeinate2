@@ -10,6 +10,8 @@ use clap::Parser;
 #[cfg(target_os = "macos")]
 use cli::{Args, MaintenanceCommand};
 #[cfg(target_os = "macos")]
+use nix::sys::signal::{Signal, kill};
+#[cfg(target_os = "macos")]
 use nix::unistd;
 #[cfg(target_os = "macos")]
 use signal_hook::{
@@ -163,7 +165,8 @@ fn main() {
     let active = Arc::new(Mutex::new(Some(active)));
     let active_signal = active.clone();
     let exit_code = Arc::new(AtomicI32::new(0));
-    let exit_code_signal = Arc::clone(&exit_code);
+    let child_pid = Arc::new(AtomicI32::new(0));
+    let child_pid_signal = Arc::clone(&child_pid);
 
     // Also catch SIGTERM/SIGHUP (kill, logout): exiting without releasing an
     // entirely-mode hold would leave system sleep disabled until the helper
@@ -171,18 +174,29 @@ fn main() {
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGHUP]).expect("Failed to create signal iterator");
     thread::spawn(move || {
-        if signals.forever().next().is_some() {
+        if let Some(signal) = signals.forever().next() {
             println!("\nStopping...");
+            let pid = child_pid_signal.load(Ordering::Relaxed);
+            if pid > 0 {
+                let _ = kill(unistd::Pid::from_raw(pid), Signal::SIGTERM);
+            }
             if let Ok(mut guard) = active_signal.lock() {
                 let _ = guard.take();
             }
-            process::exit(exit_code_signal.load(Ordering::Relaxed));
+            process::exit(128 + signal);
         }
     });
 
     match wait_mode(&args) {
         WaitMode::Command => {
             let command = args.command.expect("Command should be present");
+            if command.is_empty() {
+                eprintln!("Error: empty command");
+                if let Ok(mut guard) = active.lock() {
+                    let _ = guard.take();
+                }
+                process::exit(2);
+            }
             sleep_str += "until command finishes.";
             println!("{sleep_str}");
 
@@ -195,8 +209,26 @@ fn main() {
                 let gid_str =
                     std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
 
-                uid = uid_str.parse::<u32>().expect("Invalid UID");
-                gid = gid_str.parse::<u32>().expect("Invalid GID");
+                uid = match uid_str.parse::<u32>() {
+                    Ok(uid) => uid,
+                    Err(_) => {
+                        eprintln!("Error: invalid SUDO_UID: {uid_str}");
+                        if let Ok(mut guard) = active.lock() {
+                            let _ = guard.take();
+                        }
+                        process::exit(1);
+                    }
+                };
+                gid = match gid_str.parse::<u32>() {
+                    Ok(gid) => gid,
+                    Err(_) => {
+                        eprintln!("Error: invalid SUDO_GID: {gid_str}");
+                        if let Ok(mut guard) = active.lock() {
+                            let _ = guard.take();
+                        }
+                        process::exit(1);
+                    }
+                };
             } else {
                 uid = unistd::getuid().into();
                 gid = unistd::getgid().into();
@@ -206,17 +238,44 @@ fn main() {
                 println!("uid: {uid}, gid: {gid}");
             }
 
-            let mut child = process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(command.join(" "))
+            let mut child_command = if args.shell {
+                let mut child_command = process::Command::new("/bin/sh");
+                child_command.arg("-c").arg(command.join(" "));
+                child_command
+            } else {
+                let mut child_command = process::Command::new(&command[0]);
+                child_command.args(&command[1..]);
+                child_command
+            };
+            let mut child = match child_command
                 .stdout(process::Stdio::inherit())
                 .stderr(process::Stdio::inherit())
                 .uid(uid)
                 .gid(gid)
                 .spawn()
-                .expect("Failed to execute command");
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Error: failed to execute command: {e}");
+                    if let Ok(mut guard) = active.lock() {
+                        let _ = guard.take();
+                    }
+                    process::exit(127);
+                }
+            };
+            child_pid.store(child.id() as i32, Ordering::Relaxed);
 
-            let status = child.wait().expect("Command wasn't running");
+            let status = match child.wait() {
+                Ok(status) => status,
+                Err(e) => {
+                    eprintln!("Error: command wait failed: {e}");
+                    if let Ok(mut guard) = active.lock() {
+                        let _ = guard.take();
+                    }
+                    process::exit(1);
+                }
+            };
+            child_pid.store(0, Ordering::Relaxed);
             // Match the -w decoding: report signal deaths as 128 + signal
             // number instead of masking them as success.
             let code = status
@@ -286,6 +345,13 @@ fn main() {
                         println!("with exit code {}", exit_code.load(Ordering::Relaxed));
                     }
                     Ok(WaitForPidResult::TimedOut) => {}
+                    Err(WaitForPidError::InvalidPid) => {
+                        eprintln!("Error: invalid PID {pid}; expected a positive process ID");
+                        if let Ok(mut guard) = active.lock() {
+                            let _ = guard.take();
+                        }
+                        process::exit(1);
+                    }
                     Err(WaitForPidError::NotFound) => {
                         println!("PID {pid} not found");
                         // Release holds before exiting: process::exit skips
@@ -353,6 +419,28 @@ mod tests {
         assert_eq!(
             sleep_modes.selected_labels(),
             vec!["Display", "User active"]
+        );
+    }
+
+    #[test]
+    fn shell_flag_is_opt_in() {
+        let direct = parse_args(&["caffeinate2", "touch", "a b.txt"]);
+        assert!(!direct.shell);
+        assert_eq!(
+            direct.command,
+            Some(vec!["touch".to_string(), "a b.txt".to_string()])
+        );
+
+        let shell = parse_args(&["caffeinate2", "--shell", "echo", "ok", "&&", "true"]);
+        assert!(shell.shell);
+        assert_eq!(
+            shell.command,
+            Some(vec![
+                "echo".to_string(),
+                "ok".to_string(),
+                "&&".to_string(),
+                "true".to_string()
+            ])
         );
     }
 

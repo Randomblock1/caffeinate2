@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(long)]
     pub drop_root: bool,
 
+    /// Run COMMAND through /bin/sh -c instead of executing it directly.
+    #[arg(long)]
+    pub shell: bool,
+
     /// Disable display sleep
     #[arg(short, long)]
     pub display: bool,

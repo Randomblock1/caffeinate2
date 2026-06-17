@@ -1,5 +1,6 @@
 use crate::app_target::AppTarget;
 use crate::duration_parser::format_remaining_secs;
+use crate::fs_util;
 use crate::sleep_mode::SleepMode;
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +45,7 @@ impl TimeLimitPreset {
     ];
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrayConfig {
     #[serde(default = "default_config_version")]
     pub version: u32,
@@ -58,6 +59,17 @@ pub struct TrayConfig {
 
 fn default_config_version() -> u32 {
     CONFIG_VERSION
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            version: default_config_version(),
+            mode: SleepMode::default(),
+            time_limit_secs: None,
+            wait_for_app: None,
+        }
+    }
 }
 
 pub fn config_path() -> Result<std::path::PathBuf, String> {
@@ -89,7 +101,7 @@ pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     let mut to_save = config.clone();
     to_save.version = CONFIG_VERSION;
     let content = toml::to_string_pretty(&to_save).map_err(|e| e.to_string())?;
-    std::fs::write(path, content).map_err(|e| e.to_string())
+    fs_util::atomic_write(&path, content.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Build menu bar tooltip text while sleep prevention is active.
@@ -119,6 +131,11 @@ pub fn format_active_tooltip(
 #[cfg(all(test, feature = "tray"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_uses_current_version() {
+        assert_eq!(TrayConfig::default().version, CONFIG_VERSION);
+    }
 
     #[test]
     fn parse_config_defaults_time_limit_to_off() {

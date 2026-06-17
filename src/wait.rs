@@ -32,6 +32,7 @@ pub enum WaitForPidResult {
 
 #[derive(Debug)]
 pub enum WaitForPidError {
+    InvalidPid,
     NotFound,
     Kevent(nix::Error),
 }
@@ -62,14 +63,15 @@ pub fn wait_for_pid(
     timeout: Option<Duration>,
     verbose: bool,
 ) -> Result<WaitForPidResult, WaitForPidError> {
+    if pid <= 0 {
+        return Err(WaitForPidError::InvalidPid);
+    }
+
     let kq = event::Kqueue::new().map_err(WaitForPidError::Kevent)?;
     let kev = event::KEvent::new(
         pid as usize,
         event::EventFilter::EVFILT_PROC,
-        event::EvFlags::EV_ADD
-            | event::EvFlags::EV_ENABLE
-            | event::EvFlags::EV_ONESHOT
-            | event::EvFlags::EV_ERROR,
+        event::EvFlags::EV_ADD | event::EvFlags::EV_ENABLE | event::EvFlags::EV_ONESHOT,
         event::FilterFlag::NOTE_EXITSTATUS,
         0,
         0,
@@ -109,6 +111,18 @@ pub fn wait_for_pid(
 mod tests {
     use super::*;
     use crate::cli::parse_args;
+
+    #[test]
+    fn wait_for_pid_rejects_non_positive_pids() {
+        assert!(matches!(
+            wait_for_pid(0, Some(Duration::from_millis(1)), false),
+            Err(WaitForPidError::InvalidPid)
+        ));
+        assert!(matches!(
+            wait_for_pid(-1, Some(Duration::from_millis(1)), false),
+            Err(WaitForPidError::InvalidPid)
+        ));
+    }
 
     #[test]
     fn wait_status_decodes_normal_exit() {

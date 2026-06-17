@@ -54,15 +54,6 @@ pub fn run() -> Result<(), String> {
             state.update_tooltip(&tray);
         }
 
-        if workspace_dirty.swap(false, Ordering::Relaxed) {
-            let apps = macos_apps::running_app_choices();
-            let key = running_apps_menu_key(&apps);
-            if key != menu_apps_key {
-                menu_apps_key = key;
-                handles = install_menu(&tray, &state.menu_snapshot(), &apps);
-            }
-        }
-
         while let Ok(event) = menu_events.try_recv() {
             if event.id == handles.choose_app_id {
                 if let Some(apps) = handle_choose_app(&mut state, &tray) {
@@ -112,6 +103,15 @@ pub fn run() -> Result<(), String> {
                         state.show_error_tooltip(&tray, &e.to_string());
                     }
                 }
+            }
+        }
+
+        if workspace_dirty.swap(false, Ordering::Relaxed) {
+            let apps = macos_apps::running_app_choices();
+            let key = running_apps_menu_key(&apps);
+            if key != menu_apps_key {
+                menu_apps_key = key;
+                handles = install_menu(&tray, &state.menu_snapshot(), &apps);
             }
         }
 

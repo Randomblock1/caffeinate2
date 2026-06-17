@@ -5,6 +5,7 @@ use crate::{
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
 
@@ -14,13 +15,7 @@ pub fn helper_lock_path() -> PathBuf {
     PathBuf::from(HELPER_LOCK_PATH)
 }
 
-pub fn cli_fallback_lock_path() -> PathBuf {
-    if nix::unistd::getuid().is_root() {
-        helper_lock_path()
-    } else {
-        PathBuf::from(format!("/tmp/caffeinate2_{}.lock", nix::unistd::getuid()))
-    }
-}
+const CLI_FALLBACK_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntirelyStatus {
@@ -73,12 +68,30 @@ impl EntirelyCoordinator {
     }
 
     pub fn cli_fallback(verbose: bool) -> Self {
-        Self::with_options(
+        let coordinator = Self::with_options(
             verbose,
-            cli_fallback_lock_path(),
+            helper_lock_path(),
             Arc::new(power_management::set_sleep_disabled),
             Arc::new(process_util::default_process_checker),
-        )
+        );
+        if let Err(e) = coordinator.reconcile_startup() {
+            eprintln!("startup reconcile failed: {e}");
+        }
+        // The CLI fallback has no long-lived daemon, so it runs a best-effort
+        // in-process reaper while this invocation is alive. If this root CLI is
+        // SIGKILLed and no future entirely-mode invocation runs, its lockfile
+        // entry and SleepDisabled=true can persist; install the helper to avoid
+        // that inherent CLI-only limit.
+        let reaper = coordinator.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(CLI_FALLBACK_RECONCILE_INTERVAL);
+                if let Err(e) = reaper.reconcile() {
+                    eprintln!("periodic reconcile failed: {e}");
+                }
+            }
+        });
+        coordinator
     }
 
     pub fn hold(
@@ -154,9 +167,11 @@ impl EntirelyCoordinator {
 
     /// Re-sync the global sleep setting with the lockfile after a (re)start.
     ///
-    /// Prunes dead holders, then disables sleep if live holders remain or
-    /// re-enables it if none do, so a helper crash can't leave the system
-    /// SleepDisabled setting stuck.
+    /// Prunes dead holders, then force-disables sleep if live holders remain,
+    /// so a helper crash can't leave active holders ineffective. It does not
+    /// force the enable direction on an empty lockfile because that is
+    /// indistinguishable from a manual `pmset disablesleep` made outside of
+    /// caffeinate2.
     pub fn reconcile_startup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reconcile_with(true)
     }
@@ -180,7 +195,8 @@ impl EntirelyCoordinator {
             inner.process_checker.as_ref(),
         )?;
         let disable = holders > 0;
-        if !force && disable == inner.sleep_disabled.load(Ordering::SeqCst) {
+        let force_apply = force && disable;
+        if !force_apply && disable == inner.sleep_disabled.load(Ordering::SeqCst) {
             return Ok(());
         }
         if inner.verbose {
@@ -237,8 +253,9 @@ impl EntirelyHoldGuard {
         if !self.active {
             return Ok(());
         }
+        self.coordinator.release(self.process_id)?;
         self.active = false;
-        self.coordinator.release(self.process_id)
+        Ok(())
     }
 }
 
@@ -333,6 +350,92 @@ mod tests {
         if lock_path.exists() {
             std::fs::remove_file(&lock_path).unwrap();
         }
+    }
+
+    #[test]
+    fn reconcile_startup_does_not_force_enable_empty_lockfile() {
+        let lock_path = temp_lock_path();
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            Ok(())
+        });
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile_startup().unwrap();
+
+        assert!(sleep_calls.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn reconcile_startup_force_disables_with_live_holders() {
+        let lock_path = temp_lock_path();
+        let holder = ProcessId {
+            pid: 42,
+            start_time: ProcessStartTime {
+                seconds: 7,
+                microseconds: 0,
+            },
+        };
+        std::fs::write(&lock_path, format!("{holder}\n")).unwrap();
+
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            Ok(())
+        });
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| true);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile_startup().unwrap();
+
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![true]);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn failed_release_is_retried_on_drop() {
+        let lock_path = temp_lock_path();
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let release_attempts_clone = release_attempts.clone();
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            if !state && release_attempts_clone.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(0xE000_02C1u32);
+            }
+            Ok(())
+        });
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        let mut guard = coordinator.hold_current_process().unwrap();
+        assert!(guard.release().is_err());
+        drop(guard);
+
+        assert_eq!(release_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![true, false, false]);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
     #[test]

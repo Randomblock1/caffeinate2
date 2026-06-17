@@ -66,6 +66,8 @@ Remove the helper: `sudo caffeinate2 --uninstall-helper`
 
 Check helper state (is it running, how many holds, is sleep disabled): `caffeinate2 --status`
 
+Helper install also adds `/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf` so `/var/log/caffeinate2-helper.log` is rotated.
+
 ## Usage
 
 ```plaintext
@@ -78,6 +80,7 @@ Options:
   -v, --verbose             Verbose mode
       --dry-run             Dry run. Don't actually sleep. Useful for testing
       --drop-root           Drop root privileges in command. You need root to disable sleep entirely, but some programs don't want to run as root
+      --shell               Run COMMAND through /bin/sh -c instead of executing it directly
   -d, --display             Disable display sleep
   -m, --disk                Disable disk idle sleep
   -i, --system              Disable idle system sleep. [DEFAULT]
@@ -97,9 +100,11 @@ Options:
 
 ### Command
 
-Sleep disabled until the command completes. You should enclose the command in quotes to prevent your shell from prematurely executing or piping it, although it isn't strictly required. Timeout and PID will be ignored if a command is specified.
+Sleep disabled until the command completes. By default the command is executed directly, so arguments keep their boundaries (for example, a filename containing spaces stays one argument). Use `--shell` when you intentionally want shell features such as pipes, globbing, or `&&`. Timeout and PID will be ignored if a command is specified.
 
-`caffeinate2 'sleep 5'`
+`caffeinate2 sleep 5`
+
+`caffeinate2 --shell 'sleep 5 && echo done'`
 
 ### Timeout and PID
 

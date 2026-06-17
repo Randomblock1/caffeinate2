@@ -1,12 +1,13 @@
 use crate::entirely::EntirelyCoordinator;
 use crate::process_util;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Holds are keyed by the requesting process (pid + start time, taken from the
 /// socket peer), not by the connection. Each request is a short RPC on its own
@@ -100,11 +101,20 @@ fn write_request(stream: &mut UnixStream, request: &HelperRequest) -> Result<(),
 }
 
 fn read_line(stream: &mut UnixStream) -> Result<String, String> {
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST_BYTES as u64 + 1);
     let mut line = String::new();
-    reader
+    let bytes = reader
         .read_line(&mut line)
         .map_err(|e| format!("read failed: {e}"))?;
+    if bytes == 0 {
+        return Err("missing request".to_string());
+    }
+    if !line.ends_with('\n') {
+        return Err("request missing newline".to_string());
+    }
+    if line.len() > MAX_REQUEST_BYTES {
+        return Err("request too large".to_string());
+    }
     Ok(line)
 }
 
@@ -267,7 +277,7 @@ pub fn serve_connection(
     stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
 ) -> Result<(), String> {
-    serve_connection_inner(stream, coordinator, &authorize_hold)
+    serve_connection_inner(stream, coordinator, &authorize_hold, &peer_process_id)
 }
 
 #[cfg(target_os = "macos")]
@@ -275,17 +285,11 @@ fn serve_connection_inner(
     mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
     authorize_hold: &dyn Fn(&UnixStream) -> Result<(), String>,
+    peer_process_id: &dyn Fn(&UnixStream) -> Result<crate::lockfile::ProcessId, String>,
 ) -> Result<(), String> {
     // Bound the whole RPC so a client that connects and sends nothing can't
     // pin a helper thread forever.
     configure_rpc_timeouts(&stream)?;
-
-    let peer = match peer_process_id(&stream) {
-        Ok(id) => id,
-        Err(e) => {
-            return write_response_on_stream(&mut stream, HelperResponse::Error { message: e });
-        }
-    };
 
     let request = match read_request_line(&mut stream) {
         Ok(req) => req,
@@ -303,18 +307,23 @@ fn serve_connection_inner(
     let response = match request {
         HelperRequest::Hold => match authorize_hold(&stream) {
             Err(denial) => HelperResponse::Error { message: denial },
-            Ok(()) => match coordinator.hold(peer) {
+            Ok(()) => match peer_process_id(&stream).and_then(|peer| {
+                // Once the hold is committed, a later response-write failure is
+                // at-least-once from the client's point of view: the client may
+                // treat acquisition as failed while the helper keeps the hold.
+                // The hold is keyed to the client process, so Release remains
+                // idempotent and the reaper clears it if the client exits.
+                coordinator.hold(peer).map_err(|e| e.to_string())
+            }) {
                 Ok(()) => HelperResponse::HoldOk,
-                Err(e) => HelperResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => HelperResponse::Error { message: e },
             },
         },
-        HelperRequest::Release => match coordinator.release(peer) {
+        HelperRequest::Release => match peer_process_id(&stream)
+            .and_then(|peer| coordinator.release(peer).map_err(|e| e.to_string()))
+        {
             Ok(()) => HelperResponse::ReleaseOk,
-            Err(e) => HelperResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => HelperResponse::Error { message: e },
         },
         HelperRequest::Status => match coordinator.status() {
             Ok(status) => HelperResponse::Status {
@@ -365,7 +374,8 @@ mod tests {
             // developer's group memberships.
             for _ in 0..3 {
                 let (stream, _) = listener.accept().unwrap();
-                serve_connection_inner(stream, &coordinator, &|_| Ok(())).unwrap();
+                serve_connection_inner(stream, &coordinator, &|_| Ok(()), &peer_process_id)
+                    .unwrap();
             }
         });
 
@@ -404,9 +414,12 @@ mod tests {
             // One denied hold, then one open status request.
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
-                serve_connection_inner(stream, &coordinator, &|_| {
-                    Err("not authorized: test denial".to_string())
-                })
+                serve_connection_inner(
+                    stream,
+                    &coordinator,
+                    &|_| Err("not authorized: test denial".to_string()),
+                    &peer_process_id,
+                )
                 .unwrap();
             }
         });
@@ -425,6 +438,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_succeeds_when_peer_lookup_fails() {
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("caffeinate2_status_{}.sock", std::process::id()));
+        let lock_path = dir.join(format!("caffeinate2_status_{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let disabler: SleepDisabler = Arc::new(|_state, _verbose| Ok(()));
+        let coordinator = Arc::new(EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            disabler,
+            Arc::new(process_util::default_process_checker),
+        ));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection_inner(stream, &coordinator, &|_| Ok(()), &|_| {
+                Err("peer lookup failed".to_string())
+            })
+            .unwrap();
+        });
+
+        let client = HelperClient {
+            socket_path: sock_path.display().to_string(),
+        };
+        assert_eq!(client.status().unwrap(), (0, false));
+        server.join().unwrap();
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn rejects_oversized_requests() {
+        let (mut left, mut right) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            left.write_all(&vec![b'a'; MAX_REQUEST_BYTES + 1]).unwrap();
+            left.write_all(b"\n").unwrap();
+        });
+
+        assert_eq!(
+            read_line(&mut right).unwrap_err(),
+            "request missing newline"
+        );
+        writer.join().unwrap();
     }
 
     #[test]

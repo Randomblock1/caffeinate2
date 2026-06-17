@@ -9,7 +9,7 @@ use std::{fmt, mem::MaybeUninit};
 // Missing functions from objc2-io-kit
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> u32;
+    fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> i32;
 }
 
 #[derive(Copy, Clone)]
@@ -165,10 +165,11 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
 
     let result = unsafe { IOPMSetSystemPowerSetting(&key, sleep_disabled_bool) };
 
+    let code = result as u32;
     if verbose {
         println!(
             "Got result {:X} when {} sleep",
-            result,
+            code,
             if sleep_disabled {
                 "disabling"
             } else {
@@ -177,7 +178,7 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
         );
     }
 
-    if result == 0 { Ok(()) } else { Err(result) }
+    if result == 0 { Ok(()) } else { Err(code) }
 }
 
 #[cfg(test)]

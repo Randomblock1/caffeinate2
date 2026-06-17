@@ -1,4 +1,5 @@
 use crate::entirely;
+use crate::fs_util;
 use crate::helper_ipc;
 use crate::power_management;
 use std::fs;
@@ -12,10 +13,14 @@ pub const HELPER_PLIST_PATH: &str =
 pub const HELPER_PLIST_LABEL: &str = "com.randomblock1.caffeinate2.helper";
 pub const TRAY_LAUNCH_AGENT_LABEL: &str = "com.randomblock1.caffeinate2-tray";
 
+const NEWSYSLOG_CONF_PATH: &str = "/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf";
+
 const HELPER_PLIST_TEMPLATE: &str =
     include_str!("../resources/com.randomblock1.caffeinate2.helper.plist");
 const TRAY_PLIST_TEMPLATE: &str =
     include_str!("../resources/com.randomblock1.caffeinate2-tray.plist");
+const NEWSYSLOG_CONF_TEMPLATE: &str =
+    include_str!("../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
 
 fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -75,9 +80,13 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     // unlink the old file so the copy gets a fresh inode. Overwriting a running
     // executable in place invalidates its code signature and the kernel kills
     // the process mid-write; bootstrap below would also no-op while the old
-    // service is still loaded.
+    // service is still loaded. bootout may fail on first install, so suppress it.
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
-    let _ = fs::remove_file(&dest);
+    match fs::remove_file(&dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("warning: could not remove old helper binary: {e}"),
+    }
     fs::copy(source_helper, &dest).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(&dest)
         .map_err(|e| e.to_string())?
@@ -86,7 +95,9 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
 
     let plist = helper_plist_content(&dest);
-    fs::write(HELPER_PLIST_PATH, plist).map_err(|e| e.to_string())?;
+    fs_util::atomic_write(Path::new(HELPER_PLIST_PATH), plist.as_bytes())
+        .map_err(|e| e.to_string())?;
+    install_newsyslog_conf();
 
     // Best-effort: create the grant group so administrators can allow
     // standard accounts with a single dseditgroup -o edit command. The
@@ -96,6 +107,19 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
 
     launchctl_bootstrap_system(HELPER_PLIST_PATH)?;
     Ok(())
+}
+
+fn install_newsyslog_conf() {
+    let path = Path::new(NEWSYSLOG_CONF_PATH);
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("warning: could not create newsyslog config directory: {e}");
+        return;
+    }
+    if let Err(e) = fs_util::atomic_write(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes()) {
+        eprintln!("warning: could not install newsyslog config: {e}");
+    }
 }
 
 fn ensure_grant_group() {
@@ -128,6 +152,7 @@ pub fn uninstall_helper() -> Result<(), String> {
 
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
     let _ = fs::remove_file(HELPER_PLIST_PATH);
+    let _ = fs::remove_file(NEWSYSLOG_CONF_PATH);
     let _ = fs::remove_file(HELPER_INSTALL_PATH);
     let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
     // Nobody can send Release to the removed helper; drop any holder state and
@@ -167,7 +192,8 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&plist_path, tray_launch_agent_plist(tray_path)).map_err(|e| e.to_string())?;
+    let plist = tray_launch_agent_plist(tray_path);
+    fs_util::atomic_write(&plist_path, plist.as_bytes()).map_err(|e| e.to_string())?;
     // Don't bootstrap the agent now: RunAtLoad would immediately launch a
     // second tray instance next to the one the user is clicking in. launchd
     // picks up ~/Library/LaunchAgents plists at the next login.

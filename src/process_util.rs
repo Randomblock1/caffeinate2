@@ -38,7 +38,16 @@ pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
 
     match get_process_start_time(pid) {
         Some(actual_start_time) => actual_start_time == start_time,
-        None => true,
+        None => {
+            // Fail open: kill(pid, 0) already showed a live process, and
+            // dropping a live holder on a transient proc_pidinfo failure would
+            // incorrectly re-enable sleep. This only weakens recycled-pid
+            // detection until the next reconcile.
+            eprintln!(
+                "warning: could not read start time for live pid {pid}; keeping holder for now"
+            );
+            true
+        }
     }
 }
 
