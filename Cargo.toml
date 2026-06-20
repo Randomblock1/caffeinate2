@@ -37,12 +37,29 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSGraphicsContext",
     "NSWorkspace",
     "NSRunningApplication",
+    # Program-picker window ("Wait for apps…"). NSImage is load-bearing:
+    # NSWorkspace::iconForFile: and NSRunningApplication::icon() are gated on it.
+    "NSWindow",
+    "NSPanel",
     "NSOpenPanel",
-    "objc2-uniform-type-identifiers",
-] }
-objc2-uniform-type-identifiers = { version = "0.3", optional = true, features = [
-    "UTType",
-    "UTCoreTypes",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSTextField",
+    "NSSearchField",
+    "NSSegmentedControl",
+    "NSTableView",
+    "NSTableColumn",
+    "NSTableCellView",
+    "NSUserInterfaceItemIdentification",
+    "NSScrollView",
+    "NSStackView",
+    "NSImage",
+    "NSImageView",
+    "NSColor",
+    "NSCell",
+    "NSLayoutConstraint",
+    "NSLayoutAnchor",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString",
@@ -67,7 +84,6 @@ tray = [
     "dep:block2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
-    "dep:objc2-uniform-type-identifiers",
 ]
 full = ["tray", "helper-bin"]
 

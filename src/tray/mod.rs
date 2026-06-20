@@ -4,6 +4,8 @@ mod app;
 mod menu;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 mod state;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+mod wait_window;
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub use app::run;

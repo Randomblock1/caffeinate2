@@ -1,17 +1,21 @@
-use crate::macos_apps;
 use crate::sleep_mode::SleepMode;
-use crate::tray::menu::{
-    MenuAction, build_menu, handle_choose_app, handle_menu_event, install_menu,
-    running_apps_menu_key,
-};
+use crate::tray::menu::{MenuAction, build_menu, handle_menu_event, install_menu};
 use crate::tray::state::AppState;
+use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use crate::tray_icons;
+use objc2_foundation::MainThreadMarker;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
 fn poll_stop_conditions(state: &mut AppState) -> bool {
-    state.check_timeout() || state.check_app_watch()
+    // `|` (not `||`): every poll must run each tick. `check_app_watch` and
+    // `poll_upgrade` both maintain per-tick state (app-seen, clear debounce),
+    // so short-circuiting would skip the watcher whenever the timer fires.
+    let timeout = state.check_timeout();
+    let app_watch = state.check_app_watch();
+    let upgrade = state.poll_upgrade();
+    timeout | app_watch | upgrade
 }
 
 pub fn run() -> Result<(), String> {
@@ -29,12 +33,17 @@ pub fn run() -> Result<(), String> {
 
     // Everything below runs on the main thread only; muda menu items are not
     // Send, so no locking or sharing is involved.
+    let mtm = MainThreadMarker::new().ok_or("tray must run on the main thread")?;
     let mut state = AppState::new();
-    let running_apps = macos_apps::running_app_choices();
     let initial = state.menu_snapshot();
-    let mut menu_apps_key = running_apps_menu_key(&running_apps);
 
-    let (menu, initial_handles) = build_menu(&initial, &running_apps);
+    // The picker window reports its result back over this channel, drained at
+    // the top of the loop so the selection is applied outside the button
+    // action (which runs re-entrantly inside the shared event pump).
+    let (wait_tx, wait_rx) = std::sync::mpsc::channel::<WaitWindowMsg>();
+    let mut wait_window: Option<WaitWindow> = None;
+
+    let (menu, initial_handles) = build_menu(&initial);
     let tray = TrayIconBuilder::new()
         .with_icon(icon_off)
         .with_icon_as_template(true)
@@ -55,10 +64,12 @@ pub fn run() -> Result<(), String> {
         }
 
         while let Ok(event) = menu_events.try_recv() {
-            if event.id == handles.choose_app_id {
-                if let Some(apps) = handle_choose_app(&mut state, &tray) {
-                    menu_apps_key = running_apps_menu_key(&apps);
-                    handles = install_menu(&tray, &state.menu_snapshot(), &apps);
+            if event.id == handles.wait_for_apps_id {
+                // Modeless: open it (if not already up) and let the existing
+                // pump drive it. Don't act on the selection here.
+                if wait_window.is_none() {
+                    let selected = state.menu_snapshot().wait_for_apps;
+                    wait_window = Some(wait_window::open(mtm, &selected, wait_tx.clone()));
                 }
                 continue;
             }
@@ -67,6 +78,22 @@ pub fn run() -> Result<(), String> {
                 MenuAction::Quit => break 'main,
                 MenuAction::Handled | MenuAction::Unhandled => {}
             }
+        }
+
+        // Apply the picker's result once it closes (see `wait_tx` above).
+        while let Ok(msg) = wait_rx.try_recv() {
+            if let WaitWindowMsg::Apply(targets) = msg {
+                if let Err(e) = state.set_wait_for_apps(targets) {
+                    eprintln!("{e}");
+                } else if state.is_on() {
+                    state.invalidate_tooltip();
+                    state.update_tooltip(&tray);
+                }
+                // Rebuild so the "(N selected)" label updates.
+                handles = install_menu(&tray, &state.menu_snapshot());
+            }
+            // The window has closed itself; drop our handle to release it.
+            wait_window = None;
         }
 
         while let Ok(event) = tray_events.try_recv() {
@@ -106,13 +133,19 @@ pub fn run() -> Result<(), String> {
             }
         }
 
-        if workspace_dirty.swap(false, Ordering::Relaxed) {
-            let apps = macos_apps::running_app_choices();
-            let key = running_apps_menu_key(&apps);
-            if key != menu_apps_key {
-                menu_apps_key = key;
-                handles = install_menu(&tray, &state.menu_snapshot(), &apps);
-            }
+        // App launch/quit wakes the loop (so `check_app_watch` runs promptly).
+        // If the picker is open, re-scan its list so newly launched or quit
+        // programs appear/disappear live.
+        if workspace_dirty.swap(false, Ordering::Relaxed)
+            && let Some(window) = wait_window.as_ref()
+        {
+            window.refresh();
+        }
+
+        // The watcher changes the menu's structure (the "Upgrading…" entries)
+        // outside of any user action, so rebuild when it flags a change.
+        if state.take_menu_dirty() {
+            handles = install_menu(&tray, &state.menu_snapshot());
         }
 
         crate::macos_activation::pump_event_loop(state.pump_timeout());

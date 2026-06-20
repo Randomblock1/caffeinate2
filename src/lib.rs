@@ -17,6 +17,8 @@ pub mod macos_activation;
 pub mod macos_apps;
 #[cfg(target_os = "macos")]
 pub mod power_management;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+pub mod process_enum;
 #[cfg(target_os = "macos")]
 pub mod process_util;
 #[cfg(target_os = "macos")]
