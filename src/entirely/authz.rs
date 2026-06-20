@@ -25,7 +25,15 @@ fn user_for_uid(uid: libc::uid_t) -> Option<User> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let ret = unsafe { libc::getpwuid_r(uid, &raw mut pwd, buf.as_mut_ptr(), buf.len(), &raw mut result) };
+    let ret = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &raw mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut result,
+        )
+    };
     if ret != 0 || result.is_null() {
         return None;
     }
@@ -89,7 +97,7 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
 
 /// Whether `uid` may take an entirely-mode hold. Fails closed: any failure
 /// to resolve the user or their groups denies.
-#[must_use] 
+#[must_use]
 pub fn uid_may_hold(uid: libc::uid_t) -> bool {
     if uid == 0 {
         return true;
@@ -108,7 +116,7 @@ pub fn uid_may_hold(uid: libc::uid_t) -> bool {
 /// Denial message sent to the client; starts with the
 /// [`crate::entirely::helper_ipc::is_authorization_error`] prefix and includes the
 /// exact grant command for this user.
-#[must_use] 
+#[must_use]
 pub fn denial_message(uid: libc::uid_t) -> String {
     let who = user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| user.name);
     format!(

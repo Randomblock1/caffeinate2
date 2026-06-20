@@ -252,7 +252,9 @@ pub fn dispatch_command(
             if enable {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling sleep upgrade…)"));
                 state.invalidate_tooltip();
-                crate::tray::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(
+                    std::time::Duration::from_millis(1),
+                ));
             }
             match state.set_upgrade_external(enable) {
                 Ok(()) => {
@@ -275,7 +277,9 @@ pub fn dispatch_command(
             if state.is_on() && mode == SleepMode::Entirely {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                 state.invalidate_tooltip();
-                crate::tray::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(
+                    std::time::Duration::from_millis(1),
+                ));
             }
             match state.set_mode(mode) {
                 Ok(()) => state.set_icon(tray),

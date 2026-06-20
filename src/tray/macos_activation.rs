@@ -51,7 +51,7 @@ pub fn wake_event_loop() {
 /// Forward tray/menu events to channels. `tray-icon` and `muda` only deliver
 /// events through `set_event_handler`; `receiver()` is disabled once a handler is set.
 #[cfg(all(target_os = "macos", feature = "tray"))]
-#[must_use] 
+#[must_use]
 pub fn install_tray_event_handlers() -> (
     std::sync::mpsc::Receiver<tray_icon::TrayIconEvent>,
     std::sync::mpsc::Receiver<muda::MenuEvent>,

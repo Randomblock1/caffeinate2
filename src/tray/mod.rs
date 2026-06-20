@@ -1,7 +1,7 @@
 #[cfg(all(target_os = "macos", feature = "tray"))]
-pub mod app_target;
-#[cfg(all(target_os = "macos", feature = "tray"))]
 mod app;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+pub mod app_target;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod macos_activation;
 #[cfg(all(target_os = "macos", feature = "tray"))]

@@ -64,12 +64,12 @@ pub fn resolve_helper_source() -> Result<PathBuf, String> {
     resolve_sibling_binary("caffeinate2-helper", HELPER_BINARY_HINT)
 }
 
-#[must_use] 
+#[must_use]
 pub fn helper_plist_content(helper_path: &Path) -> String {
     HELPER_PLIST_TEMPLATE.replace("__HELPER_PATH__", &helper_path.display().to_string())
 }
 
-#[must_use] 
+#[must_use]
 pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
     TRAY_PLIST_TEMPLATE.replace("__TRAY_PATH__", &tray_path.display().to_string())
 }
@@ -254,7 +254,7 @@ pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn tray_launch_agent_installed() -> bool {
     tray_launch_agent_path()
         .map(|p| p.exists())

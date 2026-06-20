@@ -1,8 +1,8 @@
 use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::menu::{MenuAction, build_menu, handle_menu_event, install_menu};
 use crate::tray::state::AppState;
-use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use crate::tray::tray_icons;
+use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use objc2_foundation::MainThreadMarker;
 use std::sync::atomic::Ordering;
 use std::time::Duration;

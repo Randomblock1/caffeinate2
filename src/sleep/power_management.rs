@@ -27,7 +27,7 @@ pub enum AssertionType {
 }
 
 impl AssertionType {
-    #[must_use] 
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::PreventUserIdleDisplaySleep => "PreventUserIdleDisplaySleep",
@@ -75,9 +75,7 @@ pub fn create_assertion(
     if status == 0 {
         let id = unsafe { id.assume_init() };
         if verbose {
-            println!(
-                "Successfully created power management assertion with ID: {id}"
-            );
+            println!("Successfully created power management assertion with ID: {id}");
         }
         Ok(PowerAssertion { id, verbose })
     } else {
@@ -87,9 +85,7 @@ pub fn create_assertion(
 
 fn release_assertion(assertion_id: u32, verbose: bool) {
     if verbose {
-        println!(
-            "Releasing power management assertion with ID: {assertion_id}"
-        );
+        println!("Releasing power management assertion with ID: {assertion_id}");
     }
 
     let status = IOPMAssertionRelease(assertion_id).cast_unsigned();
@@ -113,9 +109,7 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
             }
         }
         _ => {
-            eprintln!(
-                "Failed to release power management assertion with code: {status:X}"
-            );
+            eprintln!("Failed to release power management assertion with code: {status:X}");
         }
     }
 }
@@ -330,7 +324,9 @@ fn cf_number_i32(number: &CFNumber) -> Option<i32> {
 
 fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
     let value = cf_ref(unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
-    value.downcast_ref::<CFString>().map(std::string::ToString::to_string)
+    value
+        .downcast_ref::<CFString>()
+        .map(std::string::ToString::to_string)
 }
 
 fn dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {

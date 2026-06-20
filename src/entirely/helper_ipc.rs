@@ -190,7 +190,7 @@ impl Default for HelperClient {
 }
 
 impl HelperClient {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             socket_path: HELPER_SOCKET_PATH.to_string(),
@@ -205,7 +205,7 @@ impl HelperClient {
         UnixStream::connect(&self.socket_path).map_err(|e| format!("connect failed: {e}"))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_available(&self) -> bool {
         self.try_connect().is_ok()
     }
@@ -219,7 +219,7 @@ impl HelperClient {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn is_connect_error(message: &str) -> bool {
     message.starts_with("connect failed:")
 }
@@ -229,7 +229,7 @@ pub fn is_connect_error(message: &str) -> bool {
 ///
 /// Distinct from the helper being unreachable or failing. Matches the prefix
 /// used by [`crate::entirely::authz::denial_message`].
-#[must_use] 
+#[must_use]
 pub fn is_authorization_error(message: &str) -> bool {
     message.starts_with("not authorized")
 }
@@ -303,7 +303,9 @@ fn write_response_on_stream(
 /// # Errors
 ///
 /// Returns an error if the peer PID or process start time cannot be read.
-pub fn peer_process_id(stream: &UnixStream) -> Result<crate::entirely::lockfile::ProcessId, String> {
+pub fn peer_process_id(
+    stream: &UnixStream,
+) -> Result<crate::entirely::lockfile::ProcessId, String> {
     use nix::sys::socket::getsockopt;
     use nix::sys::socket::sockopt::LocalPeerPid;
 
@@ -360,10 +362,7 @@ fn serve_connection_inner(
     let request = match read_request_line(&mut stream) {
         Ok(req) => req,
         Err(e) => {
-            return write_response_on_stream(
-                &mut stream,
-                &HelperResponse::Error { message: e },
-            );
+            return write_response_on_stream(&mut stream, &HelperResponse::Error { message: e });
         }
     };
 

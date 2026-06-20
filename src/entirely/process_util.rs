@@ -3,18 +3,12 @@ use libc::{PROC_PIDTBSDINFO, proc_bsdinfo, proc_pidinfo};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
-#[must_use] 
+#[must_use]
 pub fn get_process_start_time(pid: i32) -> Option<ProcessStartTime> {
     unsafe {
         let mut info = std::mem::zeroed::<proc_bsdinfo>();
         let size = i32::try_from(std::mem::size_of::<proc_bsdinfo>()).unwrap_or(i32::MAX);
-        let ret = proc_pidinfo(
-            pid,
-            PROC_PIDTBSDINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        );
+        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size);
         if ret == size {
             Some(ProcessStartTime {
                 seconds: info.pbi_start_tvsec,
@@ -26,9 +20,12 @@ pub fn get_process_start_time(pid: i32) -> Option<ProcessStartTime> {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
-    let is_alive = !matches!(kill(Pid::from_raw(pid), None), Err(nix::errno::Errno::ESRCH));
+    let is_alive = !matches!(
+        kill(Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
 
     if !is_alive {
         return false;
@@ -53,7 +50,9 @@ pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
 /// # Errors
 ///
 /// Returns an error if the process start time cannot be determined.
-pub fn process_id_from_pid(pid: i32) -> Result<crate::entirely::lockfile::ProcessId, std::io::Error> {
+pub fn process_id_from_pid(
+    pid: i32,
+) -> Result<crate::entirely::lockfile::ProcessId, std::io::Error> {
     let start_time = get_process_start_time(pid)
         .ok_or_else(|| std::io::Error::other("Failed to determine process start time"))?;
     Ok(crate::entirely::lockfile::ProcessId { pid, start_time })

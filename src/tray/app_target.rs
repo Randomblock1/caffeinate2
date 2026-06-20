@@ -25,7 +25,7 @@ pub enum WatchTarget {
 
 impl WatchTarget {
     /// Human-readable label for tooltips and the picker.
-    #[must_use] 
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Bundle { name, .. } | Self::Executable { name, .. } => name,
@@ -34,7 +34,7 @@ impl WatchTarget {
 
     /// Stable identity used to dedup targets and to match checkbox rows across
     /// rebuilds: the bundle id for an app, the executable path otherwise.
-    #[must_use] 
+    #[must_use]
     pub fn key(&self) -> &str {
         match self {
             Self::Bundle { bundle_id, .. } => bundle_id,
@@ -43,7 +43,7 @@ impl WatchTarget {
     }
 
     /// Lift a legacy single-app target into the multi-select model.
-    #[must_use] 
+    #[must_use]
     pub fn from_app_target(app: AppTarget) -> Self {
         Self::Bundle {
             bundle_id: app.bundle_id,
