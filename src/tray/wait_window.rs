@@ -26,6 +26,7 @@ use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSPoint,
     NSRect, NSSize, NSString,
 };
+use objc2_uniform_type_identifiers::UTTypeApplicationBundle;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
@@ -290,10 +291,8 @@ impl WaitController {
         panel.setTreatsFilePackagesAsDirectories(false);
         panel.setTitle(Some(&NSString::from_str("Choose application")));
         panel.setPrompt(Some(&NSString::from_str("Choose")));
-        let app_extension = NSString::from_str("app");
-        let app_types = NSArray::arrayWithObject(&*app_extension);
-        #[allow(deprecated)]
-        panel.setAllowedFileTypes(Some(&app_types));
+        let app_types = unsafe { NSArray::arrayWithObject(UTTypeApplicationBundle) };
+        panel.setAllowedContentTypes(&app_types);
 
         if panel.runModal() != NSModalResponseOK {
             return;
@@ -351,7 +350,9 @@ impl WaitController {
         let mtm = self.ivars().mtm;
         let (title, icon_path, checked) = {
             let all = self.ivars().all.borrow();
-            let prog = &all[all_index];
+            let Some(prog) = all.get(all_index) else {
+                return self.child_cell("Program list changed; refresh to reload", 0);
+            };
             let title = if prog.procs.len() > 1 {
                 format!("{}  ({} processes)", prog.name, prog.procs.len())
             } else {

@@ -6,6 +6,7 @@ use crate::process_enum;
 use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
 use crate::tray_icons;
 use crate::tray_mode::{self, TrayConfig};
+use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
 
@@ -507,14 +508,16 @@ impl AppState {
                     let _ = self.save_config();
                     return Err(error);
                 }
-                // launchd starts the helper asynchronously; wait for the socket
-                // so the watcher's first hold doesn't re-trigger the prompt.
-                for _ in 0..25 {
-                    if client.is_available() {
-                        break;
+                // launchd starts the helper asynchronously. Let the socket check
+                // finish off the UI thread; the watcher will retry on its poll.
+                thread::spawn(move || {
+                    for _ in 0..25 {
+                        if client.is_available() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(200));
                     }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+                });
             }
         } else {
             // Drop any "Ignoring…" entries; the menu rebuild removes them.

@@ -92,12 +92,9 @@ fn proc_path(pid: i32) -> String {
 
 /// Read a NUL-terminated fixed C-char array (`pbi_name`/`pbi_comm`).
 fn cstr_field(bytes: &[libc::c_char]) -> String {
-    let raw: Vec<u8> = bytes
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    String::from_utf8_lossy(&raw).into_owned()
+    let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), bytes.len()) };
+    let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
 /// Every live process with pid/ppid/uid and its executable path. Drops PIDs

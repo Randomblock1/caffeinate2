@@ -60,6 +60,11 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSCell",
     "NSLayoutConstraint",
     "NSLayoutAnchor",
+    "objc2-uniform-type-identifiers",
+] }
+objc2-uniform-type-identifiers = { version = "0.3.2", optional = true, default-features = false, features = [
+    "UTCoreTypes",
+    "UTType",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString",
@@ -83,6 +88,7 @@ tray = [
     "dep:muda",
     "dep:block2",
     "dep:objc2-app-kit",
+    "dep:objc2-uniform-type-identifiers",
     "dep:objc2-foundation",
 ]
 full = ["tray", "helper-bin"]
