@@ -3,7 +3,7 @@ use nix::fcntl::{Flock, FlockArg, OFlag};
 use nix::sys::stat::{Mode, fchmod, fstat, lstat};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -121,15 +121,16 @@ fn write_holder_set(
     file: &mut Flock<File>,
     pids: &HashSet<ProcessId>,
 ) -> Result<(), std::io::Error> {
-    
-
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    let mut writer = BufWriter::new(&mut **file);
+    let mut content = String::new();
     for p in pids {
-        writeln!(writer, "{p}")?;
+        content.push_str(&format!("{p}\n"));
     }
-    writer.flush()?;
+    // Write the full snapshot before truncating so a crash mid-update is less
+    // likely to leave an empty lockfile while SleepDisabled is still on.
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.set_len(content.len() as u64)?;
+    file.sync_all()?;
     Ok(())
 }
 

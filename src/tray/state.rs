@@ -428,15 +428,19 @@ impl AppState {
         }
         let previous_mode = self.config.mode;
         if self.is_on() {
-            let started_by_upgrade = self
+            let was_upgrade = self
                 .session
                 .as_ref()
                 .is_some_and(|session| session.started_by_upgrade);
             self.stop_session();
             self.config.mode = mode;
-            if let Err(error) = self.start_session_with(mode, started_by_upgrade) {
+            if was_upgrade {
+                // Explicit mode change takes manual control away from the watcher.
+                self.upgrade_overridden = true;
+            }
+            if let Err(error) = self.start_session_with(mode, false) {
                 self.config.mode = previous_mode;
-                let _ = self.start_session_with(previous_mode, started_by_upgrade);
+                let _ = self.start_session_with(previous_mode, false);
                 return Err(error);
             }
         } else {
@@ -635,7 +639,9 @@ impl AppState {
                         true
                     }
                     Err(error) => {
-                        self.upgrade_failed = true;
+                        if matches!(error, EnableError::NotAuthorized(_)) {
+                            self.upgrade_failed = true;
+                        }
                         eprintln!("upgrade external wakefulness failed: {error}");
                         false
                     }

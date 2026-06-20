@@ -6,11 +6,13 @@ use caffeinate2::entirely::helper_ipc::{self, serve_connection};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_os = "macos")]
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -33,9 +35,9 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("failed to set socket permissions: {e}"))?;
     let coordinator = Arc::new(EntirelyCoordinator::helper_daemon(verbose));
 
-    // The lockfile is the source of truth for holds and survives helper
-    // restarts. Re-sync the global SleepDisabled setting with whatever it says
-    // is still alive, so a helper crash can't leave sleep stuck disabled.
+    // Re-sync the global SleepDisabled setting with whatever the lockfile says
+    // is still alive. An empty lockfile does not force re-enable sleep, since
+    // that could undo an unrelated manual `pmset disablesleep`.
     if let Err(e) = coordinator.reconcile_startup() {
         eprintln!("startup reconcile failed: {e}");
     }
@@ -54,6 +56,7 @@ fn run() -> Result<(), String> {
 
     eprintln!("caffeinate2-helper listening on {socket_path}");
 
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -62,10 +65,16 @@ fn run() -> Result<(), String> {
                 continue;
             }
         };
-        // Serve each connection on its own thread so a slow client can't
-        // stall the others.
+        let active = active_connections.load(Ordering::Relaxed);
+        if active >= MAX_CONCURRENT_CONNECTIONS {
+            eprintln!("connection rejected: too many concurrent clients");
+            continue;
+        }
+        active_connections.fetch_add(1, Ordering::Relaxed);
         let coordinator = Arc::clone(&coordinator);
+        let active_connections = Arc::clone(&active_connections);
         std::thread::spawn(move || {
+            let _guard = ConnectionGuard(active_connections);
             if let Err(e) = serve_connection(stream, &coordinator) {
                 eprintln!("connection error: {e}");
             }
@@ -73,6 +82,14 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

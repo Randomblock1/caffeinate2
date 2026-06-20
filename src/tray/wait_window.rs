@@ -12,15 +12,16 @@
 use crate::tray::app_target::WatchTarget;
 use crate::tray::macos_apps;
 use crate::tray::process_enum::{self, BundleRef, ProgramRow};
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
     NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSImage,
-    NSImageView, NSModalResponseOK, NSOpenPanel, NSScrollView, NSSearchField, NSTableColumn,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSImageView, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSScrollView, NSSearchField,
+    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSPoint,
@@ -282,28 +283,7 @@ impl WaitController {
         self.rebuild();
     }
 
-    fn choose_app(&self) {
-        let panel = NSOpenPanel::openPanel(self.ivars().mtm);
-        panel.setCanChooseFiles(false);
-        panel.setCanChooseDirectories(true);
-        panel.setAllowsMultipleSelection(false);
-        panel.setResolvesAliases(true);
-        panel.setTreatsFilePackagesAsDirectories(false);
-        panel.setTitle(Some(&NSString::from_str("Choose application")));
-        panel.setPrompt(Some(&NSString::from_str("Choose")));
-        let app_types = unsafe { NSArray::arrayWithObject(UTTypeApplicationBundle) };
-        panel.setAllowedContentTypes(&app_types);
-
-        if panel.runModal() != NSModalResponseOK {
-            return;
-        }
-        let urls = panel.URLs();
-        if urls.count() == 0 {
-            return;
-        }
-        let Some(path) = urls.objectAtIndex(0).path().map(|path| path.to_string()) else {
-            return;
-        };
+    fn apply_chosen_app_path(&self, path: String) {
         let Some(app) = macos_apps::bundle_from_app_path(&path) else {
             return;
         };
@@ -321,6 +301,40 @@ impl WaitController {
         }
         drop(all);
         self.rebuild();
+    }
+
+    fn choose_app(&self) {
+        let panel = NSOpenPanel::openPanel(self.ivars().mtm);
+        panel.setCanChooseFiles(false);
+        panel.setCanChooseDirectories(true);
+        panel.setAllowsMultipleSelection(false);
+        panel.setResolvesAliases(true);
+        panel.setTreatsFilePackagesAsDirectories(false);
+        panel.setTitle(Some(&NSString::from_str("Choose application")));
+        panel.setPrompt(Some(&NSString::from_str("Choose")));
+        let app_types = unsafe { NSArray::arrayWithObject(UTTypeApplicationBundle) };
+        panel.setAllowedContentTypes(&app_types);
+
+        let Some(window) = self.ivars().window.borrow().clone() else {
+            return;
+        };
+        let controller = self.retain();
+        let panel_for_handler = panel.clone();
+        let handler = RcBlock::new(move |response: NSModalResponse| {
+            if response != NSModalResponseOK {
+                return;
+            }
+            let urls = panel_for_handler.URLs();
+            if urls.count() == 0 {
+                return;
+            }
+            let Some(path) = urls.objectAtIndex(0).path().map(|path| path.to_string()) else {
+                return;
+            };
+            controller.apply_chosen_app_path(path);
+            crate::tray::macos_activation::wake_event_loop();
+        });
+        panel.beginSheetModalForWindow_completionHandler(&window, &handler);
     }
 
     fn close_window(&self) {
@@ -469,11 +483,7 @@ fn not_running_row(target: WatchTarget, icon_path: String) -> ProgramRow {
     }
 }
 
-fn install_wait_window_header(
-    mtm: MainThreadMarker,
-    content: &NSView,
-    target: &AnyObject,
-) -> f64 {
+fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &AnyObject) -> f64 {
     let search = NSSearchField::new(mtm);
     search.setFrame(rect(MARGIN, WIN_H - MARGIN - 24.0, INNER_W, 24.0));
     unsafe {

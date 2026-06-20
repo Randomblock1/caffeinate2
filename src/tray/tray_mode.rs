@@ -119,15 +119,25 @@ pub fn config_path() -> Result<std::path::PathBuf, String> {
         .join("tray.toml"))
 }
 
-#[must_use] 
+#[must_use]
 pub fn load_config() -> TrayConfig {
     let Ok(path) = config_path() else {
         return TrayConfig::default();
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = std::fs::read_to_string(&path) else {
         return TrayConfig::default();
     };
-    let mut config: TrayConfig = toml::from_str(&content).unwrap_or_default();
+    let parsed = toml::from_str::<TrayConfig>(&content);
+    let mut config = match parsed {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "Warning: could not parse {} ({error}); using defaults",
+                path.display()
+            );
+            TrayConfig::default()
+        }
+    };
     config.normalize_legacy();
     config
 }

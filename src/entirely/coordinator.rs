@@ -12,7 +12,7 @@ pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
 
 pub type SleepDisabler = Arc<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
 
-#[must_use] 
+#[must_use]
 pub fn helper_lock_path() -> PathBuf {
     PathBuf::from(HELPER_LOCK_PATH)
 }
@@ -170,6 +170,15 @@ impl EntirelyCoordinator {
                 eprintln!("Last holder released. Re-enabling system sleep globally.");
             }
             if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
+                // Mirror hold(): restore the lockfile entry when re-enabling sleep
+                // fails so we don't drop the last holder while SleepDisabled stays on.
+                let _ = lockfile::update_lockfile(
+                    true,
+                    inner.verbose,
+                    &inner.lock_file_path,
+                    inner.process_checker.as_ref(),
+                    &process_id,
+                );
                 return Err(std::io::Error::other(format!(
                     "Failed to re-enable sleep (IOKit error: {code:X})"
                 ))
@@ -190,10 +199,10 @@ impl EntirelyCoordinator {
     /// force the enable direction on an empty lockfile because that is
     /// indistinguishable from a manual `pmset disablesleep` made outside of
     /// caffeinate2.
-///
-/// # Errors
-///
-/// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile_startup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reconcile_with(true)
     }
@@ -204,10 +213,10 @@ impl EntirelyCoordinator {
     /// Only acts when the desired state differs from the state this
     /// coordinator last applied, so it doesn't fight a manual
     /// `pmset disablesleep` made outside of any holds.
-///
-/// # Errors
-///
-/// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reconcile_with(false)
     }
@@ -259,7 +268,7 @@ impl EntirelyCoordinator {
         )?;
         Ok(EntirelyStatus {
             holders,
-            sleep_disabled: inner.sleep_disabled.load(Ordering::SeqCst),
+            sleep_disabled: holders > 0 || inner.sleep_disabled.load(Ordering::SeqCst),
         })
     }
 
@@ -481,6 +490,46 @@ mod tests {
 
         assert_eq!(release_attempts.load(Ordering::Relaxed), 2);
         assert_eq!(*sleep_calls.lock().unwrap(), vec![true, false, false]);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn release_enable_failure_restores_lockfile_entry() {
+        let lock_path = temp_lock_path();
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let release_attempts_clone = release_attempts.clone();
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            if !state && release_attempts_clone.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(0xE000_02C1u32);
+            }
+            Ok(())
+        });
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        let mut guard = coordinator.hold_current_process().unwrap();
+        assert!(guard.release().is_err());
+        assert!(
+            !std::fs::read_to_string(&lock_path)
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "holder should remain in lockfile after failed re-enable"
+        );
+        drop(guard);
+
+        assert_eq!(release_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![true, false, false]);
+        let content = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(content.trim().is_empty());
         let _ = std::fs::remove_file(&lock_path);
     }
 

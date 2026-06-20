@@ -11,8 +11,12 @@ pub enum WaitMode {
     UntilInterrupt,
 }
 
-pub const fn wait_mode(args: &Args) -> WaitMode {
-    if args.command.is_some() {
+pub fn wait_mode(args: &Args) -> WaitMode {
+    if args
+        .command
+        .as_ref()
+        .is_some_and(|command| !command.is_empty())
+    {
         WaitMode::Command
     } else {
         match (args.timeout.is_some(), args.waitfor.is_some()) {
@@ -22,6 +26,38 @@ pub const fn wait_mode(args: &Args) -> WaitMode {
             (false, false) => WaitMode::UntilInterrupt,
         }
     }
+}
+
+/// Detect `-t 1 hour ...` style invocations where clap parsed trailing duration
+/// tokens as a command instead of part of the timeout string.
+#[must_use]
+pub fn misquoted_duration_error(args: &Args) -> Option<String> {
+    let timeout = args.timeout.as_deref()?;
+    let command = args.command.as_ref()?;
+    if command.is_empty() {
+        return None;
+    }
+
+    const DURATION_WORDS: &[&str] = &[
+        "hour", "hours", "hr", "hrs", "minute", "minutes", "min", "mins", "second", "seconds",
+        "sec", "secs", "day", "days", "week", "weeks", "month", "months", "year", "years", "and",
+    ];
+
+    let timeout_is_lone_number = timeout.parse::<u64>().is_ok();
+    let command_has_duration_words = command.iter().any(|word| {
+        let lower = word.to_lowercase();
+        DURATION_WORDS.contains(&lower.as_str())
+            || matches!(word.as_str(), "m" | "h" | "d" | "w" | "s")
+    });
+
+    if timeout_is_lone_number && command_has_duration_words {
+        let suggested = format!("{timeout} {}", command.join(" "));
+        return Some(format!(
+            "Error: multi-word durations must be quoted (did you mean: caffeinate2 -t \"{suggested}\")?"
+        ));
+    }
+
+    None
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,8 +149,8 @@ pub fn wait_for_pid(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::parse_args;
+    use super::*;
 
     #[test]
     fn wait_for_pid_rejects_non_positive_pids() {
@@ -139,6 +175,14 @@ mod tests {
     fn wait_status_decodes_signal_death() {
         assert_eq!(exit_code_from_wait_status(libc::SIGTERM), 128 + 15);
         assert_eq!(exit_code_from_wait_status(libc::SIGKILL), 128 + 9);
+    }
+
+    #[test]
+    fn misquoted_duration_is_detected() {
+        let args = parse_args(&["caffeinate2", "-t", "1", "hour", "and", "30", "minutes"]);
+        let message = misquoted_duration_error(&args).expect("should detect misquoted duration");
+        assert!(message.contains("multi-word durations must be quoted"));
+        assert!(message.contains("-t \"1 hour and 30 minutes\""));
     }
 
     #[test]

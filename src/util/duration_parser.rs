@@ -30,8 +30,9 @@ pub fn parse_duration(duration: &str) -> Result<SignedDuration, String> {
 fn parse_human_duration(duration: &str) -> Result<std::time::Duration, humantime::DurationError> {
     match humantime::parse_duration(duration) {
         Ok(duration) => Ok(duration),
-        Err(error) => duration_without_connectors(duration)
-            .map_or(Err(error), |normalized| humantime::parse_duration(&normalized)),
+        Err(error) => duration_without_connectors(duration).map_or(Err(error), |normalized| {
+            humantime::parse_duration(&normalized)
+        }),
     }
 }
 
@@ -55,6 +56,18 @@ fn duration_without_connectors(duration: &str) -> Option<String> {
 /// Human-readable duration for CLI messages (e.g. "1 hour 30 minutes").
 #[must_use]
 pub fn format_duration_human(duration: SignedDuration) -> String {
+    if duration <= SignedDuration::ZERO {
+        return "0 seconds".to_string();
+    }
+
+    let total_ms = duration.as_millis();
+    if total_ms > 0 && total_ms < 1_000 {
+        return format!(
+            "{total_ms} millisecond{}",
+            if total_ms == 1 { "" } else { "s" }
+        );
+    }
+
     let seconds = duration.as_secs() % 60;
     let minutes = duration.as_mins() % 60;
     let hours = duration.as_hours() % 24;
@@ -90,7 +103,7 @@ pub fn format_duration_human(duration: SignedDuration) -> String {
 }
 
 /// Compact remaining-time label for tray tooltips (e.g. "1h 30m remaining").
-#[must_use] 
+#[must_use]
 pub fn format_remaining_secs(secs: u64) -> String {
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;
@@ -117,6 +130,18 @@ mod tests {
     const MINUTE: i64 = 60 * SECOND;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
+
+    #[test]
+    fn format_duration_human_shows_sub_second_durations() {
+        assert_eq!(
+            format_duration_human(SignedDuration::from_millis(250)),
+            "250 milliseconds"
+        );
+        assert_eq!(
+            format_duration_human(SignedDuration::from_millis(1)),
+            "1 millisecond"
+        );
+    }
 
     #[test]
     fn format_duration_human_omits_zero_components() {

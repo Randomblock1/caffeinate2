@@ -8,6 +8,10 @@ use caffeinate2::util::duration_parser;
 #[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
+use cli::wait::{
+    WaitForPidError, WaitForPidResult, WaitMode, misquoted_duration_error, wait_for_pid, wait_mode,
+};
+#[cfg(target_os = "macos")]
 use cli::{Args, MaintenanceCommand};
 #[cfg(target_os = "macos")]
 use nix::sys::signal::{Signal, kill};
@@ -28,8 +32,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::thread;
-#[cfg(target_os = "macos")]
-use cli::wait::{WaitForPidError, WaitForPidResult, WaitMode, wait_for_pid, wait_mode};
 
 #[cfg(target_os = "macos")]
 const SHORT_TIME_FMT: &str = "at %-I:%M:%S %p";
@@ -37,10 +39,7 @@ const SHORT_TIME_FMT: &str = "at %-I:%M:%S %p";
 const LONG_TIME_FMT: &str = "on %B %-d at %-I:%M:%S %p";
 
 #[cfg(target_os = "macos")]
-fn release_active_and_exit(
-    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
-    code: i32,
-) -> ! {
+fn release_active_and_exit(active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>, code: i32) -> ! {
     if let Ok(mut guard) = active.lock() {
         let _ = guard.take();
     }
@@ -48,12 +47,13 @@ fn release_active_and_exit(
 }
 
 #[cfg(target_os = "macos")]
-fn command_credentials(args: &Args, active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>) -> (u32, u32) {
+fn command_credentials(
+    args: &Args,
+    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
+) -> (u32, u32) {
     if args.drop_root {
-        let uid_str =
-            std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
-        let gid_str =
-            std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
+        let uid_str = std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
+        let gid_str = std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
         let Ok(uid) = uid_str.parse::<u32>() else {
             eprintln!("Error: invalid SUDO_UID: {uid_str}");
             release_active_and_exit(active, 1);
@@ -168,14 +168,16 @@ fn run_timed_wait_mode(
     println!(".");
 
     if timeout {
-        println!(
-            "Resuming {}.",
-            if duration.as_secs() > (60 * 60 * 24) {
-                end_time.strftime(LONG_TIME_FMT)
-            } else {
-                end_time.strftime(SHORT_TIME_FMT)
-            }
-        );
+        if !waitfor {
+            println!(
+                "Resuming {}.",
+                if duration.as_secs() > (60 * 60 * 24) {
+                    end_time.strftime(LONG_TIME_FMT)
+                } else {
+                    end_time.strftime(SHORT_TIME_FMT)
+                }
+            );
+        }
         if !waitfor {
             thread::sleep(duration.try_into().expect("Duration should be valid"));
         }
@@ -201,13 +203,18 @@ fn run_timed_wait_mode(
             print!("{} ", now.strftime(SHORT_TIME_FMT));
             println!("with exit code {}", exit_code.load(Ordering::Relaxed));
         }
-        Ok(WaitForPidResult::TimedOut) => {}
+        Ok(WaitForPidResult::TimedOut) => {
+            if timeout {
+                let now = jiff::Zoned::now();
+                println!("Timeout reached {}.", now.strftime(SHORT_TIME_FMT));
+            }
+        }
         Err(WaitForPidError::InvalidPid) => {
             eprintln!("Error: invalid PID {pid}; expected a positive process ID");
             release_active_and_exit(active, 1);
         }
         Err(WaitForPidError::NotFound) => {
-            println!("PID {pid} not found");
+            eprintln!("Error: PID {pid} not found");
             // Release holds before exiting: process::exit skips destructors,
             // and an entirely-mode hold would leave system sleep disabled
             // (until the helper reaps it, or indefinitely with the root CLI
@@ -305,6 +312,11 @@ fn main() {
         process::exit(2);
     }
 
+    if let Some(message) = misquoted_duration_error(&args) {
+        eprintln!("{message}");
+        process::exit(2);
+    }
+
     let mut sleep_modes = args.sleep_modes();
     sleep_modes.apply_defaults();
 
@@ -378,15 +390,15 @@ fn main() {
     });
 
     match wait_mode(&args) {
-        WaitMode::Command => run_command_mode(
-            &args,
-            &sleep_str,
-            &active,
-            &child_pid,
-            &exit_code,
-        ),
+        WaitMode::Command => run_command_mode(&args, &sleep_str, &active, &child_pid, &exit_code),
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
-            run_timed_wait_mode(&args, parsed_timeout.as_ref(), &mut sleep_str, &active, &exit_code);
+            run_timed_wait_mode(
+                &args,
+                parsed_timeout.as_ref(),
+                &mut sleep_str,
+                &active,
+                &exit_code,
+            );
         }
         WaitMode::UntilInterrupt => {
             sleep_str += "until Ctrl+C pressed.";
