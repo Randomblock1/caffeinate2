@@ -22,6 +22,12 @@ const TRAY_PLIST_TEMPLATE: &str =
 const NEWSYSLOG_CONF_TEMPLATE: &str =
     include_str!("../../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
 
+const HELPER_BINARY_HINT: &str = "install caffeinate2 with --features full or helper-bin, \
+    use the GitHub release bundle, or place caffeinate2-helper in the same directory as caffeinate2";
+
+const CLI_BINARY_HINT: &str = "install caffeinate2 with --features full, use the GitHub release \
+    bundle, or place caffeinate2 in the same directory as caffeinate2-helper";
+
 fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -47,7 +53,7 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
 ///
 /// Returns an error if the CLI binary cannot be resolved.
 pub fn resolve_cli_binary() -> Result<PathBuf, String> {
-    resolve_sibling_binary("caffeinate2", "install caffeinate2 with --features full")
+    resolve_sibling_binary("caffeinate2", CLI_BINARY_HINT)
 }
 
 ///
@@ -55,7 +61,7 @@ pub fn resolve_cli_binary() -> Result<PathBuf, String> {
 ///
 /// Returns an error if the helper binary cannot be resolved.
 pub fn resolve_helper_source() -> Result<PathBuf, String> {
-    resolve_sibling_binary("caffeinate2-helper", "build with --features helper-bin")
+    resolve_sibling_binary("caffeinate2-helper", HELPER_BINARY_HINT)
 }
 
 #[must_use] 
@@ -328,5 +334,12 @@ mod tests {
         assert!(content.contains("/Users/test/.cargo/bin/caffeinate2-tray"));
         assert!(content.contains(TRAY_LAUNCH_AGENT_LABEL));
         assert!(!content.contains("__TRAY_PATH__"));
+    }
+
+    #[test]
+    fn helper_binary_hint_mentions_packaging_options() {
+        assert!(HELPER_BINARY_HINT.contains("--features full"));
+        assert!(HELPER_BINARY_HINT.contains("GitHub release"));
+        assert!(HELPER_BINARY_HINT.contains("caffeinate2-helper"));
     }
 }

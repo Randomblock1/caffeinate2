@@ -45,6 +45,14 @@ When a time limit is set, left-clicking to start sleep prevention automatically 
 
 Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
 
+**Start at login** writes `~/Library/LaunchAgents/com.randomblock1.caffeinate2-tray.plist` and takes effect at the next login (the tray does not start a second instance immediately). The menu toggle and the CLI flags below use the same LaunchAgent:
+
+`caffeinate2-tray --install-launch-agent`
+
+`caffeinate2-tray --uninstall-launch-agent`
+
+`caffeinate2-tray --launch-agent-status`
+
 Unsigned binaries may require running from Terminal once (right-click → Open) or allowing in Privacy & Security.
 
 ## Entirely mode (no repeated sudo)
@@ -55,6 +63,8 @@ Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid
 
 1. Tray: select **Entirely** and approve the administrator dialog when prompted, or
 2. CLI: `sudo caffeinate2 --install-helper`
+
+Helper install requires `caffeinate2-helper` next to `caffeinate2`: use `cargo install caffeinate2 --features full`, build with `--features full`, or extract the GitHub release bundle (all three binaries together).
 
 After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
 
