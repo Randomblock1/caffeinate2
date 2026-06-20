@@ -55,7 +55,7 @@ impl std::str::FromStr for ProcessId {
             seconds,
             microseconds,
         };
-        Ok(ProcessId { pid, start_time })
+        Ok(Self { pid, start_time })
     }
 }
 
@@ -101,7 +101,7 @@ fn open_validated_lockfile(path: &Path) -> Result<Flock<File>, std::io::Error> {
 
     fchmod(
         file.as_fd(),
-        Mode::from_bits_truncate(LOCK_FILE_MODE as libc::mode_t),
+        Mode::from_bits_truncate(libc::mode_t::try_from(LOCK_FILE_MODE).unwrap_or(0)),
     )
     .map_err(std::io::Error::other)?;
 
@@ -121,13 +121,13 @@ fn write_holder_set(
     file: &mut Flock<File>,
     pids: &HashSet<ProcessId>,
 ) -> Result<(), std::io::Error> {
-    use std::ops::DerefMut;
+    
 
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    let mut writer = BufWriter::new(file.deref_mut());
+    let mut writer = BufWriter::new(&mut **file);
     for p in pids {
-        writeln!(writer, "{}", p)?;
+        writeln!(writer, "{p}")?;
     }
     writer.flush()?;
     Ok(())

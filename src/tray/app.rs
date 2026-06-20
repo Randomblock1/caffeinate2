@@ -1,8 +1,8 @@
-use crate::sleep_mode::SleepMode;
+use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::menu::{MenuAction, build_menu, handle_menu_event, install_menu};
 use crate::tray::state::AppState;
 use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
-use crate::tray_icons;
+use crate::tray::tray_icons;
 use objc2_foundation::MainThreadMarker;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -18,13 +18,17 @@ fn poll_stop_conditions(state: &mut AppState) -> bool {
     timeout | app_watch | upgrade
 }
 
+///
+/// # Errors
+///
+/// Returns an error if tray setup or icon decoding fails.
 pub fn run() -> Result<(), String> {
-    crate::macos_activation::init_tray_app();
-    let (tray_events, menu_events) = crate::macos_activation::install_tray_event_handlers();
+    crate::tray::macos_activation::init_tray_app();
+    let (tray_events, menu_events) = crate::tray::macos_activation::install_tray_event_handlers();
     let (workspace_dirty, _workspace_guard) =
-        crate::macos_activation::install_workspace_observers();
+        crate::tray::macos_activation::install_workspace_observers();
     // tray-icon requires a running main-thread event loop before creating the icon.
-    crate::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
+    crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
 
     let (icon_off_rgba, icon_width, icon_height) =
         tray_icons::decode_icon_rgba(tray_icons::ICON_OFF)?;
@@ -52,7 +56,7 @@ pub fn run() -> Result<(), String> {
         .with_tooltip("caffeinate2")
         .build()
         .map_err(|e| e.to_string())?;
-    crate::macos_activation::wake_event_loop();
+    crate::tray::macos_activation::wake_event_loop();
 
     let mut handles = initial_handles;
 
@@ -119,7 +123,7 @@ pub fn run() -> Result<(), String> {
                     let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                     state.invalidate_tooltip();
                 }
-                crate::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
                 match state.toggle() {
                     Ok(()) => state.set_icon(&tray),
                     Err(e) => {
@@ -148,7 +152,7 @@ pub fn run() -> Result<(), String> {
             handles = install_menu(&tray, &state.menu_snapshot());
         }
 
-        crate::macos_activation::pump_event_loop(state.pump_timeout());
+        crate::tray::macos_activation::pump_event_loop(state.pump_timeout());
     }
 
     state.stop_session();

@@ -34,7 +34,7 @@ where
                 None
             }
         }
-        Err(_) => None,
+        Err(()) => None,
     }
 }
 
@@ -51,7 +51,7 @@ fn main() {
         if signals.forever().next().is_some() {
             let len = sleep_arr_clone.lock().unwrap().len();
             if len != 0 {
-                println!("\nSleep was detected {} times", len);
+                println!("\nSleep was detected {len} times");
                 println!(
                     "On average, slept for {} seconds",
                     sleep_arr_clone.lock().unwrap().iter().sum::<u64>() / len as u64
@@ -109,7 +109,7 @@ mod tests {
 
         // Mock: slept longer than threshold
         let result = detect_sleep_event(expected, threshold, |_| Ok(elapsed));
-        assert_eq!(result, Some(elapsed - expected));
+        assert_eq!(result, Some(elapsed.checked_sub(expected).unwrap()));
         assert_eq!(result.unwrap().as_secs(), 10);
     }
 

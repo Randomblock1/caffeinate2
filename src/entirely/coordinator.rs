@@ -1,7 +1,8 @@
-use crate::{
+use crate::entirely::{
     lockfile::{self, ProcessChecker, ProcessId},
-    power_management, process_util,
+    process_util,
 };
+use crate::sleep::power_management;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ pub const HELPER_LOCK_PATH: &str = "/var/run/caffeinate2.lock";
 
 pub type SleepDisabler = Arc<dyn Fn(bool, bool) -> Result<(), u32> + Send + Sync>;
 
+#[must_use] 
 pub fn helper_lock_path() -> PathBuf {
     PathBuf::from(HELPER_LOCK_PATH)
 }
@@ -94,6 +96,14 @@ impl EntirelyCoordinator {
         coordinator
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be updated or sleep cannot be disabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal operations mutex is poisoned.
     pub fn hold(
         &self,
         process_id: ProcessId,
@@ -133,6 +143,14 @@ impl EntirelyCoordinator {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be updated or sleep cannot be re-enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal operations mutex is poisoned.
     pub fn release(
         &self,
         process_id: ProcessId,
@@ -172,6 +190,10 @@ impl EntirelyCoordinator {
     /// force the enable direction on an empty lockfile because that is
     /// indistinguishable from a manual `pmset disablesleep` made outside of
     /// caffeinate2.
+///
+/// # Errors
+///
+/// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile_startup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reconcile_with(true)
     }
@@ -182,6 +204,10 @@ impl EntirelyCoordinator {
     /// Only acts when the desired state differs from the state this
     /// coordinator last applied, so it doesn't fight a manual
     /// `pmset disablesleep` made outside of any holds.
+///
+/// # Errors
+///
+/// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.reconcile_with(false)
     }
@@ -215,6 +241,14 @@ impl EntirelyCoordinator {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be read or pruned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal operations mutex is poisoned.
     pub fn status(&self) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
         let inner = &self.inner;
         let _ops = inner.ops.lock().expect("ops lock");
@@ -229,10 +263,14 @@ impl EntirelyCoordinator {
         })
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hold cannot be acquired for the current process.
     pub fn hold_current_process(
         &self,
     ) -> Result<EntirelyHoldGuard, Box<dyn std::error::Error + Send + Sync>> {
-        let process_id = process_util::process_id_from_pid(std::process::id() as i32)?;
+        let process_id = process_util::process_id_from_pid(std::process::id().cast_signed())?;
         self.hold(process_id)?;
         Ok(EntirelyHoldGuard {
             coordinator: self.clone(),
@@ -249,6 +287,10 @@ pub struct EntirelyHoldGuard {
 }
 
 impl EntirelyHoldGuard {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hold cannot be released.
     pub fn release(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.active {
             return Ok(());
@@ -272,8 +314,8 @@ impl Drop for EntirelyHoldGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lockfile::{ProcessChecker, ProcessStartTime};
-    use crate::process_util;
+    use crate::entirely::lockfile::{ProcessChecker, ProcessStartTime};
+    use crate::entirely::process_util;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -292,7 +334,7 @@ mod tests {
 
     #[test]
     fn process_checker_rejects_current_pid_with_wrong_start_time() {
-        let current_pid = std::process::id() as i32;
+        let current_pid = std::process::id().cast_signed();
         let current_start_time = process_util::get_process_start_time(current_pid).unwrap();
         let wrong_start_time = ProcessStartTime {
             seconds: current_start_time.seconds.saturating_add(1),
@@ -336,16 +378,20 @@ mod tests {
 
         let guard = coordinator.hold_current_process().unwrap();
 
-        let calls = sleep_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0]);
-
-        drop(calls);
+        {
+            let calls = sleep_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0]);
+            drop(calls);
+        }
         drop(guard);
 
-        let calls = sleep_calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(!calls[1]);
+        {
+            let calls = sleep_calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert!(!calls[1]);
+            drop(calls);
+        }
 
         if lock_path.exists() {
             std::fs::remove_file(&lock_path).unwrap();

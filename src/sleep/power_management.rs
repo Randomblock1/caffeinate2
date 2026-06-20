@@ -27,12 +27,13 @@ pub enum AssertionType {
 }
 
 impl AssertionType {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use] 
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            AssertionType::PreventUserIdleDisplaySleep => "PreventUserIdleDisplaySleep",
-            AssertionType::PreventDiskIdle => "PreventDiskIdle",
-            AssertionType::PreventUserIdleSystemSleep => "PreventUserIdleSystemSleep",
-            AssertionType::PreventSystemSleep => "PreventSystemSleep",
+            Self::PreventUserIdleDisplaySleep => "PreventUserIdleDisplaySleep",
+            Self::PreventDiskIdle => "PreventDiskIdle",
+            Self::PreventUserIdleSystemSleep => "PreventUserIdleSystemSleep",
+            Self::PreventSystemSleep => "PreventSystemSleep",
         }
     }
 }
@@ -54,6 +55,10 @@ impl Drop for PowerAssertion {
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an `IOKit` error code if the assertion cannot be created.
 pub fn create_assertion(
     assertion_type: AssertionType,
     verbose: bool,
@@ -71,54 +76,54 @@ pub fn create_assertion(
         let id = unsafe { id.assume_init() };
         if verbose {
             println!(
-                "Successfully created power management assertion with ID: {}",
-                id
+                "Successfully created power management assertion with ID: {id}"
             );
         }
         Ok(PowerAssertion { id, verbose })
     } else {
-        Err(status as u32)
+        Err(status.cast_unsigned())
     }
 }
 
 fn release_assertion(assertion_id: u32, verbose: bool) {
     if verbose {
         println!(
-            "Releasing power management assertion with ID: {}",
-            assertion_id
+            "Releasing power management assertion with ID: {assertion_id}"
         );
     }
 
-    let status = IOPMAssertionRelease(assertion_id) as u32;
+    let status = IOPMAssertionRelease(assertion_id).cast_unsigned();
 
     match status {
         0 => {
             if verbose {
                 println!(
-                    "Successfully released power management assertion with ID: {}",
-                    assertion_id
+                    "Successfully released power management assertion with ID: {assertion_id}"
                 );
             }
         }
         kIOReturnNotFound => {
             if verbose {
-                println!("Assertion {} already released", assertion_id);
+                println!("Assertion {assertion_id} already released");
             }
         }
         kIOReturnBadArgument => {
             if verbose {
-                println!("Assertion {} was invalid", assertion_id);
+                println!("Assertion {assertion_id} was invalid");
             }
         }
         _ => {
             eprintln!(
-                "Failed to release power management assertion with code: {:X}",
-                status
+                "Failed to release power management assertion with code: {status:X}"
             );
         }
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an `IOKit` error code if user activity cannot be declared.
 pub fn declare_user_activity(verbose: bool) -> Result<PowerAssertion, u32> {
     let assertion_name = CFString::from_str("caffeinate2");
     let mut id = MaybeUninit::uninit();
@@ -133,13 +138,13 @@ pub fn declare_user_activity(verbose: bool) -> Result<PowerAssertion, u32> {
         )
     };
     if status != 0 {
-        return Err(status as u32);
+        return Err(status.cast_unsigned());
     }
 
     let id = unsafe { id.assume_init() };
 
     if verbose {
-        println!("Successfully declared user activity with ID: {}", id);
+        println!("Successfully declared user activity with ID: {id}");
     }
 
     Ok(PowerAssertion { id, verbose })
@@ -155,11 +160,23 @@ impl Drop for SleepDisabledGuard {
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an `IOKit` error code if sleep cannot be disabled.
 pub fn disable_sleep(verbose: bool) -> Result<SleepDisabledGuard, u32> {
     set_sleep_disabled(true, verbose)?;
     Ok(SleepDisabledGuard { verbose })
 }
 
+///
+/// # Errors
+///
+/// Returns an `IOKit` error code if the sleep setting cannot be changed.
+///
+/// # Panics
+///
+/// Panics if the Core Foundation boolean constants are unavailable.
 pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
     let sleep_disabled_bool = if sleep_disabled {
         unsafe { kCFBooleanTrue.unwrap() }
@@ -171,7 +188,7 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
 
     let result = unsafe { IOPMSetSystemPowerSetting(&key, sleep_disabled_bool) };
 
-    let code = result as u32;
+    let code = result.cast_unsigned();
     if verbose {
         println!(
             "Got result {:X} when {} sleep",
@@ -215,13 +232,17 @@ pub struct ExternalAssertion {
 /// something else (a coding agent, `caffeinate -i`, …) is holding a low-level
 /// assertion that still allows lid-close sleep, so it can take a stronger hold.
 /// Our own PID is filtered out so the watcher can never react to itself.
+///
+/// # Errors
+///
+/// Returns an `IOKit` error code if assertions cannot be queried.
 pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssertion>, u32> {
-    let self_pid = std::process::id() as i32;
+    let self_pid = std::process::id().cast_signed();
 
     let mut raw: *const CFDictionary = std::ptr::null();
-    let status = unsafe { IOPMCopyAssertionsByProcess(&mut raw) };
+    let status = unsafe { IOPMCopyAssertionsByProcess(&raw mut raw) };
     if status != 0 {
-        return Err(status as u32);
+        return Err(status.cast_unsigned());
     }
     let Some(raw) = NonNull::new(raw.cast_mut()) else {
         // No process holds any assertion.
@@ -237,7 +258,7 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
     let name_key = CFString::from_str(ASSERTION_PROCESS_NAME_KEY);
 
     // Top level: keys are pid CFNumbers, values are CFArrays of assertion dicts.
-    let count = by_pid.count().max(0) as usize;
+    let count = by_pid.count().max(0).cast_unsigned();
     let mut keys: Vec<*const c_void> = vec![std::ptr::null(); count];
     let mut values: Vec<*const c_void> = vec![std::ptr::null(); count];
     unsafe {
@@ -309,7 +330,7 @@ fn cf_number_i32(number: &CFNumber) -> Option<i32> {
 
 fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
     let value = cf_ref(unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
-    value.downcast_ref::<CFString>().map(|s| s.to_string())
+    value.downcast_ref::<CFString>().map(std::string::ToString::to_string)
 }
 
 fn dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {
@@ -383,7 +404,7 @@ mod tests {
                         "Insufficient privileges to disable sleep (expected in non-root tests)"
                     );
                 } else {
-                    panic!("Failed to disable sleep with unexpected code: {:X}", code);
+                    panic!("Failed to disable sleep with unexpected code: {code:X}");
                 }
             }
         }
@@ -401,7 +422,7 @@ mod tests {
         // Hold an assertion ourselves and confirm it is filtered out (same PID).
         let _held = create_assertion(AssertionType::PreventUserIdleSystemSleep, false).unwrap();
         let externals = external_assertions(&[AssertionType::PreventUserIdleSystemSleep]).unwrap();
-        let self_pid = std::process::id() as i32;
+        let self_pid = std::process::id().cast_signed();
         for assertion in &externals {
             assert_ne!(assertion.pid, self_pid, "self PID must be excluded");
             assert_eq!(

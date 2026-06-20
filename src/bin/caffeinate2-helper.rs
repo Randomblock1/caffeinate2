@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
-use caffeinate2::entirely::EntirelyCoordinator;
+use caffeinate2::entirely::coordinator::EntirelyCoordinator;
 #[cfg(target_os = "macos")]
-use caffeinate2::helper_ipc::{self, serve_connection};
+use caffeinate2::entirely::helper_ipc::{self, serve_connection};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "macos")]

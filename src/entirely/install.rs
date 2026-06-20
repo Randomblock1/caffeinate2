@@ -1,7 +1,7 @@
-use crate::entirely;
-use crate::fs_util;
-use crate::helper_ipc;
-use crate::power_management;
+use crate::entirely::coordinator;
+use crate::entirely::helper_ipc;
+use crate::sleep::power_management;
+use crate::util::fs_util;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -16,11 +16,11 @@ pub const TRAY_LAUNCH_AGENT_LABEL: &str = "com.randomblock1.caffeinate2-tray";
 const NEWSYSLOG_CONF_PATH: &str = "/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf";
 
 const HELPER_PLIST_TEMPLATE: &str =
-    include_str!("../resources/com.randomblock1.caffeinate2.helper.plist");
+    include_str!("../../resources/com.randomblock1.caffeinate2.helper.plist");
 const TRAY_PLIST_TEMPLATE: &str =
-    include_str!("../resources/com.randomblock1.caffeinate2-tray.plist");
+    include_str!("../../resources/com.randomblock1.caffeinate2-tray.plist");
 const NEWSYSLOG_CONF_TEMPLATE: &str =
-    include_str!("../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
+    include_str!("../../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
 
 fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -42,22 +42,36 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the CLI binary cannot be resolved.
 pub fn resolve_cli_binary() -> Result<PathBuf, String> {
     resolve_sibling_binary("caffeinate2", "install caffeinate2 with --features full")
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the helper binary cannot be resolved.
 pub fn resolve_helper_source() -> Result<PathBuf, String> {
     resolve_sibling_binary("caffeinate2-helper", "build with --features helper-bin")
 }
 
+#[must_use] 
 pub fn helper_plist_content(helper_path: &Path) -> String {
     HELPER_PLIST_TEMPLATE.replace("__HELPER_PATH__", &helper_path.display().to_string())
 }
 
+#[must_use] 
 pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
     TRAY_PLIST_TEMPLATE.replace("__TRAY_PATH__", &tray_path.display().to_string())
 }
 
+///
+/// # Errors
+///
+/// Returns an error if `HOME` is not set.
 pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -67,6 +81,10 @@ pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
         .join(format!("{TRAY_LAUNCH_AGENT_LABEL}.plist")))
 }
 
+///
+/// # Errors
+///
+/// Returns an error if installation fails or the process is not root.
 pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     if !nix::unistd::Uid::effective().is_root() {
         return Err("--install-helper must run as root".to_string());
@@ -123,7 +141,7 @@ fn install_newsyslog_conf() {
 }
 
 fn ensure_grant_group() {
-    let group = crate::authz::GRANT_GROUP;
+    let group = crate::entirely::authz::GRANT_GROUP;
     let exists = Command::new("dseditgroup")
         .args(["-o", "read", group])
         .output()
@@ -145,6 +163,10 @@ fn ensure_grant_group() {
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an error if uninstallation fails or the process is not root.
 pub fn uninstall_helper() -> Result<(), String> {
     if !nix::unistd::Uid::effective().is_root() {
         return Err("--uninstall-helper must run as root".to_string());
@@ -157,11 +179,15 @@ pub fn uninstall_helper() -> Result<(), String> {
     let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
     // Nobody can send Release to the removed helper; drop any holder state and
     // make sure the persistent SleepDisabled setting isn't left on.
-    let _ = fs::remove_file(entirely::HELPER_LOCK_PATH);
+    let _ = fs::remove_file(coordinator::HELPER_LOCK_PATH);
     let _ = power_management::set_sleep_disabled(false, false);
     Ok(())
 }
 
+///
+/// # Errors
+///
+/// Returns an error if privileged installation fails or is cancelled.
 pub fn install_helper_privileged() -> Result<(), String> {
     if nix::unistd::Uid::effective().is_root() {
         let source = resolve_helper_source()?;
@@ -187,6 +213,10 @@ pub fn install_helper_privileged() -> Result<(), String> {
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the launch agent plist cannot be written.
 pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
     if let Some(parent) = plist_path.parent() {
@@ -200,6 +230,10 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the launch agent plist cannot be removed.
 pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     let plist_path = tray_launch_agent_path()?;
     // Only remove the plist; launchd won't start the agent at the next login.
@@ -214,6 +248,7 @@ pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     }
 }
 
+#[must_use] 
 pub fn tray_launch_agent_installed() -> bool {
     tray_launch_agent_path()
         .map(|p| p.exists())
@@ -283,7 +318,7 @@ mod tests {
             "'/Users/a b/caffeinate2'"
         );
         assert_eq!(sh_single_quote("it's"), r"'it'\''s'");
-        assert_eq!(applescript_escape(r"'it'\''s'"), r#"'it'\\''s'"#);
+        assert_eq!(applescript_escape(r"'it'\''s'"), r"'it'\\''s'");
         assert_eq!(applescript_escape("say \"hi\""), r#"say \"hi\""#);
     }
 

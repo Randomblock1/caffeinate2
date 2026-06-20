@@ -1,5 +1,9 @@
 use jiff::SignedDuration;
 
+///
+/// # Errors
+///
+/// Returns an error if the duration string is invalid or too large.
 pub fn parse_duration(duration: &str) -> Result<SignedDuration, String> {
     let duration = duration.trim();
 
@@ -26,10 +30,8 @@ pub fn parse_duration(duration: &str) -> Result<SignedDuration, String> {
 fn parse_human_duration(duration: &str) -> Result<std::time::Duration, humantime::DurationError> {
     match humantime::parse_duration(duration) {
         Ok(duration) => Ok(duration),
-        Err(error) => match duration_without_connectors(duration) {
-            Some(normalized) => humantime::parse_duration(&normalized),
-            None => Err(error),
-        },
+        Err(error) => duration_without_connectors(duration)
+            .map_or(Err(error), |normalized| humantime::parse_duration(&normalized)),
     }
 }
 
@@ -51,6 +53,7 @@ fn duration_without_connectors(duration: &str) -> Option<String> {
 }
 
 /// Human-readable duration for CLI messages (e.g. "1 hour 30 minutes").
+#[must_use]
 pub fn format_duration_human(duration: SignedDuration) -> String {
     let seconds = duration.as_secs() % 60;
     let minutes = duration.as_mins() % 60;
@@ -59,27 +62,27 @@ pub fn format_duration_human(duration: SignedDuration) -> String {
     let mut parts = Vec::new();
 
     if days > 0 {
-        parts.push(format!("{} day{}", days, if days != 1 { "s" } else { "" }));
+        parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
     }
     if hours > 0 {
         parts.push(format!(
             "{} hour{}",
             hours,
-            if hours != 1 { "s" } else { "" }
+            if hours == 1 { "" } else { "s" }
         ));
     }
     if minutes > 0 {
         parts.push(format!(
             "{} minute{}",
             minutes,
-            if minutes != 1 { "s" } else { "" }
+            if minutes == 1 { "" } else { "s" }
         ));
     }
     if seconds > 0 || parts.is_empty() {
         parts.push(format!(
             "{} second{}",
             seconds,
-            if seconds != 1 { "s" } else { "" }
+            if seconds == 1 { "" } else { "s" }
         ));
     }
 
@@ -87,6 +90,7 @@ pub fn format_duration_human(duration: SignedDuration) -> String {
 }
 
 /// Compact remaining-time label for tray tooltips (e.g. "1h 30m remaining").
+#[must_use] 
 pub fn format_remaining_secs(secs: u64) -> String {
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;
@@ -183,7 +187,7 @@ mod tests {
 
         let duration = "1000000s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 1000000);
+        assert_eq!(result.as_secs(), 1_000_000);
 
         let duration = "  15m  ";
         let result = parse_duration(duration).unwrap();

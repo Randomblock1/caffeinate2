@@ -1,10 +1,10 @@
 #[cfg(target_os = "macos")]
 mod cli;
-#[cfg(target_os = "macos")]
-mod wait;
 
 #[cfg(target_os = "macos")]
-use caffeinate2::{duration_parser, helper_ipc, install, sleep_mode};
+use caffeinate2::entirely::{helper_ipc, install};
+use caffeinate2::sleep::sleep_mode;
+use caffeinate2::util::duration_parser;
 #[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
@@ -29,7 +29,197 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
-use wait::{WaitForPidError, WaitForPidResult, WaitMode, wait_for_pid, wait_mode};
+use cli::wait::{WaitForPidError, WaitForPidResult, WaitMode, wait_for_pid, wait_mode};
+
+#[cfg(target_os = "macos")]
+const SHORT_TIME_FMT: &str = "at %-I:%M:%S %p";
+#[cfg(target_os = "macos")]
+const LONG_TIME_FMT: &str = "on %B %-d at %-I:%M:%S %p";
+
+#[cfg(target_os = "macos")]
+fn release_active_and_exit(
+    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
+    code: i32,
+) -> ! {
+    if let Ok(mut guard) = active.lock() {
+        let _ = guard.take();
+    }
+    process::exit(code);
+}
+
+#[cfg(target_os = "macos")]
+fn command_credentials(args: &Args, active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>) -> (u32, u32) {
+    if args.drop_root {
+        let uid_str =
+            std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
+        let gid_str =
+            std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
+        let Ok(uid) = uid_str.parse::<u32>() else {
+            eprintln!("Error: invalid SUDO_UID: {uid_str}");
+            release_active_and_exit(active, 1);
+        };
+        let Ok(gid) = gid_str.parse::<u32>() else {
+            eprintln!("Error: invalid SUDO_GID: {gid_str}");
+            release_active_and_exit(active, 1);
+        };
+        (uid, gid)
+    } else {
+        (unistd::getuid().into(), unistd::getgid().into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_command_mode(
+    args: &Args,
+    sleep_str: &str,
+    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
+    child_pid: &Arc<AtomicI32>,
+    exit_code: &Arc<AtomicI32>,
+) {
+    let command = args.command.as_ref().expect("Command should be present");
+    if command.is_empty() {
+        eprintln!("Error: empty command");
+        release_active_and_exit(active, 2);
+    }
+    println!("{sleep_str}until command finishes.");
+
+    let (uid, gid) = command_credentials(args, active);
+    if args.verbose {
+        println!("uid: {uid}, gid: {gid}");
+    }
+
+    let mut child_command = if args.shell {
+        let mut child_command = process::Command::new("/bin/sh");
+        child_command.arg("-c").arg(command.join(" "));
+        child_command
+    } else {
+        let mut child_command = process::Command::new(&command[0]);
+        child_command.args(&command[1..]);
+        child_command
+    };
+    let mut child = match child_command
+        .stdout(process::Stdio::inherit())
+        .stderr(process::Stdio::inherit())
+        .uid(uid)
+        .gid(gid)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Error: failed to execute command: {e}");
+            release_active_and_exit(active, 127);
+        }
+    };
+    child_pid.store(child.id().cast_signed(), Ordering::Relaxed);
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("Error: command wait failed: {e}");
+            release_active_and_exit(active, 1);
+        }
+    };
+    child_pid.store(0, Ordering::Relaxed);
+    // Match the -w decoding: report signal deaths as 128 + signal number
+    // instead of masking them as success.
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(0);
+    exit_code.store(code, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn run_timed_wait_mode(
+    args: &Args,
+    parsed_timeout: Option<&jiff::SignedDuration>,
+    sleep_str: &mut String,
+    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
+    exit_code: &Arc<AtomicI32>,
+) {
+    use std::fmt::Write as _;
+
+    let mut duration = jiff::SignedDuration::ZERO;
+    let mut end_time = jiff::Zoned::now();
+
+    let timeout = args.timeout.is_some();
+    let waitfor = args.waitfor.is_some();
+    if timeout {
+        duration = parsed_timeout.copied().expect("Timeout should be present");
+        end_time += duration;
+        let _ = write!(
+            sleep_str,
+            "for {}",
+            duration_parser::format_duration_human(duration)
+        );
+    }
+
+    print!("{sleep_str}");
+
+    if timeout && waitfor {
+        print!(" or ");
+    }
+    if waitfor {
+        print!(
+            "until PID {} finishes",
+            args.waitfor.expect("PID should be present")
+        );
+    }
+    println!(".");
+
+    if timeout {
+        println!(
+            "Resuming {}.",
+            if duration.as_secs() > (60 * 60 * 24) {
+                end_time.strftime(LONG_TIME_FMT)
+            } else {
+                end_time.strftime(SHORT_TIME_FMT)
+            }
+        );
+        if !waitfor {
+            thread::sleep(duration.try_into().expect("Duration should be valid"));
+        }
+    }
+
+    if !waitfor {
+        return;
+    }
+
+    let pid = args.waitfor.expect("PID should be present");
+    let timeout_duration = if timeout {
+        Some(duration.try_into().expect("Duration should be valid"))
+    } else {
+        None
+    };
+
+    match wait_for_pid(pid, timeout_duration, args.verbose) {
+        Ok(WaitForPidResult::Exited(pid_exit_code)) => {
+            exit_code.store(pid_exit_code, Ordering::Relaxed);
+
+            print!("PID {pid} finished ");
+            let now = jiff::Zoned::now();
+            print!("{} ", now.strftime(SHORT_TIME_FMT));
+            println!("with exit code {}", exit_code.load(Ordering::Relaxed));
+        }
+        Ok(WaitForPidResult::TimedOut) => {}
+        Err(WaitForPidError::InvalidPid) => {
+            eprintln!("Error: invalid PID {pid}; expected a positive process ID");
+            release_active_and_exit(active, 1);
+        }
+        Err(WaitForPidError::NotFound) => {
+            println!("PID {pid} not found");
+            // Release holds before exiting: process::exit skips destructors,
+            // and an entirely-mode hold would leave system sleep disabled
+            // (until the helper reaps it, or indefinitely with the root CLI
+            // fallback).
+            release_active_and_exit(active, 1);
+        }
+        Err(WaitForPidError::Kevent(e)) => {
+            eprintln!("kevent error waiting for PID {pid}: {e}");
+            release_active_and_exit(active, 1);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn run_maintenance(command: MaintenanceCommand) {
@@ -188,190 +378,15 @@ fn main() {
     });
 
     match wait_mode(&args) {
-        WaitMode::Command => {
-            let command = args.command.expect("Command should be present");
-            if command.is_empty() {
-                eprintln!("Error: empty command");
-                if let Ok(mut guard) = active.lock() {
-                    let _ = guard.take();
-                }
-                process::exit(2);
-            }
-            sleep_str += "until command finishes.";
-            println!("{sleep_str}");
-
-            let uid;
-            let gid;
-
-            if args.drop_root {
-                let uid_str =
-                    std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
-                let gid_str =
-                    std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
-
-                uid = match uid_str.parse::<u32>() {
-                    Ok(uid) => uid,
-                    Err(_) => {
-                        eprintln!("Error: invalid SUDO_UID: {uid_str}");
-                        if let Ok(mut guard) = active.lock() {
-                            let _ = guard.take();
-                        }
-                        process::exit(1);
-                    }
-                };
-                gid = match gid_str.parse::<u32>() {
-                    Ok(gid) => gid,
-                    Err(_) => {
-                        eprintln!("Error: invalid SUDO_GID: {gid_str}");
-                        if let Ok(mut guard) = active.lock() {
-                            let _ = guard.take();
-                        }
-                        process::exit(1);
-                    }
-                };
-            } else {
-                uid = unistd::getuid().into();
-                gid = unistd::getgid().into();
-            }
-
-            if args.verbose {
-                println!("uid: {uid}, gid: {gid}");
-            }
-
-            let mut child_command = if args.shell {
-                let mut child_command = process::Command::new("/bin/sh");
-                child_command.arg("-c").arg(command.join(" "));
-                child_command
-            } else {
-                let mut child_command = process::Command::new(&command[0]);
-                child_command.args(&command[1..]);
-                child_command
-            };
-            let mut child = match child_command
-                .stdout(process::Stdio::inherit())
-                .stderr(process::Stdio::inherit())
-                .uid(uid)
-                .gid(gid)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(e) => {
-                    eprintln!("Error: failed to execute command: {e}");
-                    if let Ok(mut guard) = active.lock() {
-                        let _ = guard.take();
-                    }
-                    process::exit(127);
-                }
-            };
-            child_pid.store(child.id() as i32, Ordering::Relaxed);
-
-            let status = match child.wait() {
-                Ok(status) => status,
-                Err(e) => {
-                    eprintln!("Error: command wait failed: {e}");
-                    if let Ok(mut guard) = active.lock() {
-                        let _ = guard.take();
-                    }
-                    process::exit(1);
-                }
-            };
-            child_pid.store(0, Ordering::Relaxed);
-            // Match the -w decoding: report signal deaths as 128 + signal
-            // number instead of masking them as success.
-            let code = status
-                .code()
-                .or_else(|| status.signal().map(|signal| 128 + signal))
-                .unwrap_or(0);
-            exit_code.store(code, Ordering::Relaxed);
-        }
+        WaitMode::Command => run_command_mode(
+            &args,
+            &sleep_str,
+            &active,
+            &child_pid,
+            &exit_code,
+        ),
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
-            let mut duration = jiff::SignedDuration::ZERO;
-            let mut end_time = jiff::Zoned::now();
-
-            let timeout = args.timeout.is_some();
-            let waitfor = args.waitfor.is_some();
-            if timeout {
-                duration = parsed_timeout.expect("Timeout should be present");
-                end_time += duration;
-                sleep_str += &format!("for {}", duration_parser::format_duration_human(duration));
-            }
-
-            print!("{sleep_str}");
-
-            if timeout && waitfor {
-                print!(" or ");
-            }
-            if waitfor {
-                print!(
-                    "until PID {} finishes",
-                    args.waitfor.expect("PID should be present")
-                );
-            }
-            println!(".");
-
-            const SHORT_FMT: &str = "at %-I:%M:%S %p";
-            const LONG_FMT: &str = "on %B %-d at %-I:%M:%S %p";
-
-            if timeout {
-                println!(
-                    "Resuming {}.",
-                    if duration.as_secs() > (60 * 60 * 24) {
-                        end_time.strftime(LONG_FMT)
-                    } else {
-                        end_time.strftime(SHORT_FMT)
-                    }
-                );
-                if !waitfor {
-                    thread::sleep(duration.try_into().expect("Duration should be valid"));
-                }
-            }
-
-            if waitfor {
-                let pid = args.waitfor.expect("PID should be present");
-
-                let timeout_duration = if timeout {
-                    Some(duration.try_into().expect("Duration should be valid"))
-                } else {
-                    None
-                };
-
-                match wait_for_pid(pid, timeout_duration, args.verbose) {
-                    Ok(WaitForPidResult::Exited(pid_exit_code)) => {
-                        exit_code.store(pid_exit_code, Ordering::Relaxed);
-
-                        print!("PID {pid} finished ");
-                        let now = jiff::Zoned::now();
-                        print!("{} ", now.strftime(SHORT_FMT));
-                        println!("with exit code {}", exit_code.load(Ordering::Relaxed));
-                    }
-                    Ok(WaitForPidResult::TimedOut) => {}
-                    Err(WaitForPidError::InvalidPid) => {
-                        eprintln!("Error: invalid PID {pid}; expected a positive process ID");
-                        if let Ok(mut guard) = active.lock() {
-                            let _ = guard.take();
-                        }
-                        process::exit(1);
-                    }
-                    Err(WaitForPidError::NotFound) => {
-                        println!("PID {pid} not found");
-                        // Release holds before exiting: process::exit skips
-                        // destructors, and an entirely-mode hold would leave
-                        // system sleep disabled (until the helper reaps it,
-                        // or indefinitely with the root CLI fallback).
-                        if let Ok(mut guard) = active.lock() {
-                            let _ = guard.take();
-                        }
-                        process::exit(1);
-                    }
-                    Err(WaitForPidError::Kevent(e)) => {
-                        eprintln!("kevent error waiting for PID {pid}: {e}");
-                        if let Ok(mut guard) = active.lock() {
-                            let _ = guard.take();
-                        }
-                        process::exit(1);
-                    }
-                }
-            }
+            run_timed_wait_mode(&args, parsed_timeout.as_ref(), &mut sleep_str, &active, &exit_code);
         }
         WaitMode::UntilInterrupt => {
             sleep_str += "until Ctrl+C pressed.";
@@ -398,9 +413,8 @@ fn main() {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::*;
     use crate::cli::parse_args;
-    use sleep_mode::{SleepMode, SleepModeSet};
+    use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
 
     #[test]
     fn defaults_to_system_assertion_when_no_assertion_flags_are_set() {

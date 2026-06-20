@@ -1,6 +1,6 @@
-use crate::sleep_mode::SleepMode;
+use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::state::{AppState, IgnoredAssertion, MenuSnapshot};
-use crate::tray_mode::TimeLimitPreset;
+use crate::tray::tray_mode::TimeLimitPreset;
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::menu::MenuId;
 
@@ -15,7 +15,7 @@ pub struct MenuHandles {
     pub quit_id: MenuId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
     Quit,
     ToggleStartAtLogin,
@@ -230,12 +230,12 @@ pub enum MenuAction {
 }
 
 pub fn dispatch_command(
-    command: MenuCommand,
+    command: &MenuCommand,
     handles: &MenuHandles,
     state: &mut AppState,
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
-    match command {
+    match *command {
         MenuCommand::Quit => return MenuAction::Quit,
         // The run loop owns the AppKit window code, so it handles this one.
         MenuCommand::OpenWaitForAppsWindow => return MenuAction::Unhandled,
@@ -252,7 +252,7 @@ pub fn dispatch_command(
             if enable {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling sleep upgrade…)"));
                 state.invalidate_tooltip();
-                crate::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
             }
             match state.set_upgrade_external(enable) {
                 Ok(()) => {
@@ -275,7 +275,7 @@ pub fn dispatch_command(
             if state.is_on() && mode == SleepMode::Entirely {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                 state.invalidate_tooltip();
-                crate::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
             }
             match state.set_mode(mode) {
                 Ok(()) => state.set_icon(tray),
@@ -309,8 +309,9 @@ pub fn handle_menu_event(
     state: &mut AppState,
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
-    match handles.resolve(event_id) {
-        Some(command) => dispatch_command(command, handles, state, tray),
-        None => MenuAction::Unhandled,
-    }
+    handles
+        .resolve(event_id)
+        .map_or(MenuAction::Unhandled, |command| {
+            dispatch_command(&command, handles, state, tray)
+        })
 }

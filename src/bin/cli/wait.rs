@@ -1,4 +1,4 @@
-use crate::cli::Args;
+use super::Args;
 use nix::sys::event;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ pub enum WaitMode {
     UntilInterrupt,
 }
 
-pub fn wait_mode(args: &Args) -> WaitMode {
+pub const fn wait_mode(args: &Args) -> WaitMode {
     if args.command.is_some() {
         WaitMode::Command
     } else {
@@ -40,15 +40,19 @@ pub enum WaitForPidError {
 fn timespec_from_duration(duration: Duration) -> libc::timespec {
     let max_seconds = <libc::time_t>::MAX as u64;
     libc::timespec {
-        tv_sec: duration.as_secs().min(max_seconds) as libc::time_t,
-        tv_nsec: duration.subsec_nanos() as libc::c_long,
+        tv_sec: duration
+            .as_secs()
+            .min(max_seconds)
+            .try_into()
+            .unwrap_or(<libc::time_t>::MAX),
+        tv_nsec: libc::c_long::from(duration.subsec_nanos()),
     }
 }
 
 /// `NOTE_EXITSTATUS` delivers the raw `wait(2)` status word, not the exit
 /// code: a normal exit N arrives as `N << 8`. Decode it like a shell would
 /// (128 + signal number for signal deaths).
-fn exit_code_from_wait_status(status: i32) -> i32 {
+const fn exit_code_from_wait_status(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
@@ -69,7 +73,7 @@ pub fn wait_for_pid(
 
     let kq = event::Kqueue::new().map_err(WaitForPidError::Kevent)?;
     let kev = event::KEvent::new(
-        pid as usize,
+        pid.cast_unsigned() as usize,
         event::EventFilter::EVFILT_PROC,
         event::EvFlags::EV_ADD | event::EvFlags::EV_ENABLE | event::EvFlags::EV_ONESHOT,
         event::FilterFlag::NOTE_EXITSTATUS,
@@ -97,12 +101,12 @@ pub fn wait_for_pid(
             Err(WaitForPidError::NotFound)
         } else {
             Err(WaitForPidError::Kevent(nix::Error::from_raw(
-                event.data() as i32
+                i32::try_from(event.data()).unwrap_or(i32::MAX),
             )))
         }
     } else {
         Ok(WaitForPidResult::Exited(exit_code_from_wait_status(
-            event.data() as i32,
+            i32::try_from(event.data()).unwrap_or(i32::MAX),
         )))
     }
 }
@@ -110,7 +114,7 @@ pub fn wait_for_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::parse_args;
+    use super::super::parse_args;
 
     #[test]
     fn wait_for_pid_rejects_non_positive_pids() {

@@ -1,5 +1,5 @@
-use crate::entirely::EntirelyCoordinator;
-use crate::process_util;
+use crate::entirely::coordinator::EntirelyCoordinator;
+use crate::entirely::process_util;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -10,9 +10,11 @@ pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Holds are keyed by the requesting process (pid + start time, taken from the
-/// socket peer), not by the connection. Each request is a short RPC on its own
-/// connection, so holds survive helper restarts: the lockfile is the source of
-/// truth and the helper reaps holders whose processes have died.
+/// socket peer), not by the connection.
+///
+/// Each request is a short RPC on its own connection, so holds survive helper
+/// restarts: the lockfile is the source of truth and the helper reaps holders
+/// whose processes have died.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum HelperRequest {
@@ -36,30 +38,46 @@ pub enum HelperResponse {
 }
 
 impl HelperResponse {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is an RPC error.
     pub fn into_result(self) -> Result<Self, String> {
         match self {
-            HelperResponse::Error { message } => Err(message),
+            Self::Error { message } => Err(message),
             other => Ok(other),
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is not `HoldOk`.
     pub fn into_hold_ok(self) -> Result<(), String> {
         match self.into_result()? {
-            HelperResponse::HoldOk => Ok(()),
+            Self::HoldOk => Ok(()),
             other => Err(format!("unexpected response for hold: {other:?}")),
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is not `ReleaseOk`.
     pub fn into_release_ok(self) -> Result<(), String> {
         match self.into_result()? {
-            HelperResponse::ReleaseOk => Ok(()),
+            Self::ReleaseOk => Ok(()),
             other => Err(format!("unexpected response for release: {other:?}")),
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is not `Status`.
     pub fn into_status(self) -> Result<(usize, bool), String> {
         match self.into_result()? {
-            HelperResponse::Status {
+            Self::Status {
                 holders,
                 sleep_disabled,
             } => Ok((holders, sleep_disabled)),
@@ -68,18 +86,36 @@ impl HelperResponse {
     }
 }
 
+///
+/// # Panics
+///
+/// Panics if the request cannot be serialized to JSON.
+#[must_use]
 pub fn encode_request(request: &HelperRequest) -> String {
     serde_json::to_string(request).expect("request should serialize") + "\n"
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the line is not valid JSON for a helper request.
 pub fn decode_request(line: &str) -> Result<HelperRequest, serde_json::Error> {
     serde_json::from_str(line.trim())
 }
 
+///
+/// # Panics
+///
+/// Panics if the response cannot be serialized to JSON.
+#[must_use]
 pub fn encode_response(response: &HelperResponse) -> String {
     serde_json::to_string(response).expect("response should serialize") + "\n"
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the line is not valid JSON for a helper response.
 pub fn decode_response(line: &str) -> Result<HelperResponse, serde_json::Error> {
     serde_json::from_str(line.trim())
 }
@@ -130,7 +166,7 @@ fn read_request_line(stream: &mut UnixStream) -> Result<HelperRequest, String> {
 
 fn rpc(
     socket_path: &str,
-    request: HelperRequest,
+    request: &HelperRequest,
     with_timeouts: bool,
 ) -> Result<HelperResponse, String> {
     let mut stream =
@@ -138,7 +174,7 @@ fn rpc(
     if with_timeouts {
         configure_rpc_timeouts(&stream)?;
     }
-    write_request(&mut stream, &request)?;
+    write_request(&mut stream, request)?;
     read_response_line(&mut stream)
 }
 
@@ -154,32 +190,46 @@ impl Default for HelperClient {
 }
 
 impl HelperClient {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             socket_path: HELPER_SOCKET_PATH.to_string(),
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the helper socket cannot be connected to.
     pub fn try_connect(&self) -> Result<UnixStream, String> {
         UnixStream::connect(&self.socket_path).map_err(|e| format!("connect failed: {e}"))
     }
 
+    #[must_use] 
     pub fn is_available(&self) -> bool {
         self.try_connect().is_ok()
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the status RPC fails.
     pub fn status(&self) -> Result<(usize, bool), String> {
-        rpc(&self.socket_path, HelperRequest::Status, true)?.into_status()
+        rpc(&self.socket_path, &HelperRequest::Status, true)?.into_status()
     }
 }
 
+#[must_use] 
 pub fn is_connect_error(message: &str) -> bool {
     message.starts_with("connect failed:")
 }
 
 /// True for helper errors that mean the peer is not allowed to take
-/// entirely-mode holds (as opposed to the helper being unreachable or
-/// failing). Matches the prefix used by [`crate::authz::denial_message`].
+/// entirely-mode holds.
+///
+/// Distinct from the helper being unreachable or failing. Matches the prefix
+/// used by [`crate::entirely::authz::denial_message`].
+#[must_use] 
 pub fn is_authorization_error(message: &str) -> bool {
     message.starts_with("not authorized")
 }
@@ -196,14 +246,22 @@ pub struct HelperHoldGuard {
 }
 
 impl HelperHoldGuard {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hold RPC fails.
     pub fn try_acquire(client: &HelperClient) -> Result<Self, String> {
-        rpc(&client.socket_path, HelperRequest::Hold, true)?.into_hold_ok()?;
+        rpc(&client.socket_path, &HelperRequest::Hold, true)?.into_hold_ok()?;
         Ok(Self {
             client: client.clone(),
             released: false,
         })
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the release RPC fails.
     pub fn release(&mut self) -> Result<(), String> {
         if self.released {
             return Ok(());
@@ -213,7 +271,7 @@ impl HelperHoldGuard {
         // as long as this process lives (the reaper only prunes dead pids).
         // Release is idempotent on the helper side, so a duplicate after a
         // lost response is harmless.
-        rpc(&self.client.socket_path, HelperRequest::Release, true)?.into_release_ok()?;
+        rpc(&self.client.socket_path, &HelperRequest::Release, true)?.into_release_ok()?;
         self.released = true;
         Ok(())
     }
@@ -232,16 +290,20 @@ impl Drop for HelperHoldGuard {
 #[cfg(target_os = "macos")]
 fn write_response_on_stream(
     stream: &mut UnixStream,
-    response: HelperResponse,
+    response: &HelperResponse,
 ) -> Result<(), String> {
     stream
-        .write_all(encode_response(&response).as_bytes())
+        .write_all(encode_response(response).as_bytes())
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]
-pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId, String> {
+///
+/// # Errors
+///
+/// Returns an error if the peer PID or process start time cannot be read.
+pub fn peer_process_id(stream: &UnixStream) -> Result<crate::entirely::lockfile::ProcessId, String> {
     use nix::sys::socket::getsockopt;
     use nix::sys::socket::sockopt::LocalPeerPid;
 
@@ -250,8 +312,8 @@ pub fn peer_process_id(stream: &UnixStream) -> Result<crate::lockfile::ProcessId
 }
 
 /// Authorize a Hold from this peer, failing closed: unreadable credentials
-/// deny. Uses only the kernel-supplied effective uid (LOCAL_PEERCRED);
-/// group membership is resolved by [`crate::authz`].
+/// deny. Uses only the kernel-supplied effective uid (`LOCAL_PEERCRED`);
+/// group membership is resolved by [`crate::entirely::authz`].
 #[cfg(target_os = "macos")]
 fn authorize_hold(stream: &UnixStream) -> Result<(), String> {
     use nix::sys::socket::getsockopt;
@@ -265,14 +327,18 @@ fn authorize_hold(stream: &UnixStream) -> Result<(), String> {
             ));
         }
     };
-    if crate::authz::uid_may_hold(uid) {
+    if crate::entirely::authz::uid_may_hold(uid) {
         Ok(())
     } else {
-        Err(crate::authz::denial_message(uid))
+        Err(crate::entirely::authz::denial_message(uid))
     }
 }
 
 #[cfg(target_os = "macos")]
+///
+/// # Errors
+///
+/// Returns an error if the connection cannot be served.
 pub fn serve_connection(
     stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
@@ -285,7 +351,7 @@ fn serve_connection_inner(
     mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
     authorize_hold: &dyn Fn(&UnixStream) -> Result<(), String>,
-    peer_process_id: &dyn Fn(&UnixStream) -> Result<crate::lockfile::ProcessId, String>,
+    peer_process_id: &dyn Fn(&UnixStream) -> Result<crate::entirely::lockfile::ProcessId, String>,
 ) -> Result<(), String> {
     // Bound the whole RPC so a client that connects and sends nothing can't
     // pin a helper thread forever.
@@ -294,7 +360,10 @@ fn serve_connection_inner(
     let request = match read_request_line(&mut stream) {
         Ok(req) => req,
         Err(e) => {
-            return write_response_on_stream(&mut stream, HelperResponse::Error { message: e });
+            return write_response_on_stream(
+                &mut stream,
+                &HelperResponse::Error { message: e },
+            );
         }
     };
 
@@ -335,14 +404,14 @@ fn serve_connection_inner(
             },
         },
     };
-    write_response_on_stream(&mut stream, response)
+    write_response_on_stream(&mut stream, &response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entirely::SleepDisabler;
-    use crate::process_util;
+    use crate::entirely::coordinator::SleepDisabler;
+    use crate::entirely::process_util;
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
 
@@ -427,9 +496,8 @@ mod tests {
         let client = HelperClient {
             socket_path: sock_path.display().to_string(),
         };
-        let error = match HelperHoldGuard::try_acquire(&client) {
-            Ok(_) => panic!("hold should have been denied"),
-            Err(error) => error,
+        let Err(error) = HelperHoldGuard::try_acquire(&client) else {
+            panic!("hold should have been denied");
         };
         assert!(is_authorization_error(&error), "{error}");
         // The denied hold must not have registered anything.

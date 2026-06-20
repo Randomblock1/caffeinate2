@@ -6,8 +6,8 @@
 //! Watch targets are keyed on something stable — a bundle id for apps, an
 //! executable path for non-bundle programs — never a PID, which the OS recycles.
 
-use crate::app_target::WatchTarget;
-use crate::macos_apps;
+use crate::tray::app_target::WatchTarget;
+use crate::tray::macos_apps;
 use libc::{PROC_PIDTBSDINFO, proc_bsdinfo, proc_pidinfo};
 use std::collections::HashMap;
 
@@ -63,31 +63,38 @@ fn all_pids() -> Vec<i32> {
     if count <= 0 {
         return Vec::new();
     }
-    let cap = count as usize + 64;
+    let cap = count.cast_unsigned() as usize + 64;
     let mut pids = vec![0i32; cap];
-    let count = unsafe {
-        libc::proc_listallpids(
-            pids.as_mut_ptr().cast(),
-            (cap * std::mem::size_of::<i32>()) as libc::c_int,
-        )
-    };
+    let byte_count: libc::c_int = cap
+        .saturating_mul(std::mem::size_of::<i32>())
+        .try_into()
+        .unwrap_or(i32::MAX);
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), byte_count) };
     if count <= 0 {
         return Vec::new();
     }
-    pids.truncate(count as usize);
+    pids.truncate(count.cast_unsigned() as usize);
     pids.retain(|&pid| pid > 0);
     pids
 }
 
 /// Executable path for `pid`, or empty if `proc_pidpath` fails (kernel/protected
 /// processes return EPERM).
+const PROC_PIDPATH_MAX: usize = 4096;
+
 fn proc_path(pid: i32) -> String {
-    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let mut buf = [0u8; PROC_PIDPATH_MAX];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buf.as_mut_ptr().cast(),
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
+        )
+    };
     if len <= 0 {
         return String::new();
     }
-    String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    String::from_utf8_lossy(&buf[..len.cast_unsigned() as usize]).into_owned()
 }
 
 /// Read a NUL-terminated fixed C-char array (`pbi_name`/`pbi_comm`).
@@ -100,17 +107,18 @@ fn cstr_field(bytes: &[libc::c_char]) -> String {
 /// Every live process with pid/ppid/uid and its executable path. Drops PIDs
 /// whose `proc_pidinfo` fails (exited mid-scan, or protected) — those are never
 /// watchable targets.
+#[must_use] 
 pub fn list_processes() -> Vec<ProcInfo> {
     let mut out = Vec::new();
     for pid in all_pids() {
         let mut info = unsafe { std::mem::zeroed::<proc_bsdinfo>() };
-        let size = std::mem::size_of::<proc_bsdinfo>() as libc::c_int;
+        let size = i32::try_from(std::mem::size_of::<proc_bsdinfo>()).unwrap_or(i32::MAX);
         let ret = unsafe {
             proc_pidinfo(
                 pid,
                 PROC_PIDTBSDINFO,
                 0,
-                &mut info as *mut _ as *mut _,
+                (&raw mut info).cast(),
                 size,
             )
         };
@@ -119,7 +127,7 @@ pub fn list_processes() -> Vec<ProcInfo> {
         }
         out.push(ProcInfo {
             pid,
-            ppid: info.pbi_ppid as i32,
+            ppid: info.pbi_ppid.cast_signed(),
             uid: info.pbi_uid,
             exec_path: proc_path(pid),
             comm: cstr_field(&info.pbi_name),
@@ -191,6 +199,7 @@ fn is_system_process(exec_path: &str, uid: u32, bundle: Option<&BundleRef>) -> b
 /// Build the picker's program rows, grouping helper PIDs under their parent
 /// `.app`. `app_only` keeps only `.app`-backed programs; `include_system`
 /// reveals system processes (off by default).
+#[must_use] 
 pub fn program_rows(app_only: bool, include_system: bool) -> Vec<ProgramRow> {
     let mut bundle_cache: HashMap<String, Option<BundleRef>> = HashMap::new();
     let mut groups: HashMap<String, ProgramRow> = HashMap::new();
@@ -214,12 +223,9 @@ pub fn program_rows(app_only: bool, include_system: bool) -> Vec<ProgramRow> {
             pid: proc.pid,
             name: child_name(&proc, bundle.as_ref()),
         };
-        match groups.get_mut(&group_key) {
-            Some(row) => row.procs.push(child),
-            None => {
-                order.push(group_key.clone());
-                groups.insert(group_key, new_row(&proc, bundle, child));
-            }
+        if let Some(row) = groups.get_mut(&group_key) { row.procs.push(child) } else {
+            order.push(group_key.clone());
+            groups.insert(group_key, new_row(&proc, bundle, child));
         }
     }
 
@@ -247,16 +253,8 @@ fn child_name(proc: &ProcInfo, bundle: Option<&BundleRef>) -> String {
 
 fn new_row(proc: &ProcInfo, bundle: Option<BundleRef>, first: ChildProc) -> ProgramRow {
     let is_system = is_system_process(&proc.exec_path, proc.uid, bundle.as_ref());
-    let (name, icon_path, target) = match &bundle {
-        Some(b) => (
-            b.name.clone(),
-            b.app_path.clone(),
-            WatchTarget::Bundle {
-                bundle_id: b.bundle_id.clone(),
-                name: b.name.clone(),
-            },
-        ),
-        None => {
+    let (name, icon_path, target) = bundle.as_ref().map_or_else(
+        || {
             let name = file_stem(&proc.exec_path).unwrap_or_else(|| proc.comm.clone());
             (
                 name.clone(),
@@ -266,8 +264,18 @@ fn new_row(proc: &ProcInfo, bundle: Option<BundleRef>, first: ChildProc) -> Prog
                     name,
                 },
             )
-        }
-    };
+        },
+        |b| {
+            (
+                b.name.clone(),
+                b.app_path.clone(),
+                WatchTarget::Bundle {
+                    bundle_id: b.bundle_id.clone(),
+                    name: b.name.clone(),
+                },
+            )
+        },
+    );
     ProgramRow {
         name,
         bundle,
@@ -279,13 +287,17 @@ fn new_row(proc: &ProcInfo, bundle: Option<BundleRef>, first: ChildProc) -> Prog
 }
 
 /// Whether a single watch target still has a live process.
+#[must_use] 
 pub fn target_running(target: &WatchTarget) -> bool {
     any_target_running(std::slice::from_ref(target))
 }
 
-/// Whether *any* of the targets is still running. Bundle targets use the cheap
-/// `NSRunningApplication` lookup; only when an `Executable` target is present do
-/// we do a single process-tree scan covering all of them.
+/// Whether *any* of the targets is still running.
+///
+/// Bundle targets use the cheap `NSRunningApplication` lookup; only when an
+/// `Executable` target is present do we do a single process-tree scan covering
+/// all of them.
+#[must_use] 
 pub fn any_target_running(targets: &[WatchTarget]) -> bool {
     let mut exec_paths: Vec<&str> = Vec::new();
     for target in targets {

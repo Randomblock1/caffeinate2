@@ -9,9 +9,9 @@
 //! back over an `mpsc` channel and applied at the top of the run loop (not
 //! synchronously inside a button action, which would re-enter `AppState`).
 
-use crate::app_target::WatchTarget;
-use crate::macos_apps;
-use crate::process_enum::{self, BundleRef, ProgramRow};
+use crate::tray::app_target::WatchTarget;
+use crate::tray::macos_apps;
+use crate::tray::process_enum::{self, BundleRef, ProgramRow};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
@@ -111,7 +111,7 @@ define_class!(
 
         #[unsafe(method(rowCheckboxToggled:))]
         fn row_checkbox_toggled(&self, sender: &NSButton) {
-            let all_index = sender.tag() as usize;
+            let all_index = sender.tag().cast_unsigned();
             let entry = {
                 let all = self.ivars().all.borrow();
                 all.get(all_index)
@@ -157,7 +157,7 @@ define_class!(
     unsafe impl NSTableViewDataSource for WaitController {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows(&self, _table: &NSTableView) -> NSInteger {
-            self.ivars().rows.borrow().len() as NSInteger
+            self.ivars().rows.borrow().len().cast_signed()
         }
     }
 
@@ -169,7 +169,7 @@ define_class!(
             _column: Option<&NSTableColumn>,
             row: NSInteger,
         ) -> Option<Retained<NSView>> {
-            let display = self.ivars().rows.borrow().get(row as usize).cloned();
+            let display = self.ivars().rows.borrow().get(row.cast_unsigned()).cloned();
             match display {
                 Some(DisplayRow::Program { all_index }) => Some(self.program_cell(all_index)),
                 Some(DisplayRow::Child { name, pid }) => Some(self.child_cell(&name, pid)),
@@ -188,7 +188,7 @@ define_class!(
             }
             let app = NSApplication::sharedApplication(self.ivars().mtm);
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-            crate::macos_activation::wake_event_loop();
+            crate::tray::macos_activation::wake_event_loop();
         }
     }
 );
@@ -266,7 +266,7 @@ impl WaitController {
     }
 
     /// Re-scan the process tree and reload, preserving the current selection,
-    /// toggles, and search query. Driven by the run loop on NSWorkspace
+    /// toggles, and search query. Driven by the run loop on `NSWorkspace`
     /// launch/quit so the list stays live, and by the Refresh button (which
     /// also catches non-app/daemon changes the workspace observer misses).
     /// Skipped once the window is closing so we don't rebuild a dying table.
@@ -388,7 +388,7 @@ impl WaitController {
             NSPoint::new(26.0, 1.0),
             NSSize::new(COL_WIDTH - 30.0, 22.0),
         ));
-        checkbox.setTag(all_index as NSInteger);
+        checkbox.setTag(all_index.cast_signed());
         checkbox.setState(if checked {
             NSControlStateValueOn
         } else {
@@ -431,7 +431,7 @@ impl WaitWindow {
     }
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+const fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
@@ -469,6 +469,121 @@ fn not_running_row(target: WatchTarget, icon_path: String) -> ProgramRow {
     }
 }
 
+fn install_wait_window_header(
+    mtm: MainThreadMarker,
+    content: &NSView,
+    target: &AnyObject,
+) -> f64 {
+    let search = NSSearchField::new(mtm);
+    search.setFrame(rect(MARGIN, WIN_H - MARGIN - 24.0, INNER_W, 24.0));
+    unsafe {
+        search.setTarget(Some(target));
+        search.setAction(Some(sel!(searchChanged:)));
+    }
+    search.setSendsWholeSearchString(false);
+    search.setSendsSearchStringImmediately(true);
+    content.addSubview(&search);
+
+    let toggles_y = WIN_H - MARGIN - 24.0 - 8.0 - 22.0;
+    let show_all = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Show all programs"),
+            Some(target),
+            Some(sel!(showAllToggled:)),
+            mtm,
+        )
+    };
+    show_all.setFrame(rect(MARGIN, toggles_y, 200.0, 22.0));
+    content.addSubview(&show_all);
+    let show_system = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Show system apps"),
+            Some(target),
+            Some(sel!(showSystemToggled:)),
+            mtm,
+        )
+    };
+    show_system.setFrame(rect(MARGIN + 210.0, toggles_y, 200.0, 22.0));
+    content.addSubview(&show_system);
+
+    let apply = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Apply"),
+            Some(target),
+            Some(sel!(applyClicked:)),
+            mtm,
+        )
+    };
+    apply.setFrame(rect(WIN_W - MARGIN - 90.0, MARGIN, 90.0, 30.0));
+    content.addSubview(&apply);
+    let cancel = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Cancel"),
+            Some(target),
+            Some(sel!(cancelClicked:)),
+            mtm,
+        )
+    };
+    cancel.setFrame(rect(WIN_W - MARGIN - 90.0 - 8.0 - 90.0, MARGIN, 90.0, 30.0));
+    content.addSubview(&cancel);
+    let refresh = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Refresh"),
+            Some(target),
+            Some(sel!(refreshClicked:)),
+            mtm,
+        )
+    };
+    refresh.setFrame(rect(MARGIN, MARGIN, 90.0, 30.0));
+    content.addSubview(&refresh);
+    let choose_app = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Choose app…"),
+            Some(target),
+            Some(sel!(chooseAppClicked:)),
+            mtm,
+        )
+    };
+    choose_app.setFrame(rect(MARGIN + 98.0, MARGIN, 110.0, 30.0));
+    content.addSubview(&choose_app);
+    toggles_y
+}
+
+fn install_wait_window_table(
+    mtm: MainThreadMarker,
+    content: &NSView,
+    controller: &WaitController,
+    toggles_y: f64,
+) -> Retained<NSTableView> {
+    let scroll_top = toggles_y - 8.0;
+    let scroll_bottom = MARGIN + 30.0 + 8.0;
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        rect(MARGIN, scroll_bottom, INNER_W, scroll_top - scroll_bottom),
+    );
+    scroll.setHasVerticalScroller(true);
+
+    let table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        rect(0.0, 0.0, INNER_W, scroll_top - scroll_bottom),
+    );
+    let column = NSTableColumn::initWithIdentifier(
+        NSTableColumn::alloc(mtm),
+        &NSString::from_str("program"),
+    );
+    column.setWidth(COL_WIDTH);
+    table.addTableColumn(&column);
+    table.setHeaderView(None);
+    table.setRowHeight(ROW_HEIGHT);
+    unsafe {
+        table.setDataSource(Some(ProtocolObject::from_ref(controller)));
+        table.setDelegate(Some(ProtocolObject::from_ref(controller)));
+    }
+    scroll.setDocumentView(Some(&table));
+    content.addSubview(&scroll);
+    table
+}
+
 /// Open the picker window pre-checked with `selected`, delivering the result
 /// over `tx`. The caller must keep the returned [`WaitWindow`] alive for the
 /// window's lifetime.
@@ -502,110 +617,8 @@ pub fn open(
     unsafe { window.setReleasedWhenClosed(false) };
     let content = window.contentView().expect("window has a content view");
 
-    // Header: search field + the two toggles.
-    let search = NSSearchField::new(mtm);
-    search.setFrame(rect(MARGIN, WIN_H - MARGIN - 24.0, INNER_W, 24.0));
-    unsafe {
-        search.setTarget(Some(target));
-        search.setAction(Some(sel!(searchChanged:)));
-    }
-    search.setSendsWholeSearchString(false);
-    search.setSendsSearchStringImmediately(true);
-    content.addSubview(&search);
-
-    let toggles_y = WIN_H - MARGIN - 24.0 - 8.0 - 22.0;
-    let show_all = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("Show all programs"),
-            Some(target),
-            Some(sel!(showAllToggled:)),
-            mtm,
-        )
-    };
-    show_all.setFrame(rect(MARGIN, toggles_y, 200.0, 22.0));
-    content.addSubview(&show_all);
-    let show_system = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("Show system apps"),
-            Some(target),
-            Some(sel!(showSystemToggled:)),
-            mtm,
-        )
-    };
-    show_system.setFrame(rect(MARGIN + 210.0, toggles_y, 200.0, 22.0));
-    content.addSubview(&show_system);
-
-    // Footer: Cancel + Apply, bottom-right.
-    let apply = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Apply"),
-            Some(target),
-            Some(sel!(applyClicked:)),
-            mtm,
-        )
-    };
-    apply.setFrame(rect(WIN_W - MARGIN - 90.0, MARGIN, 90.0, 30.0));
-    content.addSubview(&apply);
-    let cancel = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Cancel"),
-            Some(target),
-            Some(sel!(cancelClicked:)),
-            mtm,
-        )
-    };
-    cancel.setFrame(rect(WIN_W - MARGIN - 90.0 - 8.0 - 90.0, MARGIN, 90.0, 30.0));
-    content.addSubview(&cancel);
-    // Bottom-left: manually re-scan (picks up daemons/non-app changes that the
-    // NSWorkspace launch/quit observer doesn't fire for) or add a dormant app.
-    let refresh = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Refresh"),
-            Some(target),
-            Some(sel!(refreshClicked:)),
-            mtm,
-        )
-    };
-    refresh.setFrame(rect(MARGIN, MARGIN, 90.0, 30.0));
-    content.addSubview(&refresh);
-    let choose_app = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Choose app…"),
-            Some(target),
-            Some(sel!(chooseAppClicked:)),
-            mtm,
-        )
-    };
-    choose_app.setFrame(rect(MARGIN + 98.0, MARGIN, 110.0, 30.0));
-    content.addSubview(&choose_app);
-
-    // Body: a scrolling table between header and footer.
-    let scroll_top = toggles_y - 8.0;
-    let scroll_bottom = MARGIN + 30.0 + 8.0;
-    let scroll = NSScrollView::initWithFrame(
-        NSScrollView::alloc(mtm),
-        rect(MARGIN, scroll_bottom, INNER_W, scroll_top - scroll_bottom),
-    );
-    scroll.setHasVerticalScroller(true);
-
-    let table = NSTableView::initWithFrame(
-        NSTableView::alloc(mtm),
-        rect(0.0, 0.0, INNER_W, scroll_top - scroll_bottom),
-    );
-    let column = NSTableColumn::initWithIdentifier(
-        NSTableColumn::alloc(mtm),
-        &NSString::from_str("program"),
-    );
-    column.setWidth(COL_WIDTH);
-    table.addTableColumn(&column);
-    table.setHeaderView(None);
-    table.setRowHeight(ROW_HEIGHT);
-    unsafe {
-        table.setDataSource(Some(ProtocolObject::from_ref(&*controller)));
-        table.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
-    }
-    scroll.setDocumentView(Some(&table));
-    content.addSubview(&scroll);
+    let toggles_y = install_wait_window_header(mtm, &content, target);
+    let table = install_wait_window_table(mtm, &content, &controller, toggles_y);
 
     window.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
     *controller.ivars().table.borrow_mut() = Some(table);

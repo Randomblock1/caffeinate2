@@ -95,11 +95,11 @@ full = ["tray", "helper-bin"]
 
 [[bin]]
 name = "caffeinate2"
-path = "src/main.rs"
+path = "src/bin/caffeinate2.rs"
 
 [[bin]]
 name = "sleepdetect"
-path = "src/sleepdetect.rs"
+path = "src/bin/sleepdetect.rs"
 
 [[bin]]
 name = "caffeinate2-tray"

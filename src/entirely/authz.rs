@@ -25,7 +25,7 @@ fn user_for_uid(uid: libc::uid_t) -> Option<User> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let ret = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    let ret = unsafe { libc::getpwuid_r(uid, &raw mut pwd, buf.as_mut_ptr(), buf.len(), &raw mut result) };
     if ret != 0 || result.is_null() {
         return None;
     }
@@ -50,10 +50,10 @@ fn gid_for_group(name: &str) -> Option<libc::gid_t> {
     let ret = unsafe {
         libc::getgrnam_r(
             cname.as_ptr(),
-            &mut grp,
+            &raw mut grp,
             buf.as_mut_ptr(),
             buf.len(),
-            &mut result,
+            &raw mut result,
         )
     };
     if ret != 0 || result.is_null() {
@@ -68,19 +68,19 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
     // macOS getgrouplist returns -1 when the array is too small (with
     // *ngroups set to how many fit), so grow and retry.
     while capacity <= 1024 {
-        let mut groups = vec![0 as libc::c_int; capacity as usize];
+        let mut groups = vec![0_i32; capacity.cast_unsigned() as usize];
         let mut count = capacity;
         let ret = unsafe {
             libc::getgrouplist(
                 cname.as_ptr(),
-                user.primary_gid as libc::c_int,
+                user.primary_gid.cast_signed(),
                 groups.as_mut_ptr(),
-                &mut count,
+                &raw mut count,
             )
         };
         if ret != -1 {
-            groups.truncate(count.max(0) as usize);
-            return Some(groups.into_iter().map(|g| g as libc::gid_t).collect());
+            groups.truncate(count.max(0).cast_unsigned() as usize);
+            return Some(groups.into_iter().map(i32::cast_unsigned).collect());
         }
         capacity *= 2;
     }
@@ -89,6 +89,7 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
 
 /// Whether `uid` may take an entirely-mode hold. Fails closed: any failure
 /// to resolve the user or their groups denies.
+#[must_use] 
 pub fn uid_may_hold(uid: libc::uid_t) -> bool {
     if uid == 0 {
         return true;
@@ -105,12 +106,11 @@ pub fn uid_may_hold(uid: libc::uid_t) -> bool {
 }
 
 /// Denial message sent to the client; starts with the
-/// [`crate::helper_ipc::is_authorization_error`] prefix and includes the
+/// [`crate::entirely::helper_ipc::is_authorization_error`] prefix and includes the
 /// exact grant command for this user.
+#[must_use] 
 pub fn denial_message(uid: libc::uid_t) -> String {
-    let who = user_for_uid(uid)
-        .map(|user| user.name)
-        .unwrap_or_else(|| format!("uid {uid}"));
+    let who = user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| user.name);
     format!(
         "not authorized: entirely mode requires an administrator account or membership in the \
          '{GRANT_GROUP}' group; an administrator can grant it with: \

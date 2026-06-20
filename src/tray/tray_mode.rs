@@ -1,12 +1,14 @@
-use crate::app_target::{AppTarget, WatchTarget};
-use crate::duration_parser::format_remaining_secs;
-use crate::fs_util;
-use crate::sleep_mode::SleepMode;
+use crate::sleep::sleep_mode::SleepMode;
+use crate::tray::app_target::{AppTarget, WatchTarget};
+use crate::util::duration_parser::format_remaining_secs;
+use crate::util::fs_util;
 use serde::{Deserialize, Serialize};
 
 /// Bumped to 2 when the single `wait_for_app` target became the multi-select
-/// `wait_for_apps` list. Migration is handled by `normalize_legacy`, not the
-/// version field (the loader never gates parsing on it).
+/// `wait_for_apps` list.
+///
+/// Migration is handled by `normalize_legacy`, not the version field (the
+/// loader never gates parsing on it).
 pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,32 +18,32 @@ pub struct TimeLimitPreset {
 }
 
 impl TimeLimitPreset {
-    pub const ALL: [TimeLimitPreset; 7] = [
-        TimeLimitPreset {
+    pub const ALL: [Self; 7] = [
+        Self {
             label: "Off",
             seconds: None,
         },
-        TimeLimitPreset {
+        Self {
             label: "15 minutes",
             seconds: Some(15 * 60),
         },
-        TimeLimitPreset {
+        Self {
             label: "30 minutes",
             seconds: Some(30 * 60),
         },
-        TimeLimitPreset {
+        Self {
             label: "1 hour",
             seconds: Some(60 * 60),
         },
-        TimeLimitPreset {
+        Self {
             label: "2 hours",
             seconds: Some(2 * 60 * 60),
         },
-        TimeLimitPreset {
+        Self {
             label: "4 hours",
             seconds: Some(4 * 60 * 60),
         },
-        TimeLimitPreset {
+        Self {
             label: "8 hours",
             seconds: Some(8 * 60 * 60),
         },
@@ -74,7 +76,7 @@ pub struct TrayConfig {
     pub upgrade_external: bool,
 }
 
-fn default_config_version() -> u32 {
+const fn default_config_version() -> u32 {
     CONFIG_VERSION
 }
 
@@ -104,6 +106,10 @@ impl TrayConfig {
     }
 }
 
+///
+/// # Errors
+///
+/// Returns an error if `HOME` is not set.
 pub fn config_path() -> Result<std::path::PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -113,20 +119,23 @@ pub fn config_path() -> Result<std::path::PathBuf, String> {
         .join("tray.toml"))
 }
 
+#[must_use] 
 pub fn load_config() -> TrayConfig {
-    let path = match config_path() {
-        Ok(p) => p,
-        Err(_) => return TrayConfig::default(),
+    let Ok(path) = config_path() else {
+        return TrayConfig::default();
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return TrayConfig::default(),
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return TrayConfig::default();
     };
     let mut config: TrayConfig = toml::from_str(&content).unwrap_or_default();
     config.normalize_legacy();
     config
 }
 
+///
+/// # Errors
+///
+/// Returns an error if the config directory or file cannot be written.
 pub fn save_config(config: &TrayConfig) -> Result<(), String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {

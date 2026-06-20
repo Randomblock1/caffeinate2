@@ -51,6 +51,7 @@ pub fn wake_event_loop() {
 /// Forward tray/menu events to channels. `tray-icon` and `muda` only deliver
 /// events through `set_event_handler`; `receiver()` is disabled once a handler is set.
 #[cfg(all(target_os = "macos", feature = "tray"))]
+#[must_use] 
 pub fn install_tray_event_handlers() -> (
     std::sync::mpsc::Receiver<tray_icon::TrayIconEvent>,
     std::sync::mpsc::Receiver<muda::MenuEvent>,
@@ -74,7 +75,7 @@ pub fn install_tray_event_handlers() -> (
     (tray_rx, menu_rx)
 }
 
-/// Keeps NSWorkspace launch/terminate observers registered for the app lifetime.
+/// Keeps `NSWorkspace` launch/terminate observers registered for the app lifetime.
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub struct WorkspaceObserverGuard {
     _launch:
@@ -164,10 +165,9 @@ pub fn pump_event_loop(timeout: Option<std::time::Duration>) {
         return;
     };
     let app = NSApplication::sharedApplication(mtm);
-    let deadline = match timeout {
-        Some(timeout) => NSDate::now().dateByAddingTimeInterval(timeout.as_secs_f64()),
-        None => NSDate::distantFuture(),
-    };
+    let deadline = timeout.map_or_else(NSDate::distantFuture, |timeout| {
+        NSDate::now().dateByAddingTimeInterval(timeout.as_secs_f64())
+    });
     let drain = NSDate::distantPast();
     let mode = unsafe { NSDefaultRunLoopMode };
 

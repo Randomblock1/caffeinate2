@@ -15,6 +15,10 @@ fn temp_path_for(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.with_file_name(temp_name))
 }
 
+///
+/// # Errors
+///
+/// Returns an I/O error if the temporary file or rename fails.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let temp_path = temp_path_for(path)?;
     let result = (|| {

@@ -1,17 +1,17 @@
-use crate::app_target::WatchTarget;
-use crate::helper_ipc::HelperClient;
-use crate::install;
-use crate::power_management::{self, AssertionType, ExternalAssertion};
-use crate::process_enum;
-use crate::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
-use crate::tray_icons;
-use crate::tray_mode::{self, TrayConfig};
+use crate::entirely::helper_ipc::HelperClient;
+use crate::entirely::install;
+use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
+use crate::sleep::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
+use crate::tray::app_target::WatchTarget;
+use crate::tray::process_enum;
+use crate::tray::tray_icons;
+use crate::tray::tray_mode::{self, TrayConfig};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
 
 /// How often to re-check external assertions while the upgrade watcher is on.
-/// External assertion changes post no NSWorkspace notification, so the only
+/// External assertion changes post no `NSWorkspace` notification, so the only
 /// option is polling — the same cadence `pmset` uses.
 const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -70,7 +70,7 @@ fn ignore_reason(assertion: &ExternalAssertion) -> &'static str {
 }
 
 /// Split the observed external assertions into the ones worth upgrading and the
-/// ones to report as ignored. Pure (no IOKit) so it can be unit-tested.
+/// ones to report as ignored. Pure (no `IOKit`) so it can be unit-tested.
 fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassification {
     let trigger_type = UPGRADE_TRIGGER_TYPE.as_str();
     let is_upgradeable = |a: &ExternalAssertion| {
@@ -140,6 +140,7 @@ pub struct MenuSnapshot {
     pub ignored_assertions: Vec<IgnoredAssertion>,
 }
 
+#[allow(clippy::struct_excessive_bools)] // session/watch flags are independent toggles
 pub struct AppState {
     config: TrayConfig,
     session: Option<ActiveTraySession>,
@@ -211,7 +212,7 @@ impl AppState {
         tray_mode::save_config(&self.config)
     }
 
-    pub fn is_on(&self) -> bool {
+    pub const fn is_on(&self) -> bool {
         self.session.is_some()
     }
 
@@ -238,9 +239,8 @@ impl AppState {
         // The upgrade watcher needs to keep polling even while idle, since
         // external assertion changes arrive via no event.
         if self.config.upgrade_external || needs_proc_poll {
-            return Some(match countdown {
-                Some(remaining) => remaining.min(UPGRADE_POLL_INTERVAL),
-                None => UPGRADE_POLL_INTERVAL,
+            return countdown.map_or(Some(UPGRADE_POLL_INTERVAL), |remaining| {
+                Some(remaining.min(UPGRADE_POLL_INTERVAL))
             });
         }
         countdown
@@ -560,10 +560,9 @@ impl AppState {
             return false;
         }
 
-        let external = match power_management::external_assertions(OBSERVED_TYPES) {
-            Ok(list) => list,
+        let Ok(external) = power_management::external_assertions(OBSERVED_TYPES) else {
             // Transient IOKit failure; leave the current state and retry.
-            Err(_) => return false,
+            return false;
         };
         let ExternalClassification {
             upgradeable,
@@ -643,14 +642,14 @@ impl AppState {
                 }
             }
             Some(session) if session.started_by_upgrade => {
-                if session.upgrade_apps != app_names {
+                if session.upgrade_apps == app_names {
+                    false
+                } else {
                     session.upgrade_apps = app_names;
                     self.last_tooltip = None;
                     // The displayed process list changed; rebuild the menu.
                     self.menu_dirty = true;
                     true
-                } else {
-                    false
                 }
             }
             // A manual session is already preventing sleep; leave it untouched.

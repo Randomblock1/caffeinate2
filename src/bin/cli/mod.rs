@@ -1,4 +1,6 @@
-use crate::sleep_mode::{SleepMode, SleepModeSet};
+pub mod wait;
+
+use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
 use clap::Parser;
 
 /// One-shot maintenance action selected via an exclusive flag.
@@ -12,6 +14,7 @@ pub enum MaintenanceCommand {
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)] // clap flags map naturally to bool fields
 pub struct Args {
     /// Install the privileged helper for entirely mode
     /// (prompts for administrator authorization; or run with sudo).
@@ -92,7 +95,7 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn maintenance_command(&self) -> Option<MaintenanceCommand> {
+    pub const fn maintenance_command(&self) -> Option<MaintenanceCommand> {
         // The flags are `exclusive`, so clap guarantees at most one is set.
         if self.install_helper {
             Some(MaintenanceCommand::InstallHelper)
@@ -132,6 +135,6 @@ impl Args {
 }
 
 #[cfg(test)]
-pub(crate) fn parse_args(args: &[&str]) -> Args {
+pub fn parse_args(args: &[&str]) -> Args {
     Args::try_parse_from(args).unwrap()
 }
