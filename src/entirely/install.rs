@@ -100,6 +100,11 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     let dest = PathBuf::from(HELPER_INSTALL_PATH);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(InstallError::from)?;
+        // create_dir_all honors the process umask, which a permissive setting
+        // could leave group/world-writable — a privilege-escalation vector for
+        // the root-owned helper binary below. Pin it to 0o755 explicitly.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+            .map_err(InstallError::from)?;
     }
     // Reinstall path: stop any loaded helper before replacing its binary, and
     // unlink the old file so the copy gets a fresh inode. Overwriting a running

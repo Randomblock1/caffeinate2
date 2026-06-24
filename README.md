@@ -125,12 +125,12 @@ Run `caffeinate2-tray` after installing with `--features full`.
 - **Right click:** open the menu:
   - **Mode** — Display, Disk, System, System on AC, User active, or Entirely.
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
-  - **Until app quits** — pick a running app, or **Choose application…** for any `.app`.
+  - **Until app quits** — pick one or more running apps, or **Choose application…** for any `.app`.
   - **Upgrade other apps' sleep prevention** — see below.
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
-When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Until app quits** keeps prevention on until every instance of the chosen app has exited; if the app isn't running yet, caffeinate2 waits for it to launch. With both set, whichever comes first wins. The tooltip shows remaining time and/or app status while active.
+When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Until app quits** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. The tooltip shows remaining time and/or app status while active.
 
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 

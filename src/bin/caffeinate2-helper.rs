@@ -10,6 +10,7 @@ use caffeinate2::util::logging;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
 #[cfg(target_os = "macos")]

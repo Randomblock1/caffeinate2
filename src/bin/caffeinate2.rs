@@ -96,8 +96,14 @@ fn command_credentials(
     active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
 ) -> CommandCredentials {
     if args.drop_root {
-        let uid_str = std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
-        let gid_str = std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
+        let sudo_uid = std::env::var("SUDO_UID").ok();
+        let sudo_gid = std::env::var("SUDO_GID").ok();
+        let uid_str = sudo_uid
+            .clone()
+            .unwrap_or_else(|| unistd::getuid().to_string());
+        let gid_str = sudo_gid
+            .clone()
+            .unwrap_or_else(|| unistd::getgid().to_string());
         let Ok(uid) = uid_str.parse::<u32>() else {
             eprintln!("Error: invalid SUDO_UID: {uid_str}");
             release_active_and_exit(active, 1);
@@ -106,6 +112,16 @@ fn command_credentials(
             eprintln!("Error: invalid SUDO_GID: {gid_str}");
             release_active_and_exit(active, 1);
         };
+        // With neither SUDO_UID nor SUDO_GID set we fell back to the current
+        // ids; if those are root, --drop-root would silently run the command as
+        // root anyway (invoked as root directly, not via sudo). Refuse rather
+        // than defeat the flag the user explicitly asked for.
+        if sudo_uid.is_none() && sudo_gid.is_none() && uid == 0 {
+            eprintln!(
+                "Error: --drop-root requires running via sudo; SUDO_UID/SUDO_GID are unset and the process is root, so privileges cannot be dropped"
+            );
+            release_active_and_exit(active, 1);
+        }
         // Resolve via SUDO_USER when present; otherwise fall back to just the
         // primary group so the child still sheds root's supplementary groups.
         let groups = std::env::var("SUDO_USER")

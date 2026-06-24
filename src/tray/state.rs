@@ -570,7 +570,16 @@ impl AppState {
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The worker vanished without sending (should not happen);
                 // treat it as a failure so the UI doesn't hang "enabling…".
-                self.pending_enable = None;
+                // Apply the same rollback as the Err(error) path so a failed
+                // mode switch doesn't leave config.mode advanced past the hold
+                // that is actually (still) enforced.
+                let pending = self.pending_enable.take().expect("pending enable present");
+                if let Some(rollback_mode) = pending.rollback_mode {
+                    self.config.mode = rollback_mode;
+                    if let Err(save_err) = self.save_config() {
+                        eprintln!("failed to roll back mode after enable failure: {save_err}");
+                    }
+                }
                 return PendingEnableOutcome::Failed(EnableError::Ipc(
                     "enable worker terminated unexpectedly".to_string(),
                 ));
