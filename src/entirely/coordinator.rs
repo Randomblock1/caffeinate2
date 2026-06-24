@@ -1,4 +1,5 @@
 use crate::entirely::{
+    error::CoordinatorError,
     lockfile::{self, ProcessChecker, ProcessId},
     process_util,
 };
@@ -77,39 +78,49 @@ impl EntirelyCoordinator {
             Arc::new(process_util::default_process_checker),
         );
         if let Err(e) = coordinator.reconcile_startup() {
-            eprintln!("startup reconcile failed: {e}");
+            tracing::warn!("startup reconcile failed: {e}");
         }
         // The CLI fallback has no long-lived daemon, so it runs a best-effort
         // in-process reaper while this invocation is alive. If this root CLI is
         // SIGKILLed and no future entirely-mode invocation runs, its lockfile
         // entry and SleepDisabled=true can persist; install the helper to avoid
         // that inherent CLI-only limit.
+        //
+        // Spawn that reaper at most once per process. `cli_fallback` can be
+        // invoked repeatedly, and a fresh non-stoppable loop per call would
+        // leak a thread each time. The reaper only reconciles the shared
+        // lockfile, so a single thread bound to the first coordinator suffices.
+        static REAPER_STARTED: std::sync::Once = std::sync::Once::new();
         let reaper = coordinator.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(CLI_FALLBACK_RECONCILE_INTERVAL);
-                if let Err(e) = reaper.reconcile() {
-                    eprintln!("periodic reconcile failed: {e}");
+        REAPER_STARTED.call_once(move || {
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(CLI_FALLBACK_RECONCILE_INTERVAL);
+                    if let Err(e) = reaper.reconcile() {
+                        tracing::warn!("periodic reconcile failed: {e}");
+                    }
                 }
-            }
+            });
         });
         coordinator
+    }
+
+    /// Lock the operations mutex, recovering from poisoning instead of
+    /// panicking. A worker thread that panicked mid-operation must not take
+    /// down every future hold/release on the helper; the lockfile is re-read
+    /// under this lock on each operation, so stale in-memory state can't
+    /// corrupt the on-disk source of truth.
+    fn lock_ops(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.ops.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     ///
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be updated or sleep cannot be disabled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal operations mutex is poisoned.
-    pub fn hold(
-        &self,
-        process_id: ProcessId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn hold(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
-        let _ops = inner.ops.lock().expect("ops lock");
+        let _ops = self.lock_ops();
         let should_disable = lockfile::update_lockfile(
             true,
             inner.verbose,
@@ -120,7 +131,7 @@ impl EntirelyCoordinator {
 
         if should_disable {
             if inner.verbose {
-                eprintln!("First holder detected. Disabling system sleep globally.");
+                tracing::info!("First holder detected. Disabling system sleep globally.");
             }
             if let Err(code) = (inner.sleep_disabler)(true, inner.verbose) {
                 let _ = lockfile::update_lockfile(
@@ -130,14 +141,11 @@ impl EntirelyCoordinator {
                     inner.process_checker.as_ref(),
                     &process_id,
                 );
-                return Err(std::io::Error::other(format!(
-                    "Failed to disable sleep (IOKit error: {code:X})"
-                ))
-                .into());
+                return Err(CoordinatorError::DisableSleepFailed { code });
             }
             inner.sleep_disabled.store(true, Ordering::SeqCst);
         } else if inner.verbose {
-            eprintln!("Other holders running. Sleep already disabled.");
+            tracing::info!("Other holders running. Sleep already disabled.");
         }
 
         Ok(())
@@ -147,16 +155,9 @@ impl EntirelyCoordinator {
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be updated or sleep cannot be re-enabled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal operations mutex is poisoned.
-    pub fn release(
-        &self,
-        process_id: ProcessId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn release(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
-        let _ops = inner.ops.lock().expect("ops lock");
+        let _ops = self.lock_ops();
         let should_enable = lockfile::update_lockfile(
             false,
             inner.verbose,
@@ -167,7 +168,7 @@ impl EntirelyCoordinator {
 
         if should_enable {
             if inner.verbose {
-                eprintln!("Last holder released. Re-enabling system sleep globally.");
+                tracing::info!("Last holder released. Re-enabling system sleep globally.");
             }
             if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
                 // Mirror hold(): restore the lockfile entry when re-enabling sleep
@@ -179,14 +180,11 @@ impl EntirelyCoordinator {
                     inner.process_checker.as_ref(),
                     &process_id,
                 );
-                return Err(std::io::Error::other(format!(
-                    "Failed to re-enable sleep (IOKit error: {code:X})"
-                ))
-                .into());
+                return Err(CoordinatorError::EnableSleepFailed { code });
             }
             inner.sleep_disabled.store(false, Ordering::SeqCst);
         } else if inner.verbose {
-            eprintln!("Other holders still running. Keeping sleep disabled.");
+            tracing::info!("Other holders still running. Keeping sleep disabled.");
         }
 
         Ok(())
@@ -194,80 +192,129 @@ impl EntirelyCoordinator {
 
     /// Re-sync the global sleep setting with the lockfile after a (re)start.
     ///
-    /// Prunes dead holders, then force-disables sleep if live holders remain,
-    /// so a helper crash can't leave active holders ineffective. It does not
-    /// force the enable direction on an empty lockfile because that is
+    /// Prunes dead holders, then re-disables sleep if live holders remain, so a
+    /// helper crash can't leave active holders ineffective. It does not force
+    /// the enable direction on an empty lockfile because that is
     /// indistinguishable from a manual `pmset disablesleep` made outside of
     /// caffeinate2.
     ///
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
-    pub fn reconcile_startup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.reconcile_with(true)
+    pub fn reconcile_startup(&self) -> Result<(), CoordinatorError> {
+        let _ops = self.lock_ops();
+        // At (re)start the in-memory `sleep_disabled` flag is freshly false, so
+        // a helper that crashed while holding the disable would otherwise never
+        // re-enable sleep after its holders die. Treat "the lockfile still had
+        // holders that we just pruned to zero" as evidence caffeinate2 disabled
+        // sleep, and converge by re-enabling it.
+        self.reconcile_locked(true).map(|_| ())
     }
 
     /// Periodic reaper: prune holders whose processes have died and converge
     /// the sleep setting to `holders > 0`.
     ///
-    /// Only acts when the desired state differs from the state this
-    /// coordinator last applied, so it doesn't fight a manual
+    /// When live holders remain it always re-applies the disable (the IOKit set
+    /// is idempotent), so an external `pmset enablesleep` (or a wake from a
+    /// sleep cycle) made while holds are active is corrected on the next pass
+    /// instead of being trusted away by cached state. It still never
+    /// force-enables on an empty lockfile, so it won't fight a manual
     /// `pmset disablesleep` made outside of any holds.
     ///
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
-    pub fn reconcile(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.reconcile_with(false)
+    pub fn reconcile(&self) -> Result<(), CoordinatorError> {
+        let _ops = self.lock_ops();
+        self.reconcile_locked(false).map(|_| ())
     }
 
-    fn reconcile_with(&self, force: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Prune dead holders and converge the system sleep setting, returning the
+    /// live holder count. The caller must already hold the ops lock.
+    ///
+    /// `treat_pruned_as_intent` re-enables sleep when pruning empties a lockfile
+    /// that *had* holders (used only at startup, where the in-memory
+    /// `sleep_disabled` flag is not yet trustworthy). The periodic reconcile
+    /// passes `false` and relies on the cached flag, so it never force-enables
+    /// against a manual `pmset disablesleep`.
+    fn reconcile_locked(&self, treat_pruned_as_intent: bool) -> Result<usize, CoordinatorError> {
         let inner = &self.inner;
-        let _ops = inner.ops.lock().expect("ops lock");
-        let holders = lockfile::prune_lockfile(
+        let lockfile::PruneOutcome {
+            live: holders,
+            had_entries,
+        } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
         )?;
-        let disable = holders > 0;
-        let force_apply = force && disable;
-        if !force_apply && disable == inner.sleep_disabled.load(Ordering::SeqCst) {
-            return Ok(());
+        if holders > 0 {
+            // Live holders remain: always re-apply the disable. The
+            // SleepDisabler abstraction is write-only, so we can't read the
+            // real SleepDisabled state to compare against; trusting the cached
+            // intent would silently leave holders ineffective if something
+            // external (manual `pmset enablesleep`, another tool, a sleep/wake
+            // cycle) re-enabled sleep. The IOKit set is idempotent and this
+            // runs at most once per reconcile interval, so re-applying is cheap.
+            if inner.verbose {
+                tracing::info!(
+                    "Reconcile: {holders} live holder(s); disabling system sleep."
+                );
+            }
+            if let Err(code) = (inner.sleep_disabler)(true, inner.verbose) {
+                return Err(CoordinatorError::ReconcileSleepFailed { code });
+            }
+            inner.sleep_disabled.store(true, Ordering::SeqCst);
+        } else if inner.sleep_disabled.load(Ordering::SeqCst) || (treat_pruned_as_intent && had_entries) {
+            // No holders, but either we previously disabled sleep ourselves, or
+            // this is a (re)start and the lockfile still held holders we just
+            // pruned to zero (a helper crash before its holders died). Re-enable
+            // sleep to converge. An empty lockfile (no `had_entries`) never
+            // force-enables, so a manual `pmset disablesleep` made outside
+            // caffeinate2 is left untouched.
+            if inner.verbose {
+                tracing::info!("Reconcile: no live holders; re-enabling system sleep.");
+            }
+            if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
+                return Err(CoordinatorError::ReconcileSleepFailed { code });
+            }
+            inner.sleep_disabled.store(false, Ordering::SeqCst);
         }
-        if inner.verbose {
-            eprintln!(
-                "Reconcile: {holders} live holder(s); {} system sleep.",
-                if disable { "disabling" } else { "enabling" }
-            );
-        }
-        if let Err(code) = (inner.sleep_disabler)(disable, inner.verbose) {
-            return Err(std::io::Error::other(format!(
-                "Failed to reconcile sleep state (IOKit error: {code:X})"
-            ))
-            .into());
-        }
-        inner.sleep_disabled.store(disable, Ordering::SeqCst);
-        Ok(())
+        Ok(holders)
     }
 
     ///
     /// # Errors
     ///
-    /// Returns an error if the lockfile cannot be read or pruned.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal operations mutex is poisoned.
-    pub fn status(&self) -> Result<EntirelyStatus, Box<dyn std::error::Error + Send + Sync>> {
+    /// Returns an error if the lockfile cannot be read or pruned, or if
+    /// converging the sleep setting after pruning fails.
+    pub fn status(&self) -> Result<EntirelyStatus, CoordinatorError> {
         let inner = &self.inner;
-        let _ops = inner.ops.lock().expect("ops lock");
-        let holders = lockfile::prune_lockfile(
+        let _ops = self.lock_ops();
+        let lockfile::PruneOutcome { live: holders, .. } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
         )?;
+        if holders == 0 && inner.sleep_disabled.load(Ordering::SeqCst) {
+            // Pruning just dropped the last holder. Converge immediately by
+            // re-enabling sleep instead of waiting up to a full reconcile
+            // interval for the periodic reaper to notice.
+            if inner.verbose {
+                tracing::info!("Status: last holder pruned; re-enabling system sleep.");
+            }
+            if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
+                return Err(CoordinatorError::EnableSleepFailed { code });
+            }
+            inner.sleep_disabled.store(false, Ordering::SeqCst);
+        }
         Ok(EntirelyStatus {
             holders,
+            // `sleep_disabled` reflects the coordinator's applied intent, not a
+            // fresh read of the kernel's SleepDisabled setting (the
+            // SleepDisabler abstraction is write-only). Because the periodic
+            // reconcile re-applies the disable while holders remain, this stays
+            // aligned with reality in the steady state; a transient external
+            // change can briefly make it stale until the next reconcile.
             sleep_disabled: holders > 0 || inner.sleep_disabled.load(Ordering::SeqCst),
         })
     }
@@ -276,9 +323,7 @@ impl EntirelyCoordinator {
     /// # Errors
     ///
     /// Returns an error if the hold cannot be acquired for the current process.
-    pub fn hold_current_process(
-        &self,
-    ) -> Result<EntirelyHoldGuard, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn hold_current_process(&self) -> Result<EntirelyHoldGuard, CoordinatorError> {
         let process_id = process_util::process_id_from_pid(std::process::id().cast_signed())?;
         self.hold(process_id)?;
         Ok(EntirelyHoldGuard {
@@ -300,7 +345,7 @@ impl EntirelyHoldGuard {
     /// # Errors
     ///
     /// Returns an error if the hold cannot be released.
-    pub fn release(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn release(&mut self) -> Result<(), CoordinatorError> {
         if !self.active {
             return Ok(());
         }
@@ -315,7 +360,7 @@ impl Drop for EntirelyHoldGuard {
         if self.active
             && let Err(e) = self.release()
         {
-            eprintln!("Error releasing entirely hold: {e}");
+            tracing::warn!("Error releasing entirely hold: {e}");
         }
     }
 }
@@ -427,6 +472,43 @@ mod tests {
         coordinator.reconcile_startup().unwrap();
 
         assert!(sleep_calls.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn reconcile_startup_reenables_after_pruning_dead_holders() {
+        // A helper that crashed while holding the disable leaves a stale holder
+        // in the lockfile. On restart the fresh coordinator must notice the
+        // lockfile *had* a holder, prune the dead entry, and re-enable sleep —
+        // even though its cached flag starts false.
+        let lock_path = temp_lock_path();
+        let stale = ProcessId {
+            pid: 999_999,
+            start_time: ProcessStartTime {
+                seconds: 7,
+                microseconds: 0,
+            },
+        };
+        std::fs::write(&lock_path, format!("{stale}\n")).unwrap();
+
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            Ok(())
+        });
+        // Every holder is dead, so pruning empties the lockfile.
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile_startup().unwrap();
+
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
         let _ = std::fs::remove_file(&lock_path);
     }
 

@@ -2,17 +2,21 @@
 mod tray_cli;
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
+use anyhow::Context;
+#[cfg(all(target_os = "macos", feature = "tray"))]
 use caffeinate2::entirely::install;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+use caffeinate2::util::logging;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use clap::Parser;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 use tray_cli::{Args, MaintenanceCommand};
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
-fn run_maintenance(command: MaintenanceCommand) -> Result<(), String> {
+fn run_maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
     match command {
         MaintenanceCommand::InstallLaunchAgent => {
-            let tray_path = std::env::current_exe().map_err(|e| e.to_string())?;
+            let tray_path = std::env::current_exe().context("could not resolve tray binary path")?;
             install::install_tray_launch_agent(&tray_path)?;
             let plist_path = install::tray_launch_agent_path()?;
             println!("Installed tray LaunchAgent at {}.", plist_path.display());
@@ -39,17 +43,18 @@ fn run_maintenance(command: MaintenanceCommand) -> Result<(), String> {
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 fn main() {
+    logging::init_cli_tracing();
     let args = Args::parse();
     if let Some(command) = args.maintenance_command() {
         if let Err(error) = run_maintenance(command) {
-            eprintln!("Error: {error}");
+            tracing::error!("Error: {error:#}");
             std::process::exit(1);
         }
         return;
     }
 
     if let Err(e) = caffeinate2::tray::run() {
-        eprintln!("caffeinate2-tray error: {e}");
+        tracing::error!("caffeinate2-tray error: {e:#}");
         std::process::exit(1);
     }
 }

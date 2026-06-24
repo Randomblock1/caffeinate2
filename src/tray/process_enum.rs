@@ -8,8 +8,23 @@
 
 use crate::tray::app_target::WatchTarget;
 use crate::tray::macos_apps;
-use libc::{PROC_PIDTBSDINFO, proc_bsdinfo, proc_pidinfo};
+use libproc::bsd_info::BSDInfo;
+use libproc::proc_pid::{pidinfo, pidpath};
+use libproc::processes::{pids_by_type, ProcFilter};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long to reuse a process-tree scan on the main thread before refreshing.
+const PROC_SCAN_CACHE_TTL: Duration = Duration::from_secs(3);
+
+type ExecPathCache = Option<(Instant, Vec<String>)>;
+
+static EXEC_PATH_CACHE: OnceLock<Mutex<ExecPathCache>> = OnceLock::new();
+
+fn exec_path_cache() -> &'static Mutex<Option<(Instant, Vec<String>)>> {
+    EXEC_PATH_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// A single running process, with just enough info to group and label it.
 #[derive(Debug, Clone)]
@@ -55,50 +70,26 @@ pub struct ProgramRow {
     pub procs: Vec<ChildProc>,
 }
 
-/// All readable PIDs. The set can change between sizing and fill, so we oversize
-/// the buffer and trust the returned PID count (a few transient PIDs are
-/// harmless).
+/// All readable PIDs.
 fn all_pids() -> Vec<i32> {
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return Vec::new();
-    }
-    let cap = count.cast_unsigned() as usize + 64;
-    let mut pids = vec![0i32; cap];
-    let byte_count: libc::c_int = cap
-        .saturating_mul(std::mem::size_of::<i32>())
-        .try_into()
-        .unwrap_or(i32::MAX);
-    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), byte_count) };
-    if count <= 0 {
-        return Vec::new();
-    }
-    pids.truncate(count.cast_unsigned() as usize);
-    pids.retain(|&pid| pid > 0);
-    pids
+    pids_by_type(ProcFilter::All)
+        .map(|pids| {
+            pids.into_iter()
+                .filter(|&pid| pid > 0)
+                .map(|pid| pid as i32)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Executable path for `pid`, or empty if `proc_pidpath` fails (kernel/protected
 /// processes return EPERM).
-const PROC_PIDPATH_MAX: usize = 4096;
-
 fn proc_path(pid: i32) -> String {
-    let mut buf = [0u8; PROC_PIDPATH_MAX];
-    let len = unsafe {
-        libc::proc_pidpath(
-            pid,
-            buf.as_mut_ptr().cast(),
-            u32::try_from(buf.len()).unwrap_or(u32::MAX),
-        )
-    };
-    if len <= 0 {
-        return String::new();
-    }
-    String::from_utf8_lossy(&buf[..len.cast_unsigned() as usize]).into_owned()
+    pidpath(pid).unwrap_or_default()
 }
 
 /// Read a NUL-terminated fixed C-char array (`pbi_name`/`pbi_comm`).
-fn cstr_field(bytes: &[libc::c_char]) -> String {
+fn cstr_field(bytes: &[i8]) -> String {
     let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), bytes.len()) };
     let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..len]).into_owned()
@@ -111,15 +102,13 @@ fn cstr_field(bytes: &[libc::c_char]) -> String {
 pub fn list_processes() -> Vec<ProcInfo> {
     let mut out = Vec::new();
     for pid in all_pids() {
-        let mut info = unsafe { std::mem::zeroed::<proc_bsdinfo>() };
-        let size = i32::try_from(std::mem::size_of::<proc_bsdinfo>()).unwrap_or(i32::MAX);
-        let ret = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-        if ret != size {
-            continue;
-        }
+        let info = match pidinfo::<BSDInfo>(pid, 0) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
         out.push(ProcInfo {
             pid,
-            ppid: info.pbi_ppid.cast_signed(),
+            ppid: info.pbi_ppid as i32,
             uid: info.pbi_uid,
             exec_path: proc_path(pid),
             comm: cstr_field(&info.pbi_name),
@@ -128,14 +117,45 @@ pub fn list_processes() -> Vec<ProcInfo> {
     out
 }
 
-/// Executable paths of all live processes — the lightweight scan the watch loop
-/// uses to test `Executable` targets (no `proc_pidinfo`, just paths).
+/// Canonicalized executable paths of all live processes — the lightweight scan
+/// the watch loop uses to test `Executable` targets (no `proc_pidinfo`, just
+/// paths). Paths are canonicalized here so the result (including the per-process
+/// `realpath` cost) is cached: repeated main-thread polls neither walk the full
+/// process tree nor re-canonicalize hundreds of paths every tick.
 fn running_executable_paths() -> Vec<String> {
-    all_pids()
+    let cache = exec_path_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((stamp, paths)) = cache.as_ref()
+        && stamp.elapsed() < PROC_SCAN_CACHE_TTL
+    {
+        return paths.clone();
+    }
+    drop(cache);
+
+    let paths: Vec<String> = all_pids()
         .into_iter()
         .map(proc_path)
         .filter(|path| !path.is_empty())
-        .collect()
+        .map(|path| canonical_exec_path(&path))
+        .collect();
+
+    // Only cache a non-empty scan. `all_pids()` returns an empty Vec when the
+    // underlying `pids_by_type` syscall transiently fails; caching that would
+    // report every `Executable` watch target as not-running for the full TTL
+    // and could prematurely end a watch session. Returning the empty result for
+    // this one tick (without caching it) self-corrects on the next poll, which
+    // matches the pre-caching behaviour.
+    if !paths.is_empty() {
+        *exec_path_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), paths.clone()));
+    }
+    paths
+}
+
+/// Canonical path for stable comparison when checking executable targets.
+fn canonical_exec_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Outermost `.app` ancestor of an executable path, so an Electron helper at
@@ -307,10 +327,13 @@ pub fn any_target_running(targets: &[WatchTarget]) -> bool {
     if exec_paths.is_empty() {
         return false;
     }
+    // `running_executable_paths` already returns canonical paths (cached), so
+    // only the handful of target paths need canonicalizing here.
     let running = running_executable_paths();
     exec_paths
         .iter()
-        .any(|path| running.iter().any(|live| live == path))
+        .map(|path| canonical_exec_path(path))
+        .any(|target| running.iter().any(|live| live == &target))
 }
 
 #[cfg(test)]

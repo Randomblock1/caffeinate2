@@ -12,6 +12,11 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Interactive keeps the daemon responsive to RPCs and exempt from the
+         aggressive throttling applied to background ProcessTypes; it still runs
+         as root with full privileges, so this does not weaken helper operation. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardErrorPath</key>
     <string>/var/log/caffeinate2-helper.log</string>
     <key>StandardOutPath</key>

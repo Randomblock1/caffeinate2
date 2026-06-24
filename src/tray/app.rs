@@ -1,12 +1,26 @@
 use crate::sleep::sleep_mode::SleepMode;
-use crate::tray::menu::{MenuAction, build_menu, handle_menu_event, install_menu};
-use crate::tray::state::AppState;
+use crate::tray::error::TrayError;
+use crate::tray::menu::{
+    MenuAction, MenuHandles, build_menu, handle_menu_event, install_menu, sync_menu_to_snapshot,
+};
+use crate::tray::single_instance;
+use crate::tray::state::{AppState, PendingEnableOutcome};
 use crate::tray::tray_icons;
 use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use objc2_foundation::MainThreadMarker;
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+
+/// Longest the main event pump will block when otherwise idle, so an
+/// off-main-thread shutdown signal is noticed promptly (see the pump call site).
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn poll_stop_conditions(state: &mut AppState) -> bool {
     // `|` (not `||`): every poll must run each tick. `check_app_watch` and
@@ -18,33 +32,71 @@ fn poll_stop_conditions(state: &mut AppState) -> bool {
     timeout | app_watch | upgrade
 }
 
+fn poll_pending_enable(
+    state: &mut AppState,
+    tray: &tray_icon::TrayIcon,
+    handles: &MenuHandles,
+) {
+    match state.poll_pending_enable() {
+        PendingEnableOutcome::Idle | PendingEnableOutcome::Pending => {}
+        PendingEnableOutcome::Started => {
+            state.set_icon(tray);
+            // An async mode switch can commit a different mode than the menu
+            // currently shows; re-sync the checkboxes to the committed state.
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
+        }
+        PendingEnableOutcome::Failed(error) => {
+            eprintln!("{error}");
+            state.set_icon(tray);
+            state.show_error_tooltip(tray, &error.to_string());
+            // A failed mode switch rolled `config.mode` back; the menu checkbox
+            // was optimistically moved to the failed target when the command ran
+            // (muda auto-toggles, then dispatch_command re-synced to the target),
+            // so re-sync it to the rolled-back state here.
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
+        }
+    }
+}
+
 ///
 /// # Errors
 ///
 /// Returns an error if tray setup or icon decoding fails.
-pub fn run() -> Result<(), String> {
+pub fn run() -> Result<(), TrayError> {
+    single_instance::acquire_or_exit();
     crate::tray::macos_activation::init_tray_app();
     let (tray_events, menu_events) = crate::tray::macos_activation::install_tray_event_handlers();
     let (workspace_dirty, _workspace_guard) =
         crate::tray::macos_activation::install_workspace_observers();
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<i32>();
+    thread::spawn(move || {
+        let mut signals =
+            Signals::new([SIGINT, SIGTERM]).expect("failed to create signal iterator");
+        if let Some(signal) = signals.forever().next() {
+            let _ = shutdown_tx.send(signal);
+            crate::tray::macos_activation::wake_event_loop();
+        }
+    });
+
     // tray-icon requires a running main-thread event loop before creating the icon.
     crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
 
     let (icon_off_rgba, icon_width, icon_height) =
         tray_icons::decode_icon_rgba(tray_icons::ICON_OFF)?;
-    let icon_off =
-        Icon::from_rgba(icon_off_rgba, icon_width, icon_height).map_err(|e| e.to_string())?;
+    let icon_off = Icon::from_rgba(icon_off_rgba, icon_width, icon_height)
+        .map_err(|e| TrayError::BuildIcon(e.to_string()))?;
 
     // Everything below runs on the main thread only; muda menu items are not
     // Send, so no locking or sharing is involved.
-    let mtm = MainThreadMarker::new().ok_or("tray must run on the main thread")?;
+    let mtm = MainThreadMarker::new().ok_or(TrayError::NotMainThread)?;
     let mut state = AppState::new();
     let initial = state.menu_snapshot();
 
     // The picker window reports its result back over this channel, drained at
     // the top of the loop so the selection is applied outside the button
     // action (which runs re-entrantly inside the shared event pump).
-    let (wait_tx, wait_rx) = std::sync::mpsc::channel::<WaitWindowMsg>();
+    let (wait_tx, wait_rx) = mpsc::channel::<WaitWindowMsg>();
     let mut wait_window: Option<WaitWindow> = None;
 
     let (menu, initial_handles) = build_menu(&initial);
@@ -55,23 +107,29 @@ pub fn run() -> Result<(), String> {
         .with_menu_on_left_click(false)
         .with_tooltip("caffeinate2")
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| TrayError::TraySetup(e.to_string()))?;
     crate::tray::macos_activation::wake_event_loop();
 
     let mut handles = initial_handles;
 
     'main: loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break 'main;
+        }
+
+        poll_pending_enable(&mut state, &tray, &handles);
+
         if poll_stop_conditions(&mut state) {
             state.set_icon(&tray);
-        } else if state.is_on() {
+        } else if state.is_on() || state.is_enabling() {
             state.update_tooltip(&tray);
         }
 
         while let Ok(event) = menu_events.try_recv() {
             if event.id == handles.wait_for_apps_id {
-                // Modeless: open it (if not already up) and let the existing
-                // pump drive it. Don't act on the selection here.
-                if wait_window.is_none() {
+                if let Some(window) = wait_window.as_ref() {
+                    window.bring_to_front();
+                } else {
                     let selected = state.menu_snapshot().wait_for_apps;
                     wait_window = Some(wait_window::open(mtm, &selected, wait_tx.clone()));
                 }
@@ -86,17 +144,21 @@ pub fn run() -> Result<(), String> {
 
         // Apply the picker's result once it closes (see `wait_tx` above).
         while let Ok(msg) = wait_rx.try_recv() {
-            if let WaitWindowMsg::Apply(targets) = msg {
-                if let Err(e) = state.set_wait_for_apps(targets) {
-                    eprintln!("{e}");
-                } else if state.is_on() {
-                    state.invalidate_tooltip();
-                    state.update_tooltip(&tray);
+            match msg {
+                WaitWindowMsg::Apply(targets) => {
+                    if let Err(e) = state.set_wait_for_apps(targets) {
+                        eprintln!("{e}");
+                    } else if state.is_on() {
+                        state.invalidate_tooltip();
+                        state.update_tooltip(&tray);
+                    }
+                    // Rebuild so the "(N selected)" label updates.
+                    handles = install_menu(&tray, &state.menu_snapshot());
                 }
-                // Rebuild so the "(N selected)" label updates.
-                handles = install_menu(&tray, &state.menu_snapshot());
+                // Cancel: discard without touching config; the run loop only
+                // needs to drop its handle so the window can be reopened.
+                WaitWindowMsg::Cancel => {}
             }
-            // The window has closed itself; drop our handle to release it.
             wait_window = None;
         }
 
@@ -109,32 +171,20 @@ pub fn run() -> Result<(), String> {
                 ..
             } = event
             {
-                // Optimistically show the target state and pump one run-loop
-                // pass so the new image is committed to the menu bar *before*
-                // the potentially slow hold acquisition/release (helper RPC +
-                // IOPMSetSystemPowerSetting in Entirely mode) blocks this
-                // thread. `set_icon` below re-syncs icon and tooltip to the
-                // real state, reverting the flip if the toggle failed.
-                AppState::show_icon_state(&tray, !state.is_on());
-                // Turning Entirely on can additionally block on the helper
-                // install (admin prompt + up to ~5s of socket retries);
-                // surface that in the tooltip while it runs.
-                if !state.is_on() && state.menu_snapshot().mode == SleepMode::Entirely {
+                let turning_on = !state.is_on() && !state.is_enabling();
+                state.show_icon_state(&tray, !state.is_on() || state.is_enabling());
+                if turning_on && state.menu_snapshot().mode == SleepMode::Entirely {
                     let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                     state.invalidate_tooltip();
                 }
                 crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(1)));
-                match state.toggle() {
-                    Ok(()) => state.set_icon(&tray),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        state.set_icon(&tray);
-                        // Leave the reason visible on hover (e.g. an
-                        // authorization denial with grant instructions).
-                        state.show_error_tooltip(&tray, &e.to_string());
-                    }
-                }
+                state.toggle();
+                state.set_icon(&tray);
             }
+        }
+
+        if let Some(window) = wait_window.as_ref() {
+            window.poll_debounce();
         }
 
         // App launch/quit wakes the loop (so `check_app_watch` runs promptly).
@@ -152,9 +202,27 @@ pub fn run() -> Result<(), String> {
             handles = install_menu(&tray, &state.menu_snapshot());
         }
 
-        crate::tray::macos_activation::pump_event_loop(state.pump_timeout());
+        // A pending picker search must wake the loop within the debounce window
+        // so `poll_debounce` can fire; otherwise an idle `pump_timeout()` (None)
+        // would block until some unrelated event arrives and the filtered list
+        // would never update after the user stops typing.
+        let mut pump_timeout = state.pump_timeout();
+        if wait_window.as_ref().is_some_and(WaitWindow::search_pending) {
+            pump_timeout = Some(pump_timeout.map_or(wait_window::SEARCH_DEBOUNCE, |timeout| {
+                timeout.min(wait_window::SEARCH_DEBOUNCE)
+            }));
+        }
+        // Never block the pump indefinitely. The SIGINT/SIGTERM handler runs off
+        // the main thread, where `wake_event_loop` can only nudge the run loop
+        // (it cannot post an NSEvent without a main-thread marker), so a fully
+        // blocked `nextEventMatchingMask` would miss shutdown until some
+        // unrelated event arrived. Capping the idle wait bounds shutdown latency
+        // without busy-looping; non-idle ticks (countdown, polling) already use
+        // shorter timeouts, so this only affects the otherwise-infinite case.
+        let pump_timeout = pump_timeout.unwrap_or(SHUTDOWN_POLL_INTERVAL);
+        crate::tray::macos_activation::pump_event_loop(Some(pump_timeout));
     }
 
-    state.stop_session();
+    state.shutdown();
     Ok(())
 }

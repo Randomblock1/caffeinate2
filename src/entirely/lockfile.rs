@@ -10,6 +10,12 @@ use std::path::Path;
 
 pub(crate) const LOCK_FILE_MODE: u32 = 0o600;
 
+/// Cap the lockfile we'll read into memory. Entries are tiny (a pid plus a
+/// start time), so even thousands of live holders stay well under this; a file
+/// larger than this is corrupt or hostile, so we refuse it rather than reading
+/// it unbounded into a String.
+const MAX_LOCKFILE_BYTES: u64 = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ProcessStartTime {
     pub seconds: u64,
@@ -109,6 +115,13 @@ fn open_validated_lockfile(path: &Path) -> Result<Flock<File>, std::io::Error> {
 }
 
 fn read_holder_set(file: &mut Flock<File>) -> Result<HashSet<ProcessId>, std::io::Error> {
+    let size = file.seek(SeekFrom::End(0))?;
+    if size > MAX_LOCKFILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "lockfile is {size} bytes, exceeding the {MAX_LOCKFILE_BYTES}-byte limit; refusing to read"
+        )));
+    }
+    file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     Ok(content
@@ -148,7 +161,7 @@ fn prune_stale_holders(
             true
         } else {
             if verbose {
-                println!(
+                tracing::debug!(
                     "Removing stale process {}:{} from lockfile",
                     p.pid, p.start_time
                 );
@@ -185,26 +198,49 @@ pub(crate) fn update_lockfile(
         let active_count_before = pids.len();
         if add {
             pids.insert(*current_proc);
+            // Toggle sleep off only when this is the first holder.
+            Ok(active_count_before == 0)
         } else {
-            pids.remove(current_proc);
+            // Only signal "re-enable sleep" when we actually removed a live
+            // holder and none remain. A Release from a process that was never a
+            // holder (or a double-release) must not flip the global setting:
+            // otherwise an unauthenticated Release against an empty lockfile
+            // would re-enable sleep, clobbering an unrelated manual
+            // `pmset disablesleep`.
+            let removed = pids.remove(current_proc);
+            let active_count_after = pids.len();
+            Ok(removed && active_count_after == 0)
         }
-        let active_count_after = pids.len();
-        Ok(if add {
-            active_count_before == 0
-        } else {
-            active_count_after == 0
-        })
     })
 }
 
-/// Prune stale lockfile entries under an exclusive lock and return the live holder count.
+/// Outcome of pruning the lockfile under an exclusive lock.
+#[cfg(target_os = "macos")]
+pub(crate) struct PruneOutcome {
+    /// Live holders remaining after pruning dead/malformed entries.
+    pub live: usize,
+    /// Whether the lockfile contained any parseable holders before pruning.
+    /// Distinguishes "we just pruned dead holders to zero" (caffeinate2 was
+    /// managing sleep) from "the lockfile was already empty" (no evidence we
+    /// disabled sleep).
+    pub had_entries: bool,
+}
+
+/// Prune stale lockfile entries under an exclusive lock and report the live
+/// holder count plus whether the file had any holders beforehand.
 #[cfg(target_os = "macos")]
 pub(crate) fn prune_lockfile(
     verbose: bool,
     path: &Path,
     process_checker: &ProcessChecker,
-) -> Result<usize, std::io::Error> {
-    mutate_lockfile(verbose, path, process_checker, None, |pids| Ok(pids.len()))
+) -> Result<PruneOutcome, std::io::Error> {
+    let mut file = open_validated_lockfile(path)?;
+    let mut pids = read_holder_set(&mut file)?;
+    let had_entries = !pids.is_empty();
+    prune_stale_holders(&mut pids, verbose, process_checker, None);
+    let live = pids.len();
+    write_holder_set(&mut file, &pids)?;
+    Ok(PruneOutcome { live, had_entries })
 }
 
 #[cfg(test)]
@@ -364,6 +400,63 @@ mod tests {
 
         assert!(should_toggle);
         assert!(read_entries(&lock_path).is_empty());
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn release_by_non_holder_does_not_request_sleep_toggle() {
+        // A Release from a process that never held (empty lockfile) must not
+        // report "last holder released": otherwise it would re-enable sleep and
+        // clobber an unrelated manual `pmset disablesleep`.
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        let should_toggle =
+            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+
+        assert!(!should_toggle);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn release_by_non_holder_with_live_others_does_not_toggle() {
+        // Releasing a PID that isn't present while another live holder exists
+        // must leave the live holder intact and not toggle sleep.
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        let other_proc = proc(200, 456);
+        {
+            let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{other_proc}").unwrap();
+        }
+        let process_checker =
+            |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
+
+        let should_toggle =
+            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+
+        assert!(!should_toggle);
+        assert_eq!(read_entries(&lock_path), vec![other_proc]);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn oversized_lockfile_is_rejected() {
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        // Write a file larger than the cap with otherwise-parseable lines.
+        let line = format!("{}\n", proc(200, 456));
+        let repeats = (MAX_LOCKFILE_BYTES as usize / line.len()) + 2;
+        std::fs::write(&lock_path, line.repeat(repeats)).unwrap();
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| true;
+
+        let result = update_lockfile(true, false, &lock_path, &process_checker, &current_proc);
+
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("exceeding"), "{message}");
 
         std::fs::remove_file(&lock_path).unwrap();
     }

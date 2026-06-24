@@ -1,5 +1,6 @@
 use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::app_target::{AppTarget, WatchTarget};
+use crate::tray::error::TrayError;
 use crate::util::duration_parser::format_remaining_secs;
 use crate::util::fs_util;
 use serde::{Deserialize, Serialize};
@@ -110,10 +111,10 @@ impl TrayConfig {
 /// # Errors
 ///
 /// Returns an error if `HOME` is not set.
-pub fn config_path() -> Result<std::path::PathBuf, String> {
+pub fn config_path() -> Result<std::path::PathBuf, TrayError> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_string())?;
+        .ok_or(TrayError::HomeNotSet)?;
     Ok(home
         .join("Library/Application Support/caffeinate2")
         .join("tray.toml"))
@@ -131,10 +132,20 @@ pub fn load_config() -> TrayConfig {
     let mut config = match parsed {
         Ok(config) => config,
         Err(error) => {
-            eprintln!(
-                "Warning: could not parse {} ({error}); using defaults",
-                path.display()
-            );
+            let backup = path.with_extension("toml.bak");
+            if let Err(copy_error) = std::fs::copy(&path, &backup) {
+                eprintln!(
+                    "Warning: could not parse {} ({error}); failed to back up to {} ({copy_error}); using defaults",
+                    path.display(),
+                    backup.display()
+                );
+            } else {
+                eprintln!(
+                    "Warning: could not parse {} ({error}); backed up to {}; using defaults",
+                    path.display(),
+                    backup.display()
+                );
+            }
             TrayConfig::default()
         }
     };
@@ -146,15 +157,16 @@ pub fn load_config() -> TrayConfig {
 /// # Errors
 ///
 /// Returns an error if the config directory or file cannot be written.
-pub fn save_config(config: &TrayConfig) -> Result<(), String> {
+pub fn save_config(config: &TrayConfig) -> Result<(), TrayError> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent)?;
     }
     let mut to_save = config.clone();
     to_save.version = CONFIG_VERSION;
-    let content = toml::to_string_pretty(&to_save).map_err(|e| e.to_string())?;
-    fs_util::atomic_write(&path, content.as_bytes()).map_err(|e| e.to_string())
+    let content = toml::to_string_pretty(&to_save)?;
+    fs_util::atomic_write(&path, content.as_bytes())?;
+    Ok(())
 }
 
 /// Build menu bar tooltip text while sleep prevention is active.

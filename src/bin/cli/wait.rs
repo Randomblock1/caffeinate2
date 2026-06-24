@@ -29,7 +29,9 @@ pub fn wait_mode(args: &Args) -> WaitMode {
 }
 
 /// Detect `-t 1 hour ...` style invocations where clap parsed trailing duration
-/// tokens as a command instead of part of the timeout string.
+/// tokens as a command instead of part of the timeout string. Returns a help
+/// message so the caller can reject the invocation before taking a sleep hold,
+/// rather than silently running the first stray word (`hour`) as a command.
 #[must_use]
 pub fn misquoted_duration_error(args: &Args) -> Option<String> {
     let timeout = args.timeout.as_deref()?;
@@ -98,6 +100,11 @@ const fn exit_code_from_wait_status(status: i32) -> i32 {
     }
 }
 
+/// Wait until `pid` exits, or until `timeout` elapses when set.
+///
+/// macOS recycles PIDs: this watches the numeric PID only and cannot prove the
+/// exiting process is the same one that was running at registration (the same
+/// limitation as `caffeinate -w`).
 pub fn wait_for_pid(
     pid: i32,
     timeout: Option<Duration>,
@@ -112,7 +119,12 @@ pub fn wait_for_pid(
         pid.cast_unsigned() as usize,
         event::EventFilter::EVFILT_PROC,
         event::EvFlags::EV_ADD | event::EvFlags::EV_ENABLE | event::EvFlags::EV_ONESHOT,
-        event::FilterFlag::NOTE_EXITSTATUS,
+        // `NOTE_EXITSTATUS` is documented as valid only on child processes and
+        // only alongside `NOTE_EXIT`; request both so the subscription is
+        // well-formed for arbitrary PIDs (for non-children `NOTE_EXIT` still
+        // fires the wake, the status just decodes to 0 — the same limitation as
+        // `caffeinate -w`).
+        event::FilterFlag::NOTE_EXIT | event::FilterFlag::NOTE_EXITSTATUS,
         0,
         0,
     );
@@ -134,23 +146,28 @@ pub fn wait_for_pid(
 
     if event.flags().contains(event::EvFlags::EV_ERROR) {
         if event.data() == nix::Error::ESRCH as isize {
-            Err(WaitForPidError::NotFound)
-        } else {
-            Err(WaitForPidError::Kevent(nix::Error::from_raw(
-                i32::try_from(event.data()).unwrap_or(i32::MAX),
-            )))
+            return Err(WaitForPidError::NotFound);
         }
-    } else {
-        Ok(WaitForPidResult::Exited(exit_code_from_wait_status(
+        return Err(WaitForPidError::Kevent(nix::Error::from_raw(
             i32::try_from(event.data()).unwrap_or(i32::MAX),
-        )))
+        )));
     }
+
+    Ok(WaitForPidResult::Exited(exit_code_from_wait_status(
+        i32::try_from(event.data()).unwrap_or(i32::MAX),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::parse_args;
     use super::*;
+
+    #[test]
+    fn dead_pid_at_registration_is_not_found() {
+        let result = wait_for_pid(i32::MAX, Some(Duration::from_millis(1)), false);
+        assert!(matches!(result, Err(WaitForPidError::NotFound)));
+    }
 
     #[test]
     fn wait_for_pid_rejects_non_positive_pids() {
@@ -183,6 +200,13 @@ mod tests {
         let message = misquoted_duration_error(&args).expect("should detect misquoted duration");
         assert!(message.contains("multi-word durations must be quoted"));
         assert!(message.contains("-t \"1 hour and 30 minutes\""));
+    }
+
+    #[test]
+    fn genuine_command_after_numeric_timeout_is_not_flagged() {
+        // `-t 3600 -- myscript` is a legitimate timeout+command, not a misquote.
+        let args = parse_args(&["caffeinate2", "-t", "3600", "--", "myscript"]);
+        assert!(misquoted_duration_error(&args).is_none());
     }
 
     #[test]

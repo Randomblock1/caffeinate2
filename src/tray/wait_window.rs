@@ -31,6 +31,7 @@ use objc2_uniform_type_identifiers::UTTypeApplicationBundle;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 const WIN_W: f64 = 440.0;
 const WIN_H: f64 = 520.0;
@@ -38,6 +39,8 @@ const MARGIN: f64 = 12.0;
 const ROW_HEIGHT: f64 = 24.0;
 const INNER_W: f64 = WIN_W - 2.0 * MARGIN;
 const COL_WIDTH: f64 = INNER_W - 4.0;
+pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+const MAX_ICON_CACHE: usize = 64;
 
 /// What the picker reports back to the run loop when it closes.
 pub enum WaitWindowMsg {
@@ -67,6 +70,8 @@ struct Ivars {
     apps_only: Cell<bool>,
     show_system: Cell<bool>,
     query: RefCell<String>,
+    search_pending: Cell<bool>,
+    last_search_change: RefCell<Option<Instant>>,
     /// Set once Apply/Cancel/close has reported a result, so the window-close
     /// handler doesn't send a second message.
     decided: Cell<bool>,
@@ -93,7 +98,8 @@ define_class!(
         #[unsafe(method(searchChanged:))]
         fn search_changed(&self, sender: &NSSearchField) {
             *self.ivars().query.borrow_mut() = sender.stringValue().to_string();
-            self.rebuild();
+            self.ivars().search_pending.set(true);
+            *self.ivars().last_search_change.borrow_mut() = Some(Instant::now());
         }
 
         #[unsafe(method(showAllToggled:))]
@@ -209,6 +215,8 @@ impl WaitController {
             apps_only: Cell::new(true),
             show_system: Cell::new(false),
             query: RefCell::new(String::new()),
+            search_pending: Cell::new(false),
+            last_search_change: RefCell::new(None),
             decided: Cell::new(false),
             tx,
             table: RefCell::new(None),
@@ -337,6 +345,19 @@ impl WaitController {
         panel.beginSheetModalForWindow_completionHandler(&window, &handler);
     }
 
+    fn poll_debounce(&self) {
+        if !self.ivars().search_pending.get() {
+            return;
+        }
+        let Some(start) = *self.ivars().last_search_change.borrow() else {
+            return;
+        };
+        if start.elapsed() >= SEARCH_DEBOUNCE {
+            self.ivars().search_pending.set(false);
+            self.rebuild();
+        }
+    }
+
     fn close_window(&self) {
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             window.close();
@@ -353,10 +374,14 @@ impl WaitController {
         }
         let image = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(path));
         image.setSize(NSSize::new(16.0, 16.0));
-        self.ivars()
-            .icons
-            .borrow_mut()
-            .insert(path.to_string(), image.clone());
+        let mut icons = self.ivars().icons.borrow_mut();
+        if icons.len() >= MAX_ICON_CACHE
+            && !icons.contains_key(path)
+            && let Some(stale) = icons.keys().next().cloned()
+        {
+            icons.remove(&stale);
+        }
+        icons.insert(path.to_string(), image.clone());
         Some(image)
     }
 
@@ -442,6 +467,29 @@ impl WaitWindow {
     /// an app launches or quits while the picker is open.
     pub fn refresh(&self) {
         self.controller.refresh();
+    }
+
+    /// Apply a debounced search filter once the user pauses typing.
+    pub fn poll_debounce(&self) {
+        self.controller.poll_debounce();
+    }
+
+    /// Whether a typed search change is still waiting for its debounce to
+    /// elapse. The run loop uses this to keep cycling (rather than blocking
+    /// indefinitely) so `poll_debounce` actually fires after the user pauses.
+    pub fn search_pending(&self) -> bool {
+        self.controller.ivars().search_pending.get()
+    }
+
+    /// Bring an already-open picker back to the front instead of opening a second copy.
+    pub fn bring_to_front(&self) {
+        let mtm = self.controller.ivars().mtm;
+        if let Some(window) = self.controller.ivars().window.borrow().as_ref() {
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            app.activate();
+            window.makeKeyAndOrderFront(None);
+        }
     }
 }
 

@@ -1,8 +1,9 @@
 use crate::entirely::coordinator::{EntirelyCoordinator, EntirelyHoldGuard};
+use crate::entirely::error::HelperIpcError;
 use crate::entirely::helper_ipc::{
     HelperClient, HelperHoldGuard, is_authorization_error, is_connect_error,
 };
-use crate::sleep::power_management::{self, AssertionType, PowerAssertion};
+use crate::sleep::power_management::{self, AssertionType, PowerAssertion, UserActivityHold};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -27,44 +28,37 @@ pub enum EntirelyPolicy {
     HelperRequired,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EnableError {
+    #[error("entirely mode requires the privileged helper")]
     HelperUnavailable,
     /// The helper is running but denied the hold (peer is not root, an
     /// administrator, or a member of the grant group). The message contains
     /// the grant instructions; installing the helper again won't help.
+    #[error("{0}")]
     NotAuthorized(String),
+    #[error("IOKit error: {0:X}")]
     Iokit(u32),
+    #[error("{0}")]
     Ipc(String),
 }
 
-impl std::fmt::Display for EnableError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::HelperUnavailable => f.write_str("entirely mode requires the privileged helper"),
-            Self::NotAuthorized(message) | Self::Ipc(message) => f.write_str(message),
-            Self::Iokit(code) => write!(f, "IOKit error: {code:X}"),
-        }
+/// Map a helper RPC error onto the typed error the UIs dispatch on.
+fn classify_helper_error(error: HelperIpcError) -> EnableError {
+    let message = error.to_string();
+    if is_connect_error(&message) {
+        EnableError::HelperUnavailable
+    } else if is_authorization_error(&message) {
+        EnableError::NotAuthorized(message)
+    } else {
+        EnableError::Ipc(message)
     }
 }
-
-impl std::error::Error for EnableError {}
 
 /// RAII hold for entirely mode (helper IPC or local lockfile).
 pub enum EntirelyHold {
     Local(EntirelyHoldGuard),
     Helper(HelperHoldGuard),
-}
-
-/// Map a helper RPC error string onto the typed error the UIs dispatch on.
-fn classify_helper_error(error: String) -> EnableError {
-    if is_connect_error(&error) {
-        EnableError::HelperUnavailable
-    } else if is_authorization_error(&error) {
-        EnableError::NotAuthorized(error)
-    } else {
-        EnableError::Ipc(error)
-    }
 }
 
 fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHold, EnableError> {
@@ -73,7 +67,7 @@ fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHol
     match policy {
         EntirelyPolicy::HelperOrLocalFallback => match HelperHoldGuard::try_acquire(&client) {
             Ok(guard) => Ok(EntirelyHold::Helper(guard)),
-            Err(error) if is_connect_error(&error) => {
+            Err(error) if is_connect_error(&error.to_string()) => {
                 // The local fallback toggles the system SleepDisabled setting
                 // directly, which only works as root. Fail fast with a clear
                 // error instead of writing a lockfile entry and surfacing the
@@ -141,7 +135,7 @@ impl SleepMode {
     ) -> Result<ActiveSleepHold, EnableError> {
         match self {
             Self::UserActive => power_management::declare_user_activity(verbose)
-                .map(ActiveSleepHold::Assertion)
+                .map(ActiveSleepHold::UserActivity)
                 .map_err(EnableError::Iokit),
             Self::Entirely => {
                 acquire_entirely(verbose, entirely_policy).map(ActiveSleepHold::Entirely)
@@ -160,18 +154,33 @@ impl SleepMode {
         }
     }
 
-    /// Enable sleep prevention for the tray, installing the privileged helper for entirely mode when needed.
+    /// Enable sleep prevention for the tray, optionally installing the privileged
+    /// helper for entirely mode when it is missing.
+    ///
+    /// This can block for several seconds (the administrator prompt plus the
+    /// post-install socket wait), so the tray runs it on a background thread and
+    /// commits the resulting hold back on the main thread — never call it
+    /// directly from the UI thread (see `tray::state`).
+    ///
+    /// Pass `install_helper_if_missing: false` for upgrade-watcher retries: the
+    /// watcher installs the helper when the user enables the setting, and
+    /// re-prompting on every poll would spam administrator dialogs.
     ///
     /// # Errors
     ///
     /// Returns an error if tray sleep prevention or helper installation fails.
-    pub fn enable_for_tray(self) -> Result<ActiveSleepHold, EnableError> {
+    pub fn enable_for_tray(self, install_helper_if_missing: bool) -> Result<ActiveSleepHold, EnableError> {
         match self.enable(false, TRAY_ENTIRELY_POLICY) {
-            Err(EnableError::HelperUnavailable) if self == Self::Entirely => {
-                crate::entirely::install::install_helper_privileged().map_err(EnableError::Ipc)?;
-                // launchd starts the helper asynchronously; give the socket a
-                // few seconds to appear before declaring failure.
-                for _ in 0..25 {
+            Err(EnableError::HelperUnavailable)
+                if self == Self::Entirely && install_helper_if_missing =>
+            {
+                crate::entirely::install::install_helper_privileged()
+                    .map_err(|e| EnableError::Ipc(e.to_string()))?;
+                // launchd starts the helper asynchronously. Because this now
+                // runs off the UI thread, we can afford a generous window
+                // (~10s) for a slow launchd to bring the socket up before
+                // declaring failure.
+                for _ in 0..50 {
                     match self.enable(false, TRAY_ENTIRELY_POLICY) {
                         Err(EnableError::HelperUnavailable) => {
                             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -189,9 +198,11 @@ impl SleepMode {
     }
 }
 
-/// One active sleep-prevention hold (`IOKit` assertion or entirely-mode lock).
+/// One active sleep-prevention hold (`IOKit` assertion, periodically-refreshed
+/// user-activity assertion, or entirely-mode lock).
 pub enum ActiveSleepHold {
     Assertion(PowerAssertion),
+    UserActivity(UserActivityHold),
     Entirely(EntirelyHold),
 }
 
@@ -238,6 +249,12 @@ impl SleepModeSet {
             .filter(|mode| self.0.contains(mode))
     }
 
+    /// Enable every selected sleep mode.
+    ///
+    /// `dry_run` skips *only* the actual sleep-prevention holds (no `IOKit`
+    /// assertions, no entirely-mode lock): the caller still runs any configured
+    /// wait/command/timeout so `--dry-run` exercises the full timing path
+    /// without touching the system's power state.
     ///
     /// # Errors
     ///
@@ -253,7 +270,7 @@ impl SleepModeSet {
         }
 
         if verbose && !holds.is_empty() {
-            println!("Assertions created");
+            tracing::debug!("Assertions created");
         }
 
         Ok(ActiveSession { holds })
@@ -286,15 +303,35 @@ mod tests {
     #[test]
     fn helper_errors_classify_by_prefix() {
         assert_eq!(
-            classify_helper_error("connect failed: no socket".to_string()),
+            classify_helper_error(HelperIpcError::new(
+                "connect failed: no socket".to_string()
+            )),
             EnableError::HelperUnavailable
         );
         assert_eq!(
-            classify_helper_error("not authorized: nope".to_string()),
+            classify_helper_error(HelperIpcError::connect(std::io::Error::other(
+                "no socket"
+            ))),
+            EnableError::HelperUnavailable
+        );
+        assert_eq!(
+            classify_helper_error(HelperIpcError::internal(std::io::Error::other(
+                "Failed to determine process start time"
+            ))),
+            EnableError::Ipc(
+                "internal error: Failed to determine process start time".to_string()
+            )
+        );
+        assert_eq!(
+            classify_helper_error(HelperIpcError::new(
+                "not authorized: nope".to_string()
+            )),
             EnableError::NotAuthorized("not authorized: nope".to_string())
         );
         assert_eq!(
-            classify_helper_error("read failed: timeout".to_string()),
+            classify_helper_error(HelperIpcError::new(
+                "read failed: timeout".to_string()
+            )),
             EnableError::Ipc("read failed: timeout".to_string())
         );
     }

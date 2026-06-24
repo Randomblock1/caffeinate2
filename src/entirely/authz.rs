@@ -8,6 +8,14 @@
 //! directory-services (including nested) membership and takes effect on the
 //! user's next request — no re-login needed. Every lookup failure denies
 //! (fail closed).
+//!
+//! SECURITY INVARIANT: the caffeinate2 binaries must NOT be installed
+//! setuid/setgid. This check trusts the peer's *effective* uid (the kernel's
+//! `LOCAL_PEERCRED`) as the caller's identity. A setuid/setgid client would
+//! present an effective id that does not match the human actually running it,
+//! which would let it escalate (or self-deny) here. The helper itself runs as
+//! a root LaunchDaemon and the CLI/tray run with the invoking user's real
+//! credentials; keep them that way.
 
 use std::ffi::{CStr, CString};
 
@@ -70,12 +78,19 @@ fn gid_for_group(name: &str) -> Option<libc::gid_t> {
     Some(grp.gr_gid)
 }
 
+/// Upper bound on the group-list buffer we'll grow to. Real accounts have far
+/// fewer groups than this; the cap only stops an unbounded loop on a
+/// pathological directory while still being generous enough to never deny a
+/// legitimate user.
+const MAX_GROUP_CAPACITY: libc::c_int = 65_536;
+
 fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
     let cname = CString::new(user.name.as_str()).ok()?;
     let mut capacity: libc::c_int = 32;
     // macOS getgrouplist returns -1 when the array is too small (with
-    // *ngroups set to how many fit), so grow and retry.
-    while capacity <= 1024 {
+    // *ngroups set to how many fit), so grow and retry until it succeeds or we
+    // hit the sane upper bound (rather than failing closed at a small cap).
+    loop {
         let mut groups = vec![0_i32; capacity.cast_unsigned() as usize];
         let mut count = capacity;
         let ret = unsafe {
@@ -90,9 +105,16 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
             groups.truncate(count.max(0).cast_unsigned() as usize);
             return Some(groups.into_iter().map(i32::cast_unsigned).collect());
         }
-        capacity *= 2;
+        if capacity >= MAX_GROUP_CAPACITY {
+            tracing::warn!(
+                "user '{}' belongs to more than {MAX_GROUP_CAPACITY} groups; \
+                 denying entirely-mode authorization (fail closed)",
+                user.name
+            );
+            return None;
+        }
+        capacity = capacity.saturating_mul(2).min(MAX_GROUP_CAPACITY);
     }
-    None
 }
 
 /// Whether `uid` may take an entirely-mode hold. Fails closed: any failure

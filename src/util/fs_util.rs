@@ -15,11 +15,50 @@ fn temp_path_for(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.with_file_name(temp_name))
 }
 
+/// Best-effort fsync of the directory containing `path` so the renamed entry is
+/// durable across a crash/power loss, not just the file contents. Errors are
+/// ignored: durability is a nice-to-have and some filesystems reject directory
+/// fsync.
+fn sync_parent_dir(path: &Path) {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+}
+
 ///
 /// # Errors
 ///
 /// Returns an I/O error if the temporary file or rename fails.
+/// Write `contents` to `path` atomically via a same-directory temp file and
+/// `rename`, so readers never see a partial file if the process crashes
+/// mid-write. The new file inherits the process umask for its mode; use
+/// [`atomic_write_with_mode`] when the destination needs an exact mode.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_inner(path, contents, None)
+}
+
+///
+/// # Errors
+///
+/// Returns an I/O error if the temporary file or rename fails.
+/// Like [`atomic_write`], but sets the destination file's permission bits to
+/// `mode` regardless of the process umask. Needed for files whose consumer
+/// rejects overly permissive modes — e.g. `launchctl` refuses a system
+/// LaunchDaemon plist that is group/world-writable, which a permissive umask
+/// would otherwise produce.
+pub fn atomic_write_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    atomic_write_inner(path, contents, Some(mode))
+}
+
+fn atomic_write_inner(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let temp_path = temp_path_for(path)?;
     let result = (|| {
         let file = std::fs::File::create(&temp_path)?;
@@ -27,11 +66,18 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         std::io::Write::write_all(&mut file, contents)?;
         let file = file.into_inner()?;
         file.sync_all()?;
+        // Set the exact mode (umask can't be relied on) before the rename so the
+        // destination atomically appears with the right permissions.
+        if let Some(mode) = mode {
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode))?;
+        }
         std::fs::rename(&temp_path, path)
     })();
 
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
+    } else {
+        sync_parent_dir(path);
     }
     result
 }
@@ -58,6 +104,20 @@ mod tests {
 
         atomic_write(&path, b"second").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_with_mode_sets_exact_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_file_path("modes.txt");
+        let _ = std::fs::remove_file(&path);
+
+        atomic_write_with_mode(&path, b"data", 0o644).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -1,30 +1,65 @@
 use jiff::SignedDuration;
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DurationParseError {
+    #[error("Error: Timeout isn't a valid duration or number!")]
+    Invalid,
+    #[error("Error: Timeout is too large!")]
+    TooLarge,
+    #[error("Error: timeout must be positive")]
+    NotPositive,
+}
+
+/// Parse a timeout duration for the CLI.
+///
+/// `-t` / `--timeout` is a single argument. Bare numbers are seconds; otherwise
+/// humantime-style strings are accepted (quote multi-word values on the shell
+/// command line, e.g. `"1 hour and 30 minutes"`).
 ///
 /// # Errors
 ///
 /// Returns an error if the duration string is invalid or too large.
-pub fn parse_duration(duration: &str) -> Result<SignedDuration, String> {
-    let duration = duration.trim();
+pub fn parse_duration(duration: &str) -> Result<SignedDuration, DurationParseError> {
+    let trimmed = duration.trim();
 
-    match parse_human_duration(duration) {
-        Ok(std_duration) => SignedDuration::try_from(std_duration)
-            .map_err(|_| "Error: Timeout is too large!".to_string()),
-        Err(humantime::DurationError::NumberOverflow) => {
-            Err("Error: Timeout is too large!".to_string())
-        }
-        Err(_) => {
-            let seconds = duration
-                .parse::<u64>()
-                .map_err(|_| "Error: Timeout isn't a valid duration or number!".to_string())?;
-
-            Ok(SignedDuration::from_secs(
-                seconds
-                    .try_into()
-                    .map_err(|_| "Error: Timeout is too large!".to_string())?,
-            ))
-        }
+    // A comma wedged between two digits is ambiguous (decimal comma like "0,5h",
+    // or a thousands separator). Silently deleting it would produce a wildly
+    // wrong timeout ("0,5h" -> "05h" = 5 hours, not 30 minutes), so reject it
+    // rather than guess. Connector commas (e.g. "1 hour, 30 minutes") are not
+    // between digits and are still stripped below.
+    let bytes = trimmed.as_bytes();
+    if bytes.iter().enumerate().any(|(i, &b)| {
+        b == b','
+            && i > 0
+            && bytes[i - 1].is_ascii_digit()
+            && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+    }) {
+        return Err(DurationParseError::Invalid);
     }
+    let duration = trimmed.replace(',', "");
+
+    match parse_human_duration(&duration) {
+        Ok(std_duration) => finish_parse(
+            SignedDuration::try_from(std_duration).map_err(|_| DurationParseError::TooLarge)?,
+        ),
+        Err(humantime::DurationError::NumberOverflow) => Err(DurationParseError::TooLarge),
+        Err(_) => finish_parse(
+            SignedDuration::from_secs(
+                duration
+                    .parse::<u64>()
+                    .map_err(|_| DurationParseError::Invalid)?
+                    .try_into()
+                    .map_err(|_| DurationParseError::TooLarge)?,
+            ),
+        ),
+    }
+}
+
+fn finish_parse(duration: SignedDuration) -> Result<SignedDuration, DurationParseError> {
+    if duration < SignedDuration::ZERO {
+        return Err(DurationParseError::NotPositive);
+    }
+    Ok(duration)
 }
 
 fn parse_human_duration(duration: &str) -> Result<std::time::Duration, humantime::DurationError> {
@@ -174,57 +209,76 @@ mod tests {
     fn test_parse_duration_valid_strings() {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND);
+        assert_eq!(
+            result.num_seconds(),
+            DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND
+        );
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE);
+        assert_eq!(result.num_seconds(), DAY + 2 * HOUR + 3 * MINUTE);
 
         let duration = "3min 17h 2s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
+        assert_eq!(result.num_seconds(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
 
         let duration = "1 hour and 30 minutes";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
+        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+
+        // Connector commas (not between digits) are stripped, not rejected.
+        let duration = "1 hour, 30 minutes";
+        let result = parse_duration(duration).unwrap();
+        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_ambiguous_comma() {
+        // A comma between digits (decimal comma / thousands separator) must not
+        // be silently deleted: "0,5h" must not become "05h" (5 hours).
+        for duration in ["0,5h", "2,5m", "1,5h", "1,000"] {
+            assert_eq!(
+                parse_duration(duration).unwrap_err(),
+                DurationParseError::Invalid,
+                "{duration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_accepts_zero() {
+        assert_eq!(parse_duration("0").unwrap().num_seconds(), 0);
+        assert_eq!(parse_duration("0s").unwrap().num_seconds(), 0);
     }
 
     #[test]
     fn test_parse_duration_valid_numbers() {
         let duration = "45323";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 45323);
-
-        let duration = "0";
-        let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 0);
+        assert_eq!(result.num_seconds(), 45323);
 
         let duration = "60";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 60 * SECOND);
+        assert_eq!(result.num_seconds(), 60 * SECOND);
     }
 
     #[test]
     fn test_parse_duration_edge_cases() {
-        let duration = "0s";
-        let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 0);
-
         let duration = "1000000s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 1_000_000);
+        assert_eq!(result.num_seconds(), 1_000_000);
 
         let duration = "  15m  ";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), 15 * MINUTE);
+        assert_eq!(result.num_seconds(), 15 * MINUTE);
 
         let duration = "1.5h";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
+        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
 
         let duration = "250ms";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.as_millis(), 250);
+        assert_eq!(result.num_milliseconds(), 250);
     }
 
     #[test]
@@ -233,17 +287,17 @@ mod tests {
             let result = parse_duration(duration);
             assert_eq!(
                 result.unwrap_err(),
-                "Error: Timeout isn't a valid duration or number!",
+                DurationParseError::Invalid,
                 "{duration:?}"
             );
         }
 
         let duration = "10000000000000000000";
         let result = parse_duration(duration);
-        assert_eq!(result.unwrap_err(), "Error: Timeout is too large!");
+        assert_eq!(result.unwrap_err(), DurationParseError::TooLarge);
 
         let duration = "100000000000000000000s";
         let result = parse_duration(duration);
-        assert_eq!(result.unwrap_err(), "Error: Timeout is too large!");
+        assert_eq!(result.unwrap_err(), DurationParseError::TooLarge);
     }
 }

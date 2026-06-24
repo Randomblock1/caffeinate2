@@ -3,9 +3,11 @@ use crate::entirely::install;
 use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
 use crate::sleep::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
 use crate::tray::app_target::WatchTarget;
+use crate::tray::error::TrayError;
 use crate::tray::process_enum;
 use crate::tray::tray_icons;
 use crate::tray::tray_mode::{self, TrayConfig};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, TrayIcon};
@@ -40,6 +42,18 @@ const OBSERVED_TYPES: &[AssertionType] = &[
 /// nothing but flap the watcher, so it is treated as ignored rather than a
 /// trigger.
 const UPGRADE_IGNORE_PROCESSES: &[&str] = &["powerd"];
+
+/// Whether a failed upgrade enable should latch `upgrade_failed` (blocking
+/// retries until the external trigger clears). Transient errors (helper socket
+/// not up yet, IOKit flakes) are retried on the next poll; permanent denials
+/// latch so the watcher does not spam install prompts or admin dialogs.
+fn should_latch_upgrade_failure(error: &EnableError) -> bool {
+    // Only policy denials are permanent. Transient helper/IOKit/IPC failures
+    // (connect errors, internal errors, RPC timeouts, capacity limits) retry on
+    // the next poll so a momentary flake does not disable upgrades for the
+    // whole external-trigger episode.
+    matches!(error, EnableError::NotAuthorized(_))
+}
 
 /// A sleep-relevant external assertion the watcher saw but did not upgrade,
 /// paired with the reason, for the informational "Ignoring…" menu entries.
@@ -105,10 +119,52 @@ fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassifica
     }
 }
 
+/// A sleep-prevention enable running on a background thread. Acquiring an
+/// Entirely hold can block for several seconds (the helper install prompt plus
+/// the post-install socket wait), so it must never run on the UI thread; the
+/// worker delivers the acquired hold (or error) back over `rx` and wakes the
+/// event loop, which commits it via [`AppState::poll_pending_enable`].
+struct PendingEnable {
+    mode: SleepMode,
+    started_by_upgrade: bool,
+    /// External process names to attach to the committed upgrade session.
+    /// Refreshed by `poll_upgrade` while the enable is still in flight.
+    upgrade_apps: Vec<String>,
+    /// When set, revert `config.mode` (and persist) if this enable fails.
+    /// Used by [`AppState::set_mode`] so a failed mode switch rolls back
+    /// without leaving the tray off or on the wrong mode.
+    rollback_mode: Option<SleepMode>,
+    /// Snapshot of the previous session's "seen a watched app running" latch,
+    /// captured when the enable started. Carried onto the committed session so a
+    /// two-phase mode switch doesn't reset the latch (which would make the
+    /// "seen running then all quit" auto-stop unreachable if the app quits
+    /// during the acquire window). OR'd with a fresh scan at commit time.
+    app_saw_seed: bool,
+    rx: mpsc::Receiver<Result<ActiveSleepHold, EnableError>>,
+}
+
+/// Result of polling the in-flight enable, consumed by the run loop.
+pub enum PendingEnableOutcome {
+    /// No enable in flight.
+    Idle,
+    /// Still acquiring the hold on the background thread.
+    Pending,
+    /// The hold was acquired and a session committed.
+    Started,
+    /// Acquisition failed; carries the error for the UI.
+    Failed(EnableError),
+}
+
 /// Runtime state while sleep prevention is active.
 struct ActiveTraySession {
+    /// Held only for its `Drop`, which releases the underlying assertion/lock;
+    /// the field is never read directly, hence the lint allowance.
     #[allow(dead_code)]
     hold: ActiveSleepHold,
+    /// The mode this hold actually enforces. Tracked so a failed mode switch
+    /// rolls `config.mode` back to what is *really* still active, rather than to
+    /// an optimistic `config.mode` a prior in-flight switch already advanced.
+    mode: SleepMode,
     until: Option<Instant>,
     app_saw_running: bool,
     /// True when the upgrade watcher started this session (vs. a manual
@@ -144,6 +200,13 @@ pub struct MenuSnapshot {
 pub struct AppState {
     config: TrayConfig,
     session: Option<ActiveTraySession>,
+    /// An enable acquiring its hold off the UI thread; `None` when idle.
+    pending_enable: Option<PendingEnable>,
+    /// Decoded on/off tray icons (RGBA + dimensions), cached at startup so an
+    /// icon flip never re-decodes the embedded PNG. `None` only if decoding
+    /// failed, in which case `show_icon_state` falls back to decoding on use.
+    icon_on_rgba: Option<(Vec<u8>, u32, u32)>,
+    icon_off_rgba: Option<(Vec<u8>, u32, u32)>,
     last_tooltip: Option<String>,
     start_at_login: bool,
     /// When the external trigger assertion first went away while an upgrade
@@ -171,6 +234,9 @@ impl AppState {
         Self {
             config: tray_mode::load_config(),
             session: None,
+            pending_enable: None,
+            icon_on_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_ON).ok(),
+            icon_off_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_OFF).ok(),
             last_tooltip: None,
             start_at_login: install::tray_launch_agent_installed(),
             upgrade_clear_since: None,
@@ -208,7 +274,7 @@ impl AppState {
         std::mem::take(&mut self.menu_dirty)
     }
 
-    fn save_config(&self) -> Result<(), String> {
+    fn save_config(&self) -> Result<(), TrayError> {
         tray_mode::save_config(&self.config)
     }
 
@@ -216,9 +282,28 @@ impl AppState {
         self.session.is_some()
     }
 
+    /// True while an enable is being acquired on a background thread. The icon
+    /// shows the target on-state and the tooltip reads "enabling…" meanwhile.
+    pub const fn is_enabling(&self) -> bool {
+        self.pending_enable.is_some()
+    }
+
+    /// The mode of the in-flight enable, if any.
+    const fn pending_mode(&self) -> Option<SleepMode> {
+        match &self.pending_enable {
+            Some(pending) => Some(pending.mode),
+            None => None,
+        }
+    }
+
     /// How long to wait before the next loop iteration, or `None` to block
     /// indefinitely until an event arrives.
     pub fn pump_timeout(&self) -> Option<Duration> {
+        // While an enable is in flight, keep cycling so the run loop polls the
+        // worker channel promptly even if its wake-up is missed.
+        if self.pending_enable.is_some() {
+            return Some(Duration::from_millis(200));
+        }
         // A timed session needs ~1s ticks to update the countdown tooltip.
         let countdown = self.session.as_ref().and_then(|s| s.until).map(|until| {
             until
@@ -255,16 +340,32 @@ impl AppState {
 
     /// Set the tray image for the given on/off state without touching the
     /// session or tooltip. Used to flip the icon optimistically before a
-    /// potentially slow toggle (e.g. the helper RPC in Entirely mode).
-    pub fn show_icon_state(tray: &TrayIcon, on: bool) {
-        let bytes = if on {
-            tray_icons::ICON_ON
+    /// potentially slow toggle (e.g. the helper RPC in Entirely mode). Reuses
+    /// the icons decoded at startup so a flip never re-decodes the PNG.
+    pub fn show_icon_state(&self, tray: &TrayIcon, on: bool) {
+        let cached = if on {
+            self.icon_on_rgba.as_ref()
         } else {
-            tray_icons::ICON_OFF
+            self.icon_off_rgba.as_ref()
         };
-        let icon = tray_icons::decode_icon_rgba(bytes).and_then(|(rgba, width, height)| {
-            Icon::from_rgba(rgba, width, height).map_err(|e| e.to_string())
-        });
+        let icon = match cached {
+            Some((rgba, width, height)) => {
+                Icon::from_rgba(rgba.clone(), *width, *height).map_err(|e| e.to_string())
+            }
+            None => {
+                // Startup decode failed; fall back to decoding on demand.
+                let bytes = if on {
+                    tray_icons::ICON_ON
+                } else {
+                    tray_icons::ICON_OFF
+                };
+                tray_icons::decode_icon_rgba(bytes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|(rgba, width, height)| {
+                        Icon::from_rgba(rgba, width, height).map_err(|e| e.to_string())
+                    })
+            }
+        };
         match icon {
             Ok(icon) => {
                 let _ = tray.set_icon_with_as_template(Some(icon), true);
@@ -274,12 +375,19 @@ impl AppState {
     }
 
     pub fn set_icon(&mut self, tray: &TrayIcon) {
-        Self::show_icon_state(tray, self.is_on());
+        // An in-flight enable shows the target on-state while it acquires.
+        self.show_icon_state(tray, self.is_on() || self.is_enabling());
         self.update_tooltip(tray);
     }
 
     pub fn update_tooltip(&mut self, tray: &TrayIcon) {
-        let tooltip = if self.is_on() {
+        let tooltip = if self.pending_enable.is_some() {
+            if self.pending_mode() == Some(SleepMode::Entirely) {
+                "caffeinate2 (enabling Entirely mode…)".to_string()
+            } else {
+                "caffeinate2 (enabling…)".to_string()
+            }
+        } else if self.is_on() {
             let remaining = self.session.as_ref().and_then(|session| {
                 session
                     .until
@@ -349,6 +457,8 @@ impl AppState {
     pub fn check_app_watch(&mut self) -> bool {
         // The upgrade watcher owns its session's start/stop lifecycle; a
         // configured app watch must never cut an upgrade session short.
+        // Upgrade sessions also ignore the wait-for-apps list in tooltips
+        // (see `format_active_tooltip` / `menu_snapshot`).
         if self
             .session
             .as_ref()
@@ -381,79 +491,208 @@ impl AppState {
         false
     }
 
-    pub fn toggle(&mut self) -> Result<(), EnableError> {
-        if self.session.is_some() {
+    pub fn toggle(&mut self) {
+        if self.session.is_some() || self.pending_enable.is_some() {
             // A manual stop is an explicit override: the watcher must not undo it
-            // by re-taking a hold while the same trigger persists.
+            // by re-taking a hold while the same trigger persists. This also
+            // cancels an in-flight enable the user changed their mind about.
             self.upgrade_overridden = true;
+            self.cancel_pending_enable();
             self.stop_session();
-            return Ok(());
+            return;
         }
-        self.start_session()
+        self.start_session();
     }
 
-    pub fn start_session(&mut self) -> Result<(), EnableError> {
-        self.start_session_with(self.config.mode, false)
+    pub fn start_session(&mut self) {
+        self.start_session_with(self.config.mode, false, None);
     }
 
-    /// Start a session in `mode`. Upgrade-watcher sessions (`started_by_upgrade`)
+    /// Begin acquiring a session in `mode` on a background thread (the helper
+    /// install + socket wait must never block the UI thread). The hold is
+    /// committed to a session by [`AppState::poll_pending_enable`] once the
+    /// worker reports back. Upgrade-watcher sessions (`started_by_upgrade`)
     /// ignore the configured time limit — they end when the external assertion
     /// goes away, not on a clock.
     pub fn start_session_with(
         &mut self,
         mode: SleepMode,
         started_by_upgrade: bool,
-    ) -> Result<(), EnableError> {
-        let hold = mode.enable_for_tray()?;
-        self.session = Some(ActiveTraySession {
-            hold,
-            until: if started_by_upgrade {
-                None
-            } else {
-                self.config
-                    .time_limit_secs
-                    .map(|secs| Instant::now() + Duration::from_secs(secs))
-            },
-            app_saw_running: process_enum::any_target_running(&self.config.wait_for_apps),
+        rollback_mode: Option<SleepMode>,
+    ) {
+        // Never stack enables; one in-flight request already targets a session.
+        if self.pending_enable.is_some() {
+            return;
+        }
+        // Capture the current session's "seen a watched app" latch now, so a
+        // two-phase mode switch (which keeps the old session alive while the new
+        // hold is acquired) doesn't lose it when the new session commits.
+        let app_saw_seed = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.app_saw_running);
+        let (tx, rx) = mpsc::channel();
+        let install_helper_if_missing = !started_by_upgrade;
+        thread::spawn(move || {
+            let result = mode.enable_for_tray(install_helper_if_missing);
+            // If the receiver was dropped (the user cancelled), the hold inside
+            // `result` is dropped here, releasing it.
+            let _ = tx.send(result);
+            crate::tray::macos_activation::wake_event_loop();
+        });
+        self.pending_enable = Some(PendingEnable {
+            mode,
             started_by_upgrade,
             upgrade_apps: Vec::new(),
+            rollback_mode,
+            app_saw_seed,
+            rx,
         });
         self.last_tooltip = None;
-        Ok(())
     }
 
-    pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), EnableError> {
+    /// Cancel any in-flight enable. The worker thread keeps running but its
+    /// result is discarded; if it already acquired a hold, dropping the
+    /// receiver causes the worker to drop (and release) it.
+    fn cancel_pending_enable(&mut self) {
+        self.pending_enable = None;
+    }
+
+    /// Poll the in-flight enable, committing the session or surfacing the error.
+    /// Called once per run-loop iteration.
+    pub fn poll_pending_enable(&mut self) -> PendingEnableOutcome {
+        let Some(pending) = self.pending_enable.as_ref() else {
+            return PendingEnableOutcome::Idle;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return PendingEnableOutcome::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The worker vanished without sending (should not happen);
+                // treat it as a failure so the UI doesn't hang "enabling…".
+                self.pending_enable = None;
+                return PendingEnableOutcome::Failed(EnableError::Ipc(
+                    "enable worker terminated unexpectedly".to_string(),
+                ));
+            }
+        };
+        let pending = self.pending_enable.take().expect("pending enable present");
+        match result {
+            Ok(hold) => {
+                let started_by_upgrade = pending.started_by_upgrade;
+                let previous_started_by_upgrade = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.started_by_upgrade);
+                self.session = Some(ActiveTraySession {
+                    hold,
+                    mode: pending.mode,
+                    until: if started_by_upgrade {
+                        None
+                    } else {
+                        self.config
+                            .time_limit_secs
+                            .map(|secs| Instant::now() + Duration::from_secs(secs))
+                    },
+                    // Preserve the prior session's "seen running" latch across a
+                    // two-phase switch (OR'd with a fresh scan) so a watched app
+                    // that quit during the acquire window can still auto-stop.
+                    app_saw_running: pending.app_saw_seed
+                        || process_enum::any_target_running(&self.config.wait_for_apps),
+                    started_by_upgrade,
+                    upgrade_apps: pending.upgrade_apps,
+                });
+                self.last_tooltip = None;
+                if started_by_upgrade || previous_started_by_upgrade {
+                    // Rebuild when entering or leaving an upgrade-started session.
+                    self.menu_dirty = true;
+                }
+                PendingEnableOutcome::Started
+            }
+            Err(error) => {
+                if let Some(rollback_mode) = pending.rollback_mode {
+                    self.config.mode = rollback_mode;
+                    if let Err(save_err) = self.save_config() {
+                        eprintln!("failed to roll back mode after enable failure: {save_err}");
+                    }
+                }
+                if pending.started_by_upgrade {
+                    if should_latch_upgrade_failure(&error) {
+                        self.upgrade_failed = true;
+                    }
+                    eprintln!("upgrade external wakefulness failed: {error}");
+                }
+                PendingEnableOutcome::Failed(error)
+            }
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), TrayError> {
         if mode == self.config.mode {
             return Ok(());
         }
-        let previous_mode = self.config.mode;
-        if self.is_on() {
+        // Roll back to the mode actually being enforced, not to `config.mode`:
+        // a prior in-flight switch may have already advanced `config.mode`
+        // optimistically, so using it would leave the menu/config disagreeing
+        // with the live hold if this switch fails. The live session's mode is
+        // the source of truth; with no live session, the current config is the
+        // best available target.
+        let previous_mode = self
+            .session
+            .as_ref()
+            .map_or(self.config.mode, |session| session.mode);
+        // Persist first: build and save the new config, then commit it in RAM
+        // only on success, so a failed write never leaves disk and memory
+        // disagreeing.
+        let mut new_config = self.config.clone();
+        new_config.mode = mode;
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
+        if self.is_on() || self.pending_enable.is_some() {
             let was_upgrade = self
                 .session
                 .as_ref()
-                .is_some_and(|session| session.started_by_upgrade);
-            self.stop_session();
-            self.config.mode = mode;
+                .is_some_and(|session| session.started_by_upgrade)
+                || self
+                    .pending_enable
+                    .as_ref()
+                    .is_some_and(|pending| pending.started_by_upgrade);
+            self.cancel_pending_enable();
             if was_upgrade {
                 // Explicit mode change takes manual control away from the watcher.
                 self.upgrade_overridden = true;
             }
-            if let Err(error) = self.start_session_with(mode, false) {
-                self.config.mode = previous_mode;
-                let _ = self.start_session_with(previous_mode, false);
-                return Err(error);
+            // Two-phase mode switch: keep the current session until the new hold
+            // is acquired. On failure, poll_pending_enable rolls config back and
+            // the old session (if any) keeps preventing sleep.
+            if !self.is_on() {
+                self.stop_session();
             }
-        } else {
-            self.config.mode = mode;
+            self.start_session_with(mode, false, Some(previous_mode));
         }
-        self.save_config().map_err(EnableError::Ipc)
+        Ok(())
+    }
+
+    /// Cancel any in-flight enable and tear down the active session. Used on
+    /// shutdown so holds are released before the process exits.
+    pub fn shutdown(&mut self) {
+        self.cancel_pending_enable();
+        self.stop_session();
     }
 
     /// Set (or clear) the time limit. Deliberately restarts the countdown
     /// from now when a session is active, rather than rebasing on the
     /// session start (documented in the README).
-    pub fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), String> {
-        self.config.time_limit_secs = time_limit_secs;
+    ///
+    /// Persists the new value before mutating in-memory state so a failed save
+    /// never leaves disk and RAM disagreeing.
+    pub fn set_time_limit(&mut self, time_limit_secs: Option<u64>) -> Result<(), TrayError> {
+        let mut new_config = self.config.clone();
+        new_config.time_limit_secs = time_limit_secs;
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
         if let Some(session) = self.session.as_mut() {
             if !session.started_by_upgrade {
                 session.until =
@@ -461,24 +700,34 @@ impl AppState {
             }
             self.last_tooltip = None;
         }
-        self.save_config()
+        Ok(())
     }
 
-    pub fn set_wait_for_apps(&mut self, targets: Vec<WatchTarget>) -> Result<(), String> {
-        self.config.wait_for_apps = targets;
+    /// Persists the new selection before mutating in-memory state so a failed
+    /// save never leaves disk and RAM disagreeing.
+    pub fn set_wait_for_apps(&mut self, targets: Vec<WatchTarget>) -> Result<(), TrayError> {
+        let mut new_config = self.config.clone();
+        new_config.wait_for_apps = targets;
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
         // Re-seed the "seen running" guard from the new set so a freshly added,
         // already-running target keeps the session alive and an emptied list
-        // does not auto-stop on the next tick.
-        let seen = process_enum::any_target_running(&self.config.wait_for_apps);
-        if let Some(session) = self.session.as_mut() {
-            session.app_saw_running = seen;
-            self.last_tooltip = None;
+        // does not auto-stop on the next tick. Only scan when a session is
+        // actually active — otherwise the (potentially expensive) process walk
+        // is computed and discarded on the idle tray.
+        if self.session.is_some() {
+            let seen = process_enum::any_target_running(&self.config.wait_for_apps);
+            if let Some(session) = self.session.as_mut() {
+                session.app_saw_running = seen;
+                self.last_tooltip = None;
+            }
         }
-        self.save_config()
+        Ok(())
     }
 
-    pub fn set_start_at_login(&mut self, enabled: bool) -> Result<(), String> {
-        let tray_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    pub fn set_start_at_login(&mut self, enabled: bool) -> Result<(), TrayError> {
+        let tray_path = std::env::current_exe()?;
         if enabled {
             install::install_tray_launch_agent(&tray_path)?;
         } else {
@@ -491,13 +740,16 @@ impl AppState {
     /// Toggle the upgrade watcher. Enabling installs the privileged helper now
     /// (so the admin prompt happens on the click, not mid-watch); disabling
     /// stops any session the watcher started.
-    pub fn set_upgrade_external(&mut self, enabled: bool) -> Result<(), String> {
+    pub fn set_upgrade_external(&mut self, enabled: bool) -> Result<(), TrayError> {
         let previous = self.config.upgrade_external;
         if enabled == previous {
             return Ok(());
         }
-        self.config.upgrade_external = enabled;
-        self.save_config()?;
+        // Persist first, commit in RAM on success (see set_mode).
+        let mut new_config = self.config.clone();
+        new_config.upgrade_external = enabled;
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
 
         self.upgrade_clear_since = None;
         self.upgrade_failed = false;
@@ -510,7 +762,7 @@ impl AppState {
                 if let Err(error) = install::install_helper_privileged() {
                     self.config.upgrade_external = previous;
                     let _ = self.save_config();
-                    return Err(error);
+                    return Err(error.into());
                 }
                 // launchd starts the helper asynchronously. Let the socket check
                 // finish off the UI thread; the watcher will retry on its poll.
@@ -552,7 +804,9 @@ impl AppState {
     /// - present, upgrade session → refresh the displayed process name;
     /// - present, manual session (or manual override) → leave it;
     /// - absent, upgrade session → release after `UPGRADE_CLEAR_GRACE`;
-    /// - absent otherwise → clear the manual override and do nothing.
+    /// - absent, manual override or failure latch → clear those after the same
+    ///   grace (agents can drop their assertion briefly between turns);
+    /// - absent otherwise → do nothing.
     pub fn poll_upgrade(&mut self) -> bool {
         if !self.config.upgrade_external {
             self.upgrade_clear_since = None;
@@ -594,15 +848,13 @@ impl AppState {
         app_names.dedup();
 
         if !present {
-            // Trigger episode is over: clear the manual override and failure
-            // latch so the next episode upgrades normally.
-            self.upgrade_failed = false;
-            self.upgrade_overridden = false;
-            if !self
+            let needs_clear_grace = self
                 .session
                 .as_ref()
                 .is_some_and(|session| session.started_by_upgrade)
-            {
+                || self.upgrade_overridden
+                || self.upgrade_failed;
+            if !needs_clear_grace {
                 self.upgrade_clear_since = None;
                 return false;
             }
@@ -610,10 +862,20 @@ impl AppState {
             let now = Instant::now();
             let since = *self.upgrade_clear_since.get_or_insert(now);
             if now.duration_since(since) >= UPGRADE_CLEAR_GRACE {
-                // stop_session flags the menu dirty so the entries disappear.
-                self.stop_session();
+                // Trigger episode is over: clear the manual override and failure
+                // latch so the next episode upgrades normally.
+                self.upgrade_failed = false;
+                self.upgrade_overridden = false;
+                let had_upgrade_session = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.started_by_upgrade);
+                if had_upgrade_session {
+                    // stop_session flags the menu dirty so the entries disappear.
+                    self.stop_session();
+                }
                 self.upgrade_clear_since = None;
-                return true;
+                return had_upgrade_session;
             }
             return false;
         }
@@ -623,29 +885,26 @@ impl AppState {
         match self.session.as_mut() {
             None => {
                 if self.upgrade_failed || self.upgrade_overridden {
-                    // Either a prior attempt failed (e.g. helper denied the
-                    // hold) or the user manually dismissed it; wait for the
-                    // trigger to clear before considering an upgrade again.
                     return false;
                 }
-                match self.start_session_with(SleepMode::Entirely, true) {
-                    Ok(()) => {
-                        if let Some(session) = self.session.as_mut() {
-                            session.upgrade_apps = app_names;
-                        }
+                if self.pending_enable.is_some() {
+                    if let Some(pending) = self.pending_enable.as_mut()
+                        && pending.started_by_upgrade
+                        && pending.upgrade_apps != app_names
+                    {
+                        pending.upgrade_apps = app_names;
                         self.last_tooltip = None;
-                        // A new "Upgrading…" entry needs a menu rebuild.
-                        self.menu_dirty = true;
-                        true
+                        return true;
                     }
-                    Err(error) => {
-                        if matches!(error, EnableError::NotAuthorized(_)) {
-                            self.upgrade_failed = true;
-                        }
-                        eprintln!("upgrade external wakefulness failed: {error}");
-                        false
-                    }
+                    return false;
                 }
+                self.start_session_with(SleepMode::Entirely, true, None);
+                if let Some(pending) = self.pending_enable.as_mut() {
+                    pending.upgrade_apps = app_names;
+                }
+                self.last_tooltip = None;
+                self.menu_dirty = true;
+                true
             }
             Some(session) if session.started_by_upgrade => {
                 if session.upgrade_apps == app_names {
@@ -763,5 +1022,57 @@ mod tests {
                 ignored("powerd", "system process"),
             ]
         );
+    }
+
+    #[test]
+    fn upgrade_failure_latching_rules() {
+        assert!(super::should_latch_upgrade_failure(&EnableError::NotAuthorized(
+            "denied".into()
+        )));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::HelperUnavailable));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Iokit(0)));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
+            "connect failed: connection refused".into()
+        )));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
+            "too many concurrent clients".into()
+        )));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
+            "internal error: unreadable peer credentials".into()
+        )));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
+            "read failed: timeout".into()
+        )));
+        assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
+            "mock enable failure".into()
+        )));
+    }
+
+    #[test]
+    fn mode_switch_enable_failure_restores_previous_mode() {
+        let mut state = AppState::new();
+        let original_mode = state.config.mode;
+        let target_mode = if original_mode == SleepMode::Display {
+            SleepMode::System
+        } else {
+            SleepMode::Display
+        };
+
+        state.config.mode = target_mode;
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(EnableError::Ipc("mock enable failure".into())))
+            .unwrap();
+        state.pending_enable = Some(PendingEnable {
+            mode: target_mode,
+            started_by_upgrade: false,
+            upgrade_apps: Vec::new(),
+            rollback_mode: Some(original_mode),
+            app_saw_seed: false,
+            rx,
+        });
+
+        let outcome = state.poll_pending_enable();
+        assert!(matches!(outcome, PendingEnableOutcome::Failed(_)));
+        assert_eq!(state.config.mode, original_mode);
     }
 }

@@ -3,6 +3,16 @@ pub mod wait;
 use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
 use clap::Parser;
 
+fn parse_positive_pid(value: &str) -> Result<i32, String> {
+    let pid = value
+        .parse::<i32>()
+        .map_err(|_| "PID must be a positive integer".to_string())?;
+    if pid <= 0 {
+        return Err("PID must be a positive integer".to_string());
+    }
+    Ok(pid)
+}
+
 /// One-shot maintenance action selected via an exclusive flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceCommand {
@@ -80,16 +90,20 @@ pub struct Args {
     #[arg(short, long)]
     pub user_active: bool,
 
-    /// Wait for X seconds.
-    /// Also supports time units (like "1 day 2 hours 3mins 4s").
+    /// Duration to wait before timing out (`-t` / `--timeout`). Takes a single
+    /// value: bare numbers are seconds; quote human-readable durations (e.g.
+    /// `"1 hour and 30 minutes"`). Use `--` before a trailing command when it
+    /// could be confused with flags (e.g. `caffeinate2 -t 3600 -- hour`).
     #[arg(short, long, name = "DURATION")]
     pub timeout: Option<String>,
 
     /// Wait for program with PID X to complete and pass its exit code.
-    #[arg(short, long, name = "PID")]
+    #[arg(short, long, name = "PID", value_parser = parse_positive_pid)]
     pub waitfor: Option<i32>,
 
-    /// Wait for given command to complete (takes priority above timeout and pid)
+    /// Trailing command to run (takes priority over `--timeout` and `--waitfor`).
+    /// End options with `--` when the command could be parsed as flags or
+    /// arguments, e.g. `caffeinate2 -t 3600 -- hour`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Option<Vec<String>>,
 }

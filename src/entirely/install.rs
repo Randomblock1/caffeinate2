@@ -1,4 +1,5 @@
 use crate::entirely::coordinator;
+use crate::entirely::error::InstallError;
 use crate::entirely::helper_ipc;
 use crate::sleep::power_management;
 use crate::util::fs_util;
@@ -28,8 +29,8 @@ const HELPER_BINARY_HINT: &str = "install caffeinate2 with --features full or he
 const CLI_BINARY_HINT: &str = "install caffeinate2 with --features full, use the GitHub release \
     bundle, or place caffeinate2 in the same directory as caffeinate2-helper";
 
-fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, InstallError> {
+    let exe = std::env::current_exe().map_err(InstallError::from)?;
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name == binary_name {
         return Ok(exe);
@@ -37,14 +38,14 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
     let sibling = exe
         .parent()
         .map(|p| p.join(binary_name))
-        .ok_or_else(|| format!("could not resolve {binary_name} path"))?;
+        .ok_or_else(|| InstallError::msg(format!("could not resolve {binary_name} path")))?;
     if sibling.exists() {
         Ok(sibling)
     } else {
-        Err(format!(
+        Err(InstallError::msg(format!(
             "{binary_name} not found next to {}; {build_hint}",
             exe.display()
-        ))
+        )))
     }
 }
 
@@ -52,7 +53,7 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
 /// # Errors
 ///
 /// Returns an error if the CLI binary cannot be resolved.
-pub fn resolve_cli_binary() -> Result<PathBuf, String> {
+pub fn resolve_cli_binary() -> Result<PathBuf, InstallError> {
     resolve_sibling_binary("caffeinate2", CLI_BINARY_HINT)
 }
 
@@ -60,7 +61,7 @@ pub fn resolve_cli_binary() -> Result<PathBuf, String> {
 /// # Errors
 ///
 /// Returns an error if the helper binary cannot be resolved.
-pub fn resolve_helper_source() -> Result<PathBuf, String> {
+pub fn resolve_helper_source() -> Result<PathBuf, InstallError> {
     resolve_sibling_binary("caffeinate2-helper", HELPER_BINARY_HINT)
 }
 
@@ -78,10 +79,10 @@ pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
 /// # Errors
 ///
 /// Returns an error if `HOME` is not set.
-pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
+pub fn tray_launch_agent_path() -> Result<PathBuf, InstallError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_string())?;
+        .ok_or_else(|| InstallError::msg("HOME is not set"))?;
     Ok(home
         .join("Library/LaunchAgents")
         .join(format!("{TRAY_LAUNCH_AGENT_LABEL}.plist")))
@@ -91,14 +92,14 @@ pub fn tray_launch_agent_path() -> Result<PathBuf, String> {
 /// # Errors
 ///
 /// Returns an error if installation fails or the process is not root.
-pub fn install_helper(source_helper: &Path) -> Result<(), String> {
+pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     if !nix::unistd::Uid::effective().is_root() {
-        return Err("--install-helper must run as root".to_string());
+        return Err(InstallError::msg("--install-helper must run as root"));
     }
 
     let dest = PathBuf::from(HELPER_INSTALL_PATH);
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(InstallError::from)?;
     }
     // Reinstall path: stop any loaded helper before replacing its binary, and
     // unlink the old file so the copy gets a fresh inode. Overwriting a running
@@ -109,18 +110,21 @@ pub fn install_helper(source_helper: &Path) -> Result<(), String> {
     match fs::remove_file(&dest) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("warning: could not remove old helper binary: {e}"),
+        Err(e) => tracing::warn!("could not remove old helper binary: {e}"),
     }
-    fs::copy(source_helper, &dest).map_err(|e| e.to_string())?;
+    fs::copy(source_helper, &dest).map_err(InstallError::from)?;
     let mut perms = fs::metadata(&dest)
-        .map_err(|e| e.to_string())?
+        .map_err(InstallError::from)?
         .permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+    fs::set_permissions(&dest, perms).map_err(InstallError::from)?;
 
     let plist = helper_plist_content(&dest);
-    fs_util::atomic_write(Path::new(HELPER_PLIST_PATH), plist.as_bytes())
-        .map_err(|e| e.to_string())?;
+    // launchctl refuses a system LaunchDaemon plist that is group/world-writable
+    // (a permissive umask would otherwise make atomic_write produce 0666), so
+    // write it with an explicit root-owned 0644.
+    fs_util::atomic_write_with_mode(Path::new(HELPER_PLIST_PATH), plist.as_bytes(), 0o644)
+        .map_err(InstallError::from)?;
     install_newsyslog_conf();
 
     // Best-effort: create the grant group so administrators can allow
@@ -138,11 +142,12 @@ fn install_newsyslog_conf() {
     if let Some(parent) = path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        eprintln!("warning: could not create newsyslog config directory: {e}");
+        tracing::warn!("could not create newsyslog config directory: {e}");
         return;
     }
-    if let Err(e) = fs_util::atomic_write(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes()) {
-        eprintln!("warning: could not install newsyslog config: {e}");
+    // newsyslog also expects a root-owned, non-world-writable config.
+    if let Err(e) = fs_util::atomic_write_with_mode(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes(), 0o644) {
+        tracing::warn!("could not install newsyslog config: {e}");
     }
 }
 
@@ -161,11 +166,11 @@ fn ensure_grant_group() {
         .output()
     {
         Ok(output) if output.status.success() => {}
-        Ok(output) => eprintln!(
-            "warning: could not create '{group}' group: {}",
+        Ok(output) => tracing::warn!(
+            "could not create '{group}' group: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(e) => eprintln!("warning: could not create '{group}' group: {e}"),
+        Err(e) => tracing::warn!("could not create '{group}' group: {e}"),
     }
 }
 
@@ -173,9 +178,9 @@ fn ensure_grant_group() {
 /// # Errors
 ///
 /// Returns an error if uninstallation fails or the process is not root.
-pub fn uninstall_helper() -> Result<(), String> {
+pub fn uninstall_helper() -> Result<(), InstallError> {
     if !nix::unistd::Uid::effective().is_root() {
-        return Err("--uninstall-helper must run as root".to_string());
+        return Err(InstallError::msg("--uninstall-helper must run as root"));
     }
 
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
@@ -183,10 +188,18 @@ pub fn uninstall_helper() -> Result<(), String> {
     let _ = fs::remove_file(NEWSYSLOG_CONF_PATH);
     let _ = fs::remove_file(HELPER_INSTALL_PATH);
     let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
-    // Nobody can send Release to the removed helper; drop any holder state and
-    // make sure the persistent SleepDisabled setting isn't left on.
+
+    // The lockfile is caffeinate2's marker that it is (or was) managing the
+    // global SleepDisabled setting. Once the helper is removed, nobody can send
+    // Release, so if that marker is present we re-enable sleep to avoid leaving
+    // SleepDisabled stuck on. If there is no lockfile we have no evidence that
+    // caffeinate2 disabled sleep, so we leave the setting untouched rather than
+    // clobber an unrelated manual `pmset disablesleep`.
+    let caffeinate2_managed_sleep = Path::new(coordinator::HELPER_LOCK_PATH).exists();
     let _ = fs::remove_file(coordinator::HELPER_LOCK_PATH);
-    let _ = power_management::set_sleep_disabled(false, false);
+    if caffeinate2_managed_sleep {
+        let _ = power_management::set_sleep_disabled(false, false);
+    }
     Ok(())
 }
 
@@ -194,7 +207,7 @@ pub fn uninstall_helper() -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error if privileged installation fails or is cancelled.
-pub fn install_helper_privileged() -> Result<(), String> {
+pub fn install_helper_privileged() -> Result<(), InstallError> {
     if nix::unistd::Uid::effective().is_root() {
         let source = resolve_helper_source()?;
         return install_helper(&source);
@@ -211,11 +224,13 @@ pub fn install_helper_privileged() -> Result<(), String> {
         .arg("-e")
         .arg(script)
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(InstallError::from)?;
     if status.success() {
         Ok(())
     } else {
-        Err("administrator authorization failed or was cancelled".to_string())
+        Err(InstallError::msg(
+            "administrator authorization failed or was cancelled",
+        ))
     }
 }
 
@@ -223,13 +238,13 @@ pub fn install_helper_privileged() -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error if the launch agent plist cannot be written.
-pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
+pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), InstallError> {
     let plist_path = tray_launch_agent_path()?;
     if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(InstallError::from)?;
     }
     let plist = tray_launch_agent_plist(tray_path);
-    fs_util::atomic_write(&plist_path, plist.as_bytes()).map_err(|e| e.to_string())?;
+    fs_util::atomic_write(&plist_path, plist.as_bytes()).map_err(InstallError::from)?;
     // Don't bootstrap the agent now: RunAtLoad would immediately launch a
     // second tray instance next to the one the user is clicking in. launchd
     // picks up ~/Library/LaunchAgents plists at the next login.
@@ -240,7 +255,7 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error if the launch agent plist cannot be removed.
-pub fn uninstall_tray_launch_agent() -> Result<(), String> {
+pub fn uninstall_tray_launch_agent() -> Result<(), InstallError> {
     let plist_path = tray_launch_agent_path()?;
     // Only remove the plist; launchd won't start the agent at the next login.
     // Do NOT boot out the loaded service: when the tray was started by launchd
@@ -250,7 +265,10 @@ pub fn uninstall_tray_launch_agent() -> Result<(), String> {
     match fs::remove_file(&plist_path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove {}: {e}", plist_path.display())),
+        Err(e) => Err(InstallError::msg(format!(
+            "failed to remove {}: {e}",
+            plist_path.display()
+        ))),
     }
 }
 
@@ -269,14 +287,14 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn launchctl_bootstrap_system(plist_path: &str) -> Result<(), String> {
+fn launchctl_bootstrap_system(plist_path: &str) -> Result<(), InstallError> {
     if run_launchctl(&["bootstrap", "system", plist_path]).is_ok() {
         return Ok(());
     }
     run_launchctl(&["load", "-w", plist_path])
 }
 
-fn launchctl_bootout_system(label: &str) -> Result<(), String> {
+fn launchctl_bootout_system(label: &str) -> Result<(), InstallError> {
     // bootout takes a service target (`system/<label>`), not a bare label.
     if run_launchctl(&["bootout", &format!("system/{label}")]).is_ok() {
         return Ok(());
@@ -288,19 +306,19 @@ fn launchctl_bootout_system(label: &str) -> Result<(), String> {
     ])
 }
 
-fn run_launchctl(args: &[&str]) -> Result<(), String> {
+fn run_launchctl(args: &[&str]) -> Result<(), InstallError> {
     let output = Command::new("launchctl")
         .args(args)
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(InstallError::from)?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!(
+        Err(InstallError::msg(format!(
             "launchctl {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
-        ))
+        )))
     }
 }
 

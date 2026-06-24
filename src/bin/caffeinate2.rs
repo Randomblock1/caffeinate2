@@ -3,7 +3,9 @@ mod cli;
 
 #[cfg(target_os = "macos")]
 use caffeinate2::entirely::{helper_ipc, install};
+#[cfg(target_os = "macos")]
 use caffeinate2::sleep::sleep_mode;
+#[cfg(target_os = "macos")]
 use caffeinate2::util::duration_parser;
 #[cfg(target_os = "macos")]
 use clap::Parser;
@@ -40,17 +42,59 @@ const LONG_TIME_FMT: &str = "on %B %-d at %-I:%M:%S %p";
 
 #[cfg(target_os = "macos")]
 fn release_active_and_exit(active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>, code: i32) -> ! {
-    if let Ok(mut guard) = active.lock() {
-        let _ = guard.take();
-    }
+    let mut guard = active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = guard.take();
     process::exit(code);
+}
+
+/// Credentials to apply to a spawned command. `groups` is `Some` only when
+/// `--drop-root` is in effect: the child's supplementary group list must be
+/// reset to the target user's own groups so it doesn't inherit root's (e.g.
+/// `wheel`, `admin`). `None` means leave the inherited group list alone.
+#[cfg(target_os = "macos")]
+struct CommandCredentials {
+    uid: u32,
+    gid: u32,
+    groups: Option<Vec<u32>>,
+}
+
+/// Resolve the target user's full supplementary group list (including the
+/// primary `gid`). Returns `None` if the lookup fails, so the caller can fall
+/// back to a conservative single-group list rather than leaking root's groups.
+#[cfg(target_os = "macos")]
+fn supplementary_groups_for(user: &str, gid: u32) -> Option<Vec<u32>> {
+    let cname = std::ffi::CString::new(user).ok()?;
+    // macOS `getgrouplist` takes/returns `int` groups (not `gid_t`); convert to
+    // `gid_t` (u32) for `setgroups`. NGROUPS_MAX is 16, but query with a larger
+    // buffer and retry once if the kernel reports it needs more.
+    let mut ngroups: libc::c_int = 64;
+    let mut buf: Vec<libc::c_int> = vec![0; ngroups as usize];
+    let mut rc = unsafe {
+        libc::getgrouplist(cname.as_ptr(), gid as libc::c_int, buf.as_mut_ptr(), &mut ngroups)
+    };
+    if rc < 0 {
+        // ngroups now holds the required size.
+        let needed = usize::try_from(ngroups).ok()?.max(1);
+        buf = vec![0; needed];
+        rc = unsafe {
+            libc::getgrouplist(cname.as_ptr(), gid as libc::c_int, buf.as_mut_ptr(), &mut ngroups)
+        };
+        if rc < 0 {
+            return None;
+        }
+    }
+    let count = usize::try_from(ngroups).ok()?.min(buf.len());
+    buf.truncate(count);
+    Some(buf.into_iter().map(|g| g as u32).collect())
 }
 
 #[cfg(target_os = "macos")]
 fn command_credentials(
     args: &Args,
     active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
-) -> (u32, u32) {
+) -> CommandCredentials {
     if args.drop_root {
         let uid_str = std::env::var("SUDO_UID").unwrap_or_else(|_| unistd::getuid().to_string());
         let gid_str = std::env::var("SUDO_GID").unwrap_or_else(|_| unistd::getgid().to_string());
@@ -62,9 +106,23 @@ fn command_credentials(
             eprintln!("Error: invalid SUDO_GID: {gid_str}");
             release_active_and_exit(active, 1);
         };
-        (uid, gid)
+        // Resolve via SUDO_USER when present; otherwise fall back to just the
+        // primary group so the child still sheds root's supplementary groups.
+        let groups = std::env::var("SUDO_USER")
+            .ok()
+            .and_then(|user| supplementary_groups_for(&user, gid))
+            .unwrap_or_else(|| vec![gid]);
+        CommandCredentials {
+            uid,
+            gid,
+            groups: Some(groups),
+        }
     } else {
-        (unistd::getuid().into(), unistd::getgid().into())
+        CommandCredentials {
+            uid: unistd::getuid().into(),
+            gid: unistd::getgid().into(),
+            groups: None,
+        }
     }
 }
 
@@ -83,7 +141,7 @@ fn run_command_mode(
     }
     println!("{sleep_str}until command finishes.");
 
-    let (uid, gid) = command_credentials(args, active);
+    let CommandCredentials { uid, gid, groups } = command_credentials(args, active);
     if args.verbose {
         println!("uid: {uid}, gid: {gid}");
     }
@@ -97,13 +155,39 @@ fn run_command_mode(
         child_command.args(&command[1..]);
         child_command
     };
-    let mut child = match child_command
+    child_command
         .stdout(process::Stdio::inherit())
-        .stderr(process::Stdio::inherit())
-        .uid(uid)
-        .gid(gid)
-        .spawn()
-    {
+        .stderr(process::Stdio::inherit());
+
+    match groups {
+        // --drop-root: reset the supplementary group list, then gid, then uid,
+        // in that order. std applies `.uid()`/`.gid()` *before* any `pre_exec`
+        // hook, so doing it through `.uid()/.gid()` alone would leave root's
+        // supplementary groups on the child; and `setgroups`/`setgid` must run
+        // while still privileged (before `setuid`). Do all three in `pre_exec`
+        // (the group list is resolved in the parent, since `getgrouplist` is not
+        // async-signal-safe).
+        Some(groups) => unsafe {
+            child_command.pre_exec(move || {
+                let ngroups = libc::c_int::try_from(groups.len()).unwrap_or(libc::c_int::MAX);
+                if libc::setgroups(ngroups, groups.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        },
+        None => {
+            child_command.uid(uid).gid(gid);
+        }
+    }
+
+    let mut child = match child_command.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Error: failed to execute command: {e}");
@@ -146,17 +230,27 @@ fn run_timed_wait_mode(
     let waitfor = args.waitfor.is_some();
     if timeout {
         duration = parsed_timeout.copied().expect("Timeout should be present");
-        end_time += duration;
-        let _ = write!(
-            sleep_str,
-            "for {}",
-            duration_parser::format_duration_human(duration)
-        );
+        if duration <= jiff::SignedDuration::ZERO && !waitfor {
+            eprintln!("Error: timeout must be positive");
+            release_active_and_exit(active, 1);
+        }
+        if duration > jiff::SignedDuration::ZERO {
+            end_time += duration;
+            let _ = write!(
+                sleep_str,
+                "for {}",
+                duration_parser::format_duration_human(duration)
+            );
+        }
     }
 
     print!("{sleep_str}");
 
-    if timeout && waitfor {
+    // Only print the " or " separator when a "for <duration>" prefix was
+    // actually emitted above (it is skipped for a zero timeout). Otherwise
+    // `-t 0 -w PID` would print a dangling " or until PID ... finishes".
+    let printed_timeout = timeout && duration > jiff::SignedDuration::ZERO;
+    if printed_timeout && waitfor {
         print!(" or ");
     }
     if waitfor {
@@ -168,7 +262,7 @@ fn run_timed_wait_mode(
     println!(".");
 
     if timeout {
-        if !waitfor {
+        if !waitfor && duration > jiff::SignedDuration::ZERO {
             println!(
                 "Resuming {}.",
                 if duration.as_secs() > (60 * 60 * 24) {
@@ -178,8 +272,15 @@ fn run_timed_wait_mode(
                 }
             );
         }
-        if !waitfor {
-            thread::sleep(duration.try_into().expect("Duration should be valid"));
+        if !waitfor && duration > jiff::SignedDuration::ZERO {
+            let std_duration = match std::time::Duration::try_from(duration) {
+                Ok(d) => d,
+                Err(_) => {
+                    eprintln!("Error: timeout is too large");
+                    release_active_and_exit(active, 1);
+                }
+            };
+            thread::sleep(std_duration);
         }
     }
 
@@ -188,8 +289,14 @@ fn run_timed_wait_mode(
     }
 
     let pid = args.waitfor.expect("PID should be present");
-    let timeout_duration = if timeout {
-        Some(duration.try_into().expect("Duration should be valid"))
+    let timeout_duration = if timeout && duration > jiff::SignedDuration::ZERO {
+        match std::time::Duration::try_from(duration) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("Error: timeout is too large");
+                release_active_and_exit(active, 1);
+            }
+        }
     } else {
         None
     };
@@ -204,7 +311,7 @@ fn run_timed_wait_mode(
             println!("with exit code {}", exit_code.load(Ordering::Relaxed));
         }
         Ok(WaitForPidResult::TimedOut) => {
-            if timeout {
+            if timeout && duration > jiff::SignedDuration::ZERO {
                 let now = jiff::Zoned::now();
                 println!("Timeout reached {}.", now.strftime(SHORT_TIME_FMT));
             }
@@ -215,10 +322,6 @@ fn run_timed_wait_mode(
         }
         Err(WaitForPidError::NotFound) => {
             eprintln!("Error: PID {pid} not found");
-            // Release holds before exiting: process::exit skips destructors,
-            // and an entirely-mode hold would leave system sleep disabled
-            // (until the helper reaps it, or indefinitely with the root CLI
-            // fallback).
             release_active_and_exit(active, 1);
         }
         Err(WaitForPidError::Kevent(e)) => {
@@ -260,7 +363,7 @@ fn run_maintenance(command: MaintenanceCommand) {
                         if sleep_disabled { "yes" } else { "no" }
                     );
                 }
-                Err(e) if helper_ipc::is_connect_error(&e) => {
+                Err(e) if helper_ipc::is_connect_error(&e.to_string()) => {
                     println!(
                         "Helper: not running (install with: sudo caffeinate2 --install-helper)"
                     );
@@ -293,6 +396,7 @@ fn run_maintenance(command: MaintenanceCommand) {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    caffeinate2::util::logging::init_cli_tracing();
     let args = Args::parse();
     if let Some(command) = args.maintenance_command() {
         run_maintenance(command);
@@ -312,9 +416,23 @@ fn main() {
         process::exit(2);
     }
 
+    // A misquoted multi-word duration (`-t 1 hour and 30 minutes`) lands the
+    // extra words in `command`. Reject it up front — before any sleep hold is
+    // taken — instead of silently spawning `hour` as a command and exiting 127.
     if let Some(message) = misquoted_duration_error(&args) {
         eprintln!("{message}");
         process::exit(2);
+    }
+
+    if args
+        .command
+        .as_ref()
+        .is_some_and(|command| !command.is_empty())
+        && (args.timeout.is_some() || args.waitfor.is_some())
+    {
+        eprintln!(
+            "Warning: trailing command takes priority over --timeout and --waitfor"
+        );
     }
 
     let mut sleep_modes = args.sleep_modes();
@@ -346,15 +464,24 @@ fn main() {
         }
     };
 
+    if parsed_timeout.as_ref().is_some_and(|d| *d <= jiff::SignedDuration::ZERO)
+        && args.waitfor.is_none()
+        && args
+            .command
+            .as_ref()
+            .is_none_or(|command| command.is_empty())
+    {
+        eprintln!("Error: timeout must be positive");
+        process::exit(1);
+    }
+
     let active = match sleep_modes.enable_all(args.verbose, args.dry_run) {
         Ok(active) => active,
         Err(e) => {
             eprintln!("Error: {e}");
-            // Skip the install hint for authorization denials: the helper is
-            // installed and reachable, and the denial message already carries
-            // the grant instructions.
+            // Only suggest installing the helper when it is unreachable.
             if sleep_modes.contains(sleep_mode::SleepMode::Entirely)
-                && !matches!(e, sleep_mode::EnableError::NotAuthorized(_))
+                && matches!(e, sleep_mode::EnableError::HelperUnavailable)
             {
                 eprintln!(
                     "Hint: install the privileged helper with: sudo caffeinate2 --install-helper (or run caffeinate2 itself with sudo)"
@@ -382,9 +509,10 @@ fn main() {
             if pid > 0 {
                 let _ = kill(unistd::Pid::from_raw(pid), Signal::SIGTERM);
             }
-            if let Ok(mut guard) = active_signal.lock() {
-                let _ = guard.take();
-            }
+            let mut guard = active_signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = guard.take();
             process::exit(128 + signal);
         }
     });
@@ -411,9 +539,10 @@ fn main() {
         }
     }
 
-    if let Ok(mut guard) = active.lock() {
-        let _ = guard.take();
-    }
+    let mut guard = active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = guard.take();
     process::exit(exit_code.load(Ordering::Relaxed));
 }
 
@@ -425,8 +554,58 @@ fn main() {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use crate::cli::parse_args;
+    use crate::cli::{Args, parse_args, wait::WaitMode};
+    use clap::Parser;
     use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
+    use caffeinate2::util::duration_parser;
+
+    #[test]
+    fn timeout_parses_raw_number_as_seconds() {
+        assert_eq!(
+            duration_parser::parse_duration("3600").unwrap().num_seconds(),
+            3600
+        );
+        assert_eq!(
+            duration_parser::parse_duration("45323").unwrap().num_seconds(),
+            45323
+        );
+    }
+
+    #[test]
+    fn timeout_parses_quoted_human_duration() {
+        let args = parse_args(&["caffeinate2", "-t", "1 hour and 30 minutes"]);
+        assert_eq!(args.timeout.as_deref(), Some("1 hour and 30 minutes"));
+        assert_eq!(
+            duration_parser::parse_duration(args.timeout.as_ref().unwrap())
+                .unwrap()
+                .num_seconds(),
+            5400
+        );
+    }
+
+    #[test]
+    fn timeout_with_command_separator() {
+        use crate::cli::wait::wait_mode;
+        let args = parse_args(&["caffeinate2", "-t", "3600", "--", "hour"]);
+        assert_eq!(args.timeout.as_deref(), Some("3600"));
+        assert_eq!(args.command, Some(vec!["hour".to_string()]));
+        assert_eq!(wait_mode(&args), WaitMode::Command);
+        assert_eq!(
+            duration_parser::parse_duration(args.timeout.as_ref().unwrap())
+                .unwrap()
+                .num_seconds(),
+            3600
+        );
+    }
+
+    #[test]
+    fn trailing_tokens_after_bare_timeout_become_command() {
+        use crate::cli::wait::wait_mode;
+        let args = parse_args(&["caffeinate2", "-t", "3600", "hour"]);
+        assert_eq!(args.timeout.as_deref(), Some("3600"));
+        assert_eq!(args.command, Some(vec!["hour".to_string()]));
+        assert_eq!(wait_mode(&args), WaitMode::Command);
+    }
 
     #[test]
     fn defaults_to_system_assertion_when_no_assertion_flags_are_set() {
@@ -478,5 +657,26 @@ mod tests {
         }
         let active = sleep_modes.enable_all(false, true).unwrap();
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn zero_timeout_with_waitfor_uses_timeout_or_pid_mode() {
+        use crate::cli::wait::wait_mode;
+        let args = parse_args(&["caffeinate2", "-t", "0", "-w", "123"]);
+        assert_eq!(args.waitfor, Some(123));
+        assert_eq!(wait_mode(&args), WaitMode::TimeoutOrPid);
+    }
+
+    #[test]
+    fn zero_timeout_with_trailing_command_is_command_mode() {
+        use crate::cli::wait::wait_mode;
+        let args = parse_args(&["caffeinate2", "-t", "0", "--", "script"]);
+        assert_eq!(wait_mode(&args), WaitMode::Command);
+    }
+
+    #[test]
+    fn reject_non_positive_waitfor_at_parse() {
+        assert!(Args::try_parse_from(["caffeinate2", "-w", "0"]).is_err());
+        assert!(Args::try_parse_from(["caffeinate2", "-w", "-1"]).is_err());
     }
 }

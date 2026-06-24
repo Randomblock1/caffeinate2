@@ -6,6 +6,10 @@ use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSURL};
 
 #[must_use]
 pub fn is_bundle_running(bundle_id: &str) -> bool {
+    debug_assert!(
+        MainThreadMarker::new().is_some(),
+        "is_bundle_running must be called on the main thread"
+    );
     if MainThreadMarker::new().is_none() {
         return false;
     }

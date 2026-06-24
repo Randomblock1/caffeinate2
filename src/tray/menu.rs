@@ -58,6 +58,8 @@ pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
     let mut mode_items = Vec::new();
 
     for mode in SleepMode::all() {
+        // `muda` menu items are not `Copy`; clone is required to append the same
+        // item to the menu after building the handle map.
         let item = CheckMenuItem::new(mode.label(), true, snapshot.mode == mode, None);
         let id = item.id().clone();
         mode_items.push((id, mode, item.clone()));
@@ -266,7 +268,7 @@ pub fn dispatch_command(
                 Err(e) => {
                     eprintln!("{e}");
                     state.set_icon(tray);
-                    state.show_error_tooltip(tray, &e);
+                    state.show_error_tooltip(tray, &e.to_string());
                 }
             }
         }

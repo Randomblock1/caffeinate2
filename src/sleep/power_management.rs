@@ -10,9 +10,19 @@ use objc2_io_kit::{
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use std::{fmt, mem::MaybeUninit};
 
-// Missing functions from objc2-io-kit
+// `IOPMSetSystemPowerSetting` is not exposed by objc2-io-kit, so it is declared
+// here by hand. It is a stable public IOKit C entry point (it is what
+// `pmset disablesleep` ultimately drives); the signature matches the SDK
+// header (`CFStringRef`, `CFBooleanRef`, returning `IOReturn`/`i32`). The
+// `set_sleep_disabled` smoke test exercises it as an `#[ignore]`d integration
+// test, since it mutates a system-wide power setting and needs root.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> i32;
@@ -75,7 +85,7 @@ pub fn create_assertion(
     if status == 0 {
         let id = unsafe { id.assume_init() };
         if verbose {
-            println!("Successfully created power management assertion with ID: {id}");
+            tracing::debug!("Successfully created power management assertion with ID: {id}");
         }
         Ok(PowerAssertion { id, verbose })
     } else {
@@ -85,7 +95,7 @@ pub fn create_assertion(
 
 fn release_assertion(assertion_id: u32, verbose: bool) {
     if verbose {
-        println!("Releasing power management assertion with ID: {assertion_id}");
+        tracing::debug!("Releasing power management assertion with ID: {assertion_id}");
     }
 
     let status = IOPMAssertionRelease(assertion_id).cast_unsigned();
@@ -93,24 +103,87 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
     match status {
         0 => {
             if verbose {
-                println!(
+                tracing::debug!(
                     "Successfully released power management assertion with ID: {assertion_id}"
                 );
             }
         }
         kIOReturnNotFound => {
             if verbose {
-                println!("Assertion {assertion_id} already released");
+                tracing::debug!("Assertion {assertion_id} already released");
             }
         }
         kIOReturnBadArgument => {
             if verbose {
-                println!("Assertion {assertion_id} was invalid");
+                tracing::debug!("Assertion {assertion_id} was invalid");
             }
         }
         _ => {
-            eprintln!("Failed to release power management assertion with code: {status:X}");
+            tracing::warn!(
+                "Failed to release power management assertion with code: {status:X}"
+            );
         }
+    }
+}
+
+/// How often to re-assert user activity for the lifetime of a `--user-active`
+/// hold. `IOPMAssertionDeclareUserActivity` marks the user active "now" and the
+/// effect lapses after the system idle timer elapses, so a long-lived hold must
+/// periodically refresh it (the classic `caffeinate -u` behavior) or sleep
+/// prevention silently stops. A 30s cadence is comfortably below any idle-sleep
+/// timeout.
+const USER_ACTIVITY_REFRESH: Duration = Duration::from_secs(30);
+
+/// Declare user activity once, returning the assertion id. Re-declaring with
+/// the same id (in/out parameter) refreshes that assertion instead of leaking a
+/// new one.
+fn declare_user_activity_once(id: &mut u32, verbose: bool) -> Result<(), u32> {
+    let assertion_name = CFString::from_str("caffeinate2");
+    // Declaring activity is inherently "active now"; the only choice is the
+    // activity type, and Local means a user is physically at this machine.
+    let status = unsafe {
+        IOPMAssertionDeclareUserActivity(
+            Some(&assertion_name),
+            IOPMUserActiveType::Local,
+            std::ptr::from_mut(id),
+        )
+    };
+    if status == 0 {
+        if verbose {
+            tracing::debug!("Successfully declared user activity with ID: {id}");
+        }
+        Ok(())
+    } else {
+        Err(status.cast_unsigned())
+    }
+}
+
+/// A `--user-active` hold: an `IOPMAssertionDeclareUserActivity` assertion plus
+/// a background thread that re-declares it on a timer (see
+/// [`USER_ACTIVITY_REFRESH`]) so it does not lapse on long runs. Dropping the
+/// hold stops the refresher and releases the assertion.
+pub struct UserActivityHold {
+    /// Shared with the refresher thread, which rewrites it after each
+    /// re-declare. `IOPMAssertionDeclareUserActivity` is documented to reuse the
+    /// same id, but it takes the id as an in/out parameter and could in
+    /// principle return a different one; reading the live value here means
+    /// `Drop` always releases the assertion the refresher last touched rather
+    /// than a stale initial id (which would leak the live assertion).
+    id: Arc<AtomicU32>,
+    verbose: bool,
+    stop_tx: Option<mpsc::Sender<()>>,
+    refresher: Option<JoinHandle<()>>,
+}
+
+impl Drop for UserActivityHold {
+    fn drop(&mut self) {
+        // Stop the refresher first so it can never re-declare after release.
+        // Dropping the sender wakes the timer's blocking recv immediately.
+        self.stop_tx.take();
+        if let Some(handle) = self.refresher.take() {
+            let _ = handle.join();
+        }
+        release_assertion(self.id.load(Ordering::SeqCst), self.verbose);
     }
 }
 
@@ -118,30 +191,37 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
 /// # Errors
 ///
 /// Returns an `IOKit` error code if user activity cannot be declared.
-pub fn declare_user_activity(verbose: bool) -> Result<PowerAssertion, u32> {
-    let assertion_name = CFString::from_str("caffeinate2");
-    let mut id = MaybeUninit::uninit();
+pub fn declare_user_activity(verbose: bool) -> Result<UserActivityHold, u32> {
+    let mut initial_id = 0u32;
+    declare_user_activity_once(&mut initial_id, verbose)?;
+    let id = Arc::new(AtomicU32::new(initial_id));
 
-    // Declaring activity is inherently "active now"; the only choice is the
-    // activity type, and Local means a user is physically at this machine.
-    let status = unsafe {
-        IOPMAssertionDeclareUserActivity(
-            Some(&assertion_name),
-            IOPMUserActiveType::Local,
-            id.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(status.cast_unsigned());
-    }
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread_id = Arc::clone(&id);
+    let refresher = thread::spawn(move || {
+        let mut current = thread_id.load(Ordering::SeqCst);
+        loop {
+            match stop_rx.recv_timeout(USER_ACTIVITY_REFRESH) {
+                // The hold was dropped (sender gone) or explicitly signalled.
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(code) = declare_user_activity_once(&mut current, verbose) {
+                        tracing::warn!("Failed to refresh user activity assertion: {code:X}");
+                    } else {
+                        // Publish the (possibly updated) id so Drop releases it.
+                        thread_id.store(current, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    });
 
-    let id = unsafe { id.assume_init() };
-
-    if verbose {
-        println!("Successfully declared user activity with ID: {id}");
-    }
-
-    Ok(PowerAssertion { id, verbose })
+    Ok(UserActivityHold {
+        id,
+        verbose,
+        stop_tx: Some(stop_tx),
+        refresher: Some(refresher),
+    })
 }
 
 pub struct SleepDisabledGuard {
@@ -166,16 +246,17 @@ pub fn disable_sleep(verbose: bool) -> Result<SleepDisabledGuard, u32> {
 ///
 /// # Errors
 ///
-/// Returns an `IOKit` error code if the sleep setting cannot be changed.
-///
-/// # Panics
-///
-/// Panics if the Core Foundation boolean constants are unavailable.
+/// Returns an `IOKit` error code if the sleep setting cannot be changed, or
+/// [`kIOReturnBadArgument`] if the Core Foundation boolean constants are
+/// unavailable (should never happen on a healthy system).
 pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
     let sleep_disabled_bool = if sleep_disabled {
-        unsafe { kCFBooleanTrue.unwrap() }
+        unsafe { kCFBooleanTrue }
     } else {
-        unsafe { kCFBooleanFalse.unwrap() }
+        unsafe { kCFBooleanFalse }
+    };
+    let Some(sleep_disabled_bool) = sleep_disabled_bool else {
+        return Err(kIOReturnBadArgument);
     };
 
     let key = CFString::from_str("SleepDisabled");
@@ -184,7 +265,7 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
 
     let code = result.cast_unsigned();
     if verbose {
-        println!(
+        tracing::debug!(
             "Got result {:X} when {} sleep",
             code,
             if sleep_disabled {
@@ -383,7 +464,10 @@ mod tests {
     #[ignore = "declares real user activity through IOKit"]
     fn smoke_declare_user_activity() {
         let assertion = declare_user_activity(true).unwrap();
-        println!("Declared user activity with ID: {}", assertion.id);
+        println!(
+            "Declared user activity with ID: {}",
+            assertion.id.load(Ordering::SeqCst)
+        );
     }
 
     #[test]

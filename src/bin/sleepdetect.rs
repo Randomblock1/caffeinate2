@@ -1,3 +1,4 @@
+use caffeinate2::util::logging;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -38,7 +39,17 @@ where
     }
 }
 
+fn format_sleep_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs >= 1.0 {
+        format!("{secs:.1} seconds")
+    } else {
+        format!("{:.0} milliseconds", duration.as_millis())
+    }
+}
+
 fn main() {
+    logging::init_cli_tracing();
     const SLEEP_TIME: u64 = 5;
     const SLEEP_DURATION: Duration = Duration::from_secs(SLEEP_TIME);
     const SLEEP_THRESHOLD: Duration = Duration::from_secs(SLEEP_TIME * 2);
@@ -49,12 +60,16 @@ fn main() {
     let sleep_arr_clone = sleep_arr.clone();
     thread::spawn(move || {
         if signals.forever().next().is_some() {
-            let len = sleep_arr_clone.lock().unwrap().len();
+            let guard = sleep_arr_clone
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let len = guard.len();
             if len != 0 {
+                let total_secs = guard.iter().sum::<u64>();
                 println!("\nSleep was detected {len} times");
                 println!(
-                    "On average, slept for {} seconds",
-                    sleep_arr_clone.lock().unwrap().iter().sum::<u64>() / len as u64
+                    "On average, slept for {:.1} seconds",
+                    total_secs as f64 / len as f64
                 );
             } else {
                 println!("\nNo sleep was detected");
@@ -74,12 +89,14 @@ fn main() {
         });
 
         if let Some(excess_duration) = sleep_result {
-            let elapsed_secs = excess_duration.as_secs();
-            sleep_arr.lock().unwrap().push(elapsed_secs);
+            let mut guard = sleep_arr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.push(excess_duration.as_secs());
             let now = jiff::Zoned::now();
             println!(
-                "Sleep detected! Slept for {} seconds, woke at {}",
-                elapsed_secs,
+                "Sleep detected! Slept for {}, woke at {}",
+                format_sleep_duration(excess_duration),
                 now.strftime("%Y-%m-%d %-I:%M:%S %p")
             );
         }

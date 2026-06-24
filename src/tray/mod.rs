@@ -1,6 +1,8 @@
 #[cfg(all(target_os = "macos", feature = "tray"))]
 mod app;
 #[cfg(all(target_os = "macos", feature = "tray"))]
+mod error;
+#[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod app_target;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod macos_activation;
@@ -10,6 +12,8 @@ pub mod macos_apps;
 mod menu;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod process_enum;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+mod single_instance;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 mod state;
 #[cfg(all(target_os = "macos", feature = "tray"))]
@@ -21,3 +25,5 @@ mod wait_window;
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub use app::run;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+pub use error::TrayError;
