@@ -98,16 +98,6 @@ fn try_encode_request(request: &HelperRequest) -> Result<String, serde_json::Err
     Ok(serde_json::to_string(request)? + "\n")
 }
 
-/// Encode a request as a newline-framed JSON line.
-///
-/// These fixed-shape enums always serialize, so on the impossible serialize
-/// error we fall back to an empty line instead of panicking. The framed write
-/// path uses [`try_encode_request`] so it can surface any error instead.
-#[must_use]
-pub fn encode_request(request: &HelperRequest) -> String {
-    try_encode_request(request).unwrap_or_default()
-}
-
 ///
 /// # Errors
 ///
@@ -118,16 +108,6 @@ pub fn decode_request(line: &str) -> Result<HelperRequest, serde_json::Error> {
 
 fn try_encode_response(response: &HelperResponse) -> Result<String, serde_json::Error> {
     Ok(serde_json::to_string(response)? + "\n")
-}
-
-/// Encode a response as a newline-framed JSON line.
-///
-/// These fixed-shape enums always serialize, so on the impossible serialize
-/// error we fall back to an empty line instead of panicking. The framed write
-/// path uses [`try_encode_response`] so it can surface any error instead.
-#[must_use]
-pub fn encode_response(response: &HelperResponse) -> String {
-    try_encode_response(response).unwrap_or_default()
 }
 
 ///
@@ -347,8 +327,15 @@ impl Drop for HelperHoldGuard {
     }
 }
 
+/// Write a single newline-framed response to a connection. Exposed so the
+/// daemon can reply (e.g. with an over-capacity error) before closing a
+/// connection it will not fully serve.
+///
+/// # Errors
+///
+/// Returns an error if the response cannot be encoded or written.
 #[cfg(target_os = "macos")]
-fn write_response_on_stream(
+pub fn write_response(
     stream: &mut UnixStream,
     response: &HelperResponse,
 ) -> Result<(), HelperIpcError> {
@@ -359,18 +346,6 @@ fn write_response_on_stream(
     stream
         .flush()
         .map_err(|e| HelperIpcError::new(e.to_string()))
-}
-
-/// Write a single newline-framed response to a connection. Exposed so the
-/// daemon can reply (e.g. with an over-capacity error) before closing a
-/// connection it will not fully serve.
-///
-/// # Errors
-///
-/// Returns an error if the response cannot be encoded or written.
-#[cfg(target_os = "macos")]
-pub fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> Result<(), HelperIpcError> {
-    write_response_on_stream(stream, response)
 }
 
 #[cfg(target_os = "macos")]
@@ -481,7 +456,7 @@ fn serve_connection_inner(
     let request = match read_request_line(&mut stream) {
         Ok(req) => req,
         Err(e) => {
-            return write_response_on_stream(
+            return write_response(
                 &mut stream,
                 &HelperResponse::Error {
                     message: e.to_string(),
@@ -563,7 +538,7 @@ fn serve_connection_inner(
             },
         },
     };
-    write_response_on_stream(&mut stream, &response)
+    write_response(&mut stream, &response)
 }
 
 #[cfg(test)]
@@ -758,7 +733,7 @@ mod tests {
             HelperRequest::Release,
             HelperRequest::Status,
         ] {
-            let decoded = decode_request(&encode_request(&req)).unwrap();
+            let decoded = decode_request(&try_encode_request(&req).unwrap()).unwrap();
             assert_eq!(decoded, req);
         }
     }
@@ -769,7 +744,7 @@ mod tests {
             holders: 2,
             sleep_disabled: true,
         };
-        let decoded = decode_response(&encode_response(&resp)).unwrap();
+        let decoded = decode_response(&try_encode_response(&resp).unwrap()).unwrap();
         assert_eq!(decoded, resp);
     }
 

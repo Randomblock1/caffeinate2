@@ -169,6 +169,31 @@ pub fn save_config(config: &TrayConfig) -> Result<(), TrayError> {
     Ok(())
 }
 
+/// Maximum number of app names shown inline in a tooltip before the rest are
+/// collapsed into a "+N more" suffix; the full set lives in the menu/picker.
+const MAX_INLINE_APPS: usize = 3;
+
+/// Join `names` with ", ", capping the inline list at `MAX_INLINE_APPS` and
+/// summarizing the overflow as " +N more".
+fn truncate_join<S: AsRef<str>>(names: &[S]) -> String {
+    let join = |slice: &[S]| {
+        slice
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if names.len() <= MAX_INLINE_APPS {
+        join(names)
+    } else {
+        format!(
+            "{} +{} more",
+            join(&names[..MAX_INLINE_APPS]),
+            names.len() - MAX_INLINE_APPS
+        )
+    }
+}
+
 /// Build menu bar tooltip text while sleep prevention is active.
 ///
 /// When the session was started by the upgrade watcher, `upgrading` is `Some`
@@ -185,20 +210,7 @@ pub fn format_active_tooltip(
     if let Some(apps) = upgrading {
         return match apps {
             [] => "caffeinate2 (upgrading external app)".to_string(),
-            [one] => format!("caffeinate2 (upgrading {one})"),
-            _ => {
-                // Cap the inline list; the menu carries the complete set.
-                const MAX: usize = 3;
-                if apps.len() <= MAX {
-                    format!("caffeinate2 (upgrading {})", apps.join(", "))
-                } else {
-                    format!(
-                        "caffeinate2 (upgrading {} +{} more)",
-                        apps[..MAX].join(", "),
-                        apps.len() - MAX
-                    )
-                }
-            }
+            _ => format!("caffeinate2 (upgrading {})", truncate_join(apps)),
         };
     }
 
@@ -207,15 +219,8 @@ pub fn format_active_tooltip(
         parts.push(format_remaining_secs(secs));
     }
     if !wait_for_apps.is_empty() {
-        // Cap the inline list like the upgrade branch; the picker holds the
-        // full set.
-        const MAX: usize = 3;
         let names: Vec<&str> = wait_for_apps.iter().map(WatchTarget::name).collect();
-        let shown = if names.len() <= MAX {
-            names.join(", ")
-        } else {
-            format!("{} +{} more", names[..MAX].join(", "), names.len() - MAX)
-        };
+        let shown = truncate_join(&names);
         if waiting_for_app_launch {
             parts.push(format!("waiting for {shown}"));
         } else {

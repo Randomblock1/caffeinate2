@@ -57,11 +57,22 @@ pub fn atomic_write_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::i
 }
 
 fn atomic_write_inner(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let temp_path = temp_path_for(path)?;
     let result = (|| {
-        let file = std::fs::File::create(&temp_path)?;
+        // Create the temp file with the target mode up front (not the umask
+        // default), so it is never momentarily group/world-readable-or-writable
+        // between creation and the set_permissions below. `O_CREAT`'s mode is
+        // still masked by the umask, so a tightened mode here can only be more
+        // restrictive than requested; the explicit set_permissions afterwards
+        // restores the exact bits regardless of umask.
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        if let Some(mode) = mode {
+            open_opts.mode(mode);
+        }
+        let file = open_opts.open(&temp_path)?;
         let mut file = std::io::BufWriter::new(file);
         std::io::Write::write_all(&mut file, contents)?;
         let file = file.into_inner()?;

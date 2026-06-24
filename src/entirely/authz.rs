@@ -140,12 +140,21 @@ pub fn uid_may_hold(uid: libc::uid_t) -> bool {
 /// exact grant command for this user.
 #[must_use]
 pub fn denial_message(uid: libc::uid_t) -> String {
-    let who = user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| user.name);
+    // Single-quote the resolved name so the suggested command is copy-paste-safe
+    // even for accounts with unusual characters; a bare name could otherwise be
+    // re-split or interpreted by the shell.
+    let who = user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| sh_single_quote(&user.name));
     format!(
         "not authorized: entirely mode requires an administrator account or membership in the \
          '{GRANT_GROUP}' group; an administrator can grant it with: \
          sudo dseditgroup -o edit -a {who} -t user {GRANT_GROUP}"
     )
+}
+
+/// Wrap `s` in single quotes for safe inclusion in a shell command shown to the
+/// user, escaping embedded single quotes.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

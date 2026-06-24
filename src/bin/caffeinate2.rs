@@ -219,6 +219,13 @@ fn run_command_mode(
             release_active_and_exit(active, 1);
         }
     };
+    // Clear the forwarded-signal target the instant wait() returns. There is a
+    // tiny residual window between the kernel reaping the child (making its PID
+    // eligible for reuse) and this store: a signal arriving in that window would
+    // forward SIGTERM to whatever process now holds the recycled PID. We accept
+    // it — the window is microscopic, the signal handler only forwards a
+    // terminating signal the user is already sending, and it is the same
+    // PID-reuse limitation that `-w` carries (see `wait_for_pid`).
     child_pid.store(0, Ordering::Relaxed);
     // Match the -w decoding: report signal deaths as 128 + signal number
     // instead of masking them as success.

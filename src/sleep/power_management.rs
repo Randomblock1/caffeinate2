@@ -342,7 +342,8 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
 
     let mut found = Vec::new();
     for (key_ptr, value_ptr) in keys.into_iter().zip(values) {
-        let (Some(key), Some(value)) = (cf_ref(key_ptr), cf_ref(value_ptr)) else {
+        let (Some(key), Some(value)) = (cf_ref(&by_pid, key_ptr), cf_ref(&by_pid, value_ptr))
+        else {
             continue;
         };
         let Some(pid) = key.downcast_ref::<CFNumber>().and_then(cf_number_i32) else {
@@ -355,7 +356,7 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
             continue;
         };
         for i in 0..list.count() {
-            let Some(item) = cf_ref(unsafe { list.value_at_index(i) }) else {
+            let Some(item) = cf_ref(list, unsafe { list.value_at_index(i) }) else {
                 continue;
             };
             let Some(dict) = item.downcast_ref::<CFDictionary>() else {
@@ -387,8 +388,12 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
 
 /// Borrow a CoreFoundation object from a raw pointer returned by a CF getter
 /// (null → `None`). CF getters return non-owning references, so the borrow is
-/// valid only while the owning collection is still alive.
-fn cf_ref<'a>(ptr: *const c_void) -> Option<&'a CFType> {
+/// only valid while the owning collection is alive. `owner` carries that
+/// collection's lifetime into the returned reference so the borrow checker
+/// enforces the invariant instead of leaving it to convention. `owner` is the
+/// only reference input, so lifetime elision ties the returned borrow to it.
+fn cf_ref<T: ?Sized>(owner: &T, ptr: *const c_void) -> Option<&CFType> {
+    let _ = owner;
     NonNull::new(ptr.cast_mut()).map(|p| unsafe { p.cast::<CFType>().as_ref() })
 }
 
@@ -404,14 +409,14 @@ fn cf_number_i32(number: &CFNumber) -> Option<i32> {
 }
 
 fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
-    let value = cf_ref(unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
+    let value = cf_ref(dict, unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
     value
         .downcast_ref::<CFString>()
         .map(std::string::ToString::to_string)
 }
 
 fn dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {
-    let value = cf_ref(unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
+    let value = cf_ref(dict, unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
     value.downcast_ref::<CFNumber>().and_then(cf_number_i32)
 }
 

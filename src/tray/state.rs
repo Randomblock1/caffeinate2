@@ -558,6 +558,18 @@ impl AppState {
         self.pending_enable = None;
     }
 
+    /// Restore `config.mode` to the value captured before an enable that has
+    /// now failed, so the persisted mode doesn't advance past the hold that is
+    /// actually (still) enforced. No-op when the enable carried no rollback.
+    fn rollback_pending_mode(&mut self, pending: &PendingEnable) {
+        if let Some(rollback_mode) = pending.rollback_mode {
+            self.config.mode = rollback_mode;
+            if let Err(save_err) = self.save_config() {
+                eprintln!("failed to roll back mode after enable failure: {save_err}");
+            }
+        }
+    }
+
     /// Poll the in-flight enable, committing the session or surfacing the error.
     /// Called once per run-loop iteration.
     pub fn poll_pending_enable(&mut self) -> PendingEnableOutcome {
@@ -574,12 +586,7 @@ impl AppState {
                 // mode switch doesn't leave config.mode advanced past the hold
                 // that is actually (still) enforced.
                 let pending = self.pending_enable.take().expect("pending enable present");
-                if let Some(rollback_mode) = pending.rollback_mode {
-                    self.config.mode = rollback_mode;
-                    if let Err(save_err) = self.save_config() {
-                        eprintln!("failed to roll back mode after enable failure: {save_err}");
-                    }
-                }
+                self.rollback_pending_mode(&pending);
                 return PendingEnableOutcome::Failed(EnableError::Ipc(
                     "enable worker terminated unexpectedly".to_string(),
                 ));
@@ -619,12 +626,7 @@ impl AppState {
                 PendingEnableOutcome::Started
             }
             Err(error) => {
-                if let Some(rollback_mode) = pending.rollback_mode {
-                    self.config.mode = rollback_mode;
-                    if let Err(save_err) = self.save_config() {
-                        eprintln!("failed to roll back mode after enable failure: {save_err}");
-                    }
-                }
+                self.rollback_pending_mode(&pending);
                 if pending.started_by_upgrade {
                     if should_latch_upgrade_failure(&error) {
                         self.upgrade_failed = true;
@@ -766,23 +768,16 @@ impl AppState {
         if enabled {
             // Upgrades use Entirely mode, which needs the helper. Surface the
             // admin prompt here rather than on the first external assertion.
+            // launchd then starts the helper asynchronously, so the socket may
+            // not be up immediately — nothing to wait for here; the watcher's
+            // periodic `poll_upgrade` retries the hold once the socket appears.
             let client = HelperClient::new();
-            if !client.is_available() {
-                if let Err(error) = install::install_helper_privileged() {
-                    self.config.upgrade_external = previous;
-                    let _ = self.save_config();
-                    return Err(error.into());
-                }
-                // launchd starts the helper asynchronously. Let the socket check
-                // finish off the UI thread; the watcher will retry on its poll.
-                thread::spawn(move || {
-                    for _ in 0..25 {
-                        if client.is_available() {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(200));
-                    }
-                });
+            if !client.is_available()
+                && let Err(error) = install::install_helper_privileged()
+            {
+                self.config.upgrade_external = previous;
+                let _ = self.save_config();
+                return Err(error.into());
             }
         } else {
             // Drop any "Ignoring…" entries; the menu rebuild removes them.
