@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
@@ -251,7 +251,16 @@ pub fn is_internal_error(message: &str) -> bool {
 /// guards here means the Release RPC is sent only when the last in-process hold
 /// is dropped — so a stale/cancelled guard can't release a hold a newer session
 /// still relies on.
-static HELPER_HOLD_COUNT: AtomicUsize = AtomicUsize::new(0);
+///
+/// This is a `Mutex`, not an atomic, because the count change and its RPC must
+/// be one critical section. The lock is held across both the count mutation and
+/// the Hold/Release RPC so acquire and release can't interleave: otherwise a
+/// concurrent `try_acquire` could re-establish a hold (count back to 1) in the
+/// window between the last guard's decrement-to-0 and its Release RPC, leaving
+/// the in-process count claiming a hold the helper has already dropped. Holds
+/// are infrequent, so serializing them behind one lock (briefly blocking across
+/// a bounded-timeout RPC) is fine.
+static HELPER_HOLD_COUNT: Mutex<usize> = Mutex::new(0);
 
 /// RAII guard for a helper-managed hold.
 ///
@@ -270,8 +279,11 @@ impl HelperHoldGuard {
     ///
     /// Returns an error if the hold RPC fails.
     pub fn try_acquire(client: &HelperClient) -> Result<Self, HelperIpcError> {
+        // Hold the count lock across the Hold RPC so a concurrent release can't
+        // slip its decrement-and-Release between this RPC and the increment.
+        let mut count = HELPER_HOLD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
         rpc(&client.socket_path, &HelperRequest::Hold, true)?.into_hold_ok()?;
-        HELPER_HOLD_COUNT.fetch_add(1, Ordering::SeqCst);
+        *count += 1;
         Ok(Self {
             client: client.clone(),
             released: false,
@@ -286,33 +298,35 @@ impl HelperHoldGuard {
         if self.released {
             return Ok(());
         }
-        // Decrement first; exactly one guard observes the 1 -> 0 transition and
-        // is responsible for the actual Release RPC. While other in-process
-        // guards remain (prev > 1), just drop our reference: releasing now would
-        // remove the shared per-process lockfile entry out from under them.
-        let prev = HELPER_HOLD_COUNT.fetch_sub(1, Ordering::SeqCst);
-        if prev > 1 {
+        // Take the count lock for the whole critical section. Exactly one guard
+        // observes the 1 -> 0 transition and is responsible for the actual
+        // Release RPC. While other in-process guards remain (count > 1), just
+        // drop our reference: releasing now would remove the shared per-process
+        // lockfile entry out from under them.
+        let mut count = HELPER_HOLD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        if *count > 1 {
+            *count -= 1;
             self.released = true;
             return Ok(());
         }
-        // We were the last hold: send the Release RPC. Only mark released on
-        // success so Drop retries a failed explicit release; otherwise a
-        // transient helper outage strands the hold for as long as this process
-        // lives (the reaper only prunes dead pids). Release is idempotent on the
-        // helper side, so a duplicate after a lost response is harmless. On
-        // failure, restore the count so a later retry still owns the 1 -> 0
-        // transition.
+        // We are the last hold: send the Release RPC while still holding the lock
+        // so a concurrent acquire can't re-establish a hold (and the count) in
+        // the gap between our decrement and the RPC. Only decrement and mark
+        // released on success so Drop retries a failed explicit release;
+        // otherwise a transient helper outage strands the hold for as long as
+        // this process lives (the reaper only prunes dead pids). Release is
+        // idempotent on the helper side, so a duplicate after a lost response is
+        // harmless. On failure the count stays at 1 so a later retry still owns
+        // the 1 -> 0 transition.
         match rpc(&self.client.socket_path, &HelperRequest::Release, true)
             .and_then(HelperResponse::into_release_ok)
         {
             Ok(()) => {
+                *count -= 1;
                 self.released = true;
                 Ok(())
             }
-            Err(e) => {
-                HELPER_HOLD_COUNT.fetch_add(1, Ordering::SeqCst);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 }
