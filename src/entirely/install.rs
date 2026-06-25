@@ -3,12 +3,19 @@ use crate::entirely::error::InstallError;
 use crate::entirely::helper_ipc;
 use crate::sleep::power_management;
 use crate::util::fs_util;
+use libc::{S_IFDIR, S_IFMT};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const HELPER_INSTALL_PATH: &str = "/usr/local/libexec/caffeinate2/caffeinate2-helper";
+// /Library/PrivilegedHelperTools is the canonical location for root LaunchDaemon
+// helpers. Unlike /usr/local (owned by the installing user on Homebrew-Intel), it
+// and its parent /Library are root-owned and not user-writable by default on both
+// Intel and Apple Silicon, so a non-root user cannot replace the daemon binary or
+// redirect the path via a writable ancestor.
+pub const HELPER_INSTALL_PATH: &str =
+    "/Library/PrivilegedHelperTools/com.randomblock1.caffeinate2.helper";
 pub const HELPER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.randomblock1.caffeinate2.helper.plist";
 pub const HELPER_PLIST_LABEL: &str = "com.randomblock1.caffeinate2.helper";
@@ -115,14 +122,21 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     }
 
     let dest = PathBuf::from(HELPER_INSTALL_PATH);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(InstallError::from)?;
-        // create_dir_all honors the process umask, which a permissive setting
-        // could leave group/world-writable — a privilege-escalation vector for
-        // the root-owned helper binary below. Pin it to 0o755 explicitly.
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
-            .map_err(InstallError::from)?;
-    }
+    let parent = dest
+        .parent()
+        .ok_or_else(|| InstallError::msg("helper install path has no parent directory"))?;
+
+    // Defense in depth around HELPER_INSTALL_PATH: if any ancestor of the install
+    // directory were attacker-owned or group/world-writable, that user could
+    // replace the root-owned daemon binary (or redirect the path via a symlinked
+    // ancestor) and gain root code execution the next time launchd starts the
+    // service. /Library/PrivilegedHelperTools is root-owned by default, but a
+    // misconfigured system (or a custom HELPER_INSTALL_PATH) could still expose
+    // this, so validate the whole chain is root-owned and non-writable by others
+    // and create any missing components ourselves as root:wheel 0o755. launchd
+    // then only ever executes a binary in a tree no non-root user controls.
+    ensure_secure_install_dir(parent)?;
+
     // Reinstall path: stop any loaded helper before replacing its binary, and
     // unlink the old file so the copy gets a fresh inode. Overwriting a running
     // executable in place invalidates its code signature and the kernel kills
@@ -134,12 +148,11 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("could not remove old helper binary: {e}"),
     }
-    fs::copy(source_helper, &dest).map_err(InstallError::from)?;
-    let mut perms = fs::metadata(&dest)
-        .map_err(InstallError::from)?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&dest, perms).map_err(InstallError::from)?;
+    // Copy with O_NOFOLLOW|O_EXCL and pin root:wheel 0o755 on the open fd, so a
+    // symlink planted at the destination cannot redirect the privileged write
+    // and the installed binary is never momentarily owned or writable by a
+    // non-root user.
+    install_helper_binary(source_helper, &dest)?;
 
     let plist = helper_plist_content(&dest);
     // launchctl refuses a system LaunchDaemon plist that is group/world-writable
@@ -156,6 +169,139 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     ensure_grant_group();
 
     launchctl_bootstrap_system(HELPER_PLIST_PATH)?;
+    Ok(())
+}
+
+/// Validate that every ancestor of `dir` (and `dir` itself) is a real directory
+/// owned by root and not writable by group or other, creating any missing
+/// components as root-owned 0o755. Refuses rather than proceeding when a
+/// component is attacker-controllable: writing the root daemon binary beneath a
+/// directory a non-root user can modify (or symlink away) is a local root
+/// privilege-escalation vector on any user-writable prefix.
+fn ensure_secure_install_dir(dir: &Path) -> Result<(), InstallError> {
+    use std::path::Component;
+
+    if !dir.is_absolute() {
+        return Err(InstallError::msg(format!(
+            "refusing to install: helper directory {} is not an absolute path",
+            dir.display()
+        )));
+    }
+
+    // Walk top-down from the filesystem root. Each component is validated (or
+    // created) only after its parent has been confirmed root-owned and
+    // non-writable by others, which closes the TOCTOU window: a non-root user
+    // cannot create or symlink-swap an entry inside a directory they can't write.
+    let mut current = PathBuf::from("/");
+    verify_secure_existing_dir(&current)?;
+    for component in dir.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                current.push(name);
+                match nix::sys::stat::lstat(&current) {
+                    Ok(st) => verify_secure_dir_stat(&current, st.st_mode, st.st_uid)?,
+                    Err(nix::errno::Errno::ENOENT) => create_secure_dir(&current)?,
+                    Err(e) => {
+                        return Err(InstallError::msg(format!(
+                            "could not inspect {}: {e}",
+                            current.display()
+                        )));
+                    }
+                }
+            }
+            // `.`/`..`/prefix shouldn't appear in the normalized absolute
+            // constant; reject rather than silently traversing them.
+            _ => {
+                return Err(InstallError::msg(format!(
+                    "refusing to install: helper directory {} is not normalized",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_secure_existing_dir(path: &Path) -> Result<(), InstallError> {
+    let st = nix::sys::stat::lstat(path)
+        .map_err(|e| InstallError::msg(format!("could not inspect {}: {e}", path.display())))?;
+    verify_secure_dir_stat(path, st.st_mode, st.st_uid)
+}
+
+fn verify_secure_dir_stat(
+    path: &Path,
+    st_mode: libc::mode_t,
+    st_uid: u32,
+) -> Result<(), InstallError> {
+    if dir_stat_is_secure(st_mode, st_uid) {
+        return Ok(());
+    }
+    Err(InstallError::msg(format!(
+        "refusing to install helper: {} must be a directory owned by root and not writable by \
+         other users (found uid {st_uid}, mode {:o}); a non-root-owned or world/group-writable \
+         ancestor would let a non-root user replace the root daemon binary. Fix the \
+         ownership/permissions of that path before installing",
+        path.display(),
+        st_mode & 0o7777,
+    )))
+}
+
+/// A directory is safe to host the root daemon only when it is a real directory
+/// (not a symlink), owned by root, and not writable by group or other.
+fn dir_stat_is_secure(st_mode: libc::mode_t, st_uid: u32) -> bool {
+    (st_mode & S_IFMT) == S_IFDIR && st_uid == 0 && (st_mode & 0o022) == 0
+}
+
+/// Create `path` as a root-owned 0o755 directory. The caller has already
+/// verified the parent is root-owned and non-writable by others, so no non-root
+/// user can pre-create or symlink-swap this component before we secure it.
+fn create_secure_dir(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::DirBuilderExt;
+    // mode(0o755) guarantees the directory is never group/world-writable, even
+    // for an instant (umask can only tighten it); the chown and set_permissions
+    // below pin the exact owner and bits regardless of umask.
+    fs::DirBuilder::new()
+        .mode(0o755)
+        .create(path)
+        .map_err(InstallError::from)?;
+    std::os::unix::fs::chown(path, Some(0), Some(0)).map_err(InstallError::from)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(InstallError::from)?;
+    Ok(())
+}
+
+/// Copy the helper binary to `dest` without following symlinks and pin it to
+/// root:wheel 0o755 through the open fd, so a symlink planted at `dest` cannot
+/// redirect the privileged write and the binary is never owned or writable by a
+/// non-root user.
+fn install_helper_binary(source: &Path, dest: &Path) -> Result<(), InstallError> {
+    use nix::sys::stat::{Mode, fchmod};
+    use nix::unistd::{Gid, Uid, fchown};
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut contents = Vec::new();
+    fs::File::open(source)
+        .map_err(InstallError::from)?
+        .read_to_end(&mut contents)
+        .map_err(InstallError::from)?;
+
+    // create_new => O_CREAT|O_EXCL; O_NOFOLLOW rejects a symlink at dest. The
+    // caller unlinks any prior binary first, so O_EXCL gets a fresh inode.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(dest)
+        .map_err(InstallError::from)?;
+    file.write_all(&contents).map_err(InstallError::from)?;
+    file.sync_all().map_err(InstallError::from)?;
+    fchown(file.as_fd(), Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+        .map_err(|e| InstallError::msg(format!("could not set helper owner: {e}")))?;
+    fchmod(file.as_fd(), Mode::from_bits_truncate(0o755))
+        .map_err(|e| InstallError::msg(format!("could not set helper mode: {e}")))?;
     Ok(())
 }
 
@@ -364,11 +510,18 @@ mod tests {
 
     #[test]
     fn helper_plist_substitutes_path() {
-        let content = helper_plist_content(Path::new(
-            "/usr/local/libexec/caffeinate2/caffeinate2-helper",
-        ));
-        assert!(content.contains("/usr/local/libexec/caffeinate2/caffeinate2-helper"));
+        let content = helper_plist_content(Path::new(HELPER_INSTALL_PATH));
+        assert!(content.contains(HELPER_INSTALL_PATH));
         assert!(!content.contains("__HELPER_PATH__"));
+    }
+
+    #[test]
+    fn helper_install_path_is_root_owned_prefix() {
+        // The install path must live under a directory tree that is root-owned
+        // and not user-writable by default; /usr/local is user-owned on
+        // Homebrew-Intel and must not be used.
+        assert!(HELPER_INSTALL_PATH.starts_with("/Library/PrivilegedHelperTools/"));
+        assert!(!HELPER_INSTALL_PATH.starts_with("/usr/local/"));
     }
 
     #[test]
@@ -388,6 +541,35 @@ mod tests {
         assert!(content.contains("/Users/test/.cargo/bin/caffeinate2-tray"));
         assert!(content.contains(TRAY_LAUNCH_AGENT_LABEL));
         assert!(!content.contains("__TRAY_PATH__"));
+    }
+
+    #[test]
+    fn dir_stat_is_secure_requires_root_owned_nonwritable_directory() {
+        let dir = S_IFDIR;
+        // Root-owned, not group/world-writable directory: safe.
+        assert!(dir_stat_is_secure(dir | 0o755, 0));
+        assert!(dir_stat_is_secure(dir | 0o700, 0));
+        // Owned by a non-root user (e.g. Homebrew-Intel /usr/local): unsafe.
+        assert!(!dir_stat_is_secure(dir | 0o755, 501));
+        // Group- or world-writable, even when root-owned: unsafe.
+        assert!(!dir_stat_is_secure(dir | 0o775, 0));
+        assert!(!dir_stat_is_secure(dir | 0o757, 0));
+        assert!(!dir_stat_is_secure(dir | 0o777, 0));
+        // A symlink (or any non-directory) is never acceptable.
+        assert!(!dir_stat_is_secure(libc::S_IFLNK | 0o755, 0));
+        assert!(!dir_stat_is_secure(libc::S_IFREG | 0o755, 0));
+    }
+
+    #[test]
+    fn ensure_secure_install_dir_rejects_relative_path() {
+        let result = ensure_secure_install_dir(Path::new("usr/local/libexec/caffeinate2"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
     }
 
     #[test]
