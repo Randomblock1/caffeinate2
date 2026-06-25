@@ -75,12 +75,25 @@ pub fn acquire_or_exit() {
 
     let _ = ftruncate(flock.as_fd(), 0);
     let line = format!("{}\n", std::process::id());
-    if let Err(error) = write(flock.as_fd(), line.as_bytes()) {
-        eprintln!(
-            "caffeinate2-tray: could not write lock file {}: {error}",
-            path.display()
-        );
-        std::process::exit(1);
+    match write(flock.as_fd(), line.as_bytes()) {
+        Ok(written) if written == line.len() => {}
+        Ok(written) => {
+            // A short write would leave a truncated PID in the lock file, so
+            // treat it as fatal rather than record a corrupt owner.
+            eprintln!(
+                "caffeinate2-tray: short write to lock file {} ({written} of {} bytes)",
+                path.display(),
+                line.len()
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!(
+                "caffeinate2-tray: could not write lock file {}: {error}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
     }
 
     if INSTANCE_LOCK.set(flock).is_err() {

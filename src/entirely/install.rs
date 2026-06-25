@@ -65,14 +65,31 @@ pub fn resolve_helper_source() -> Result<PathBuf, InstallError> {
     resolve_sibling_binary("caffeinate2-helper", HELPER_BINARY_HINT)
 }
 
+/// Escape the five XML metacharacters so a path containing `&`, `<`, `>`, or
+/// quotes can't break (or inject into) the surrounding plist `<string>`.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[must_use]
 pub fn helper_plist_content(helper_path: &Path) -> String {
-    HELPER_PLIST_TEMPLATE.replace("__HELPER_PATH__", &helper_path.display().to_string())
+    HELPER_PLIST_TEMPLATE.replace(
+        "__HELPER_PATH__",
+        &xml_escape(&helper_path.display().to_string()),
+    )
 }
 
 #[must_use]
 pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
-    TRAY_PLIST_TEMPLATE.replace("__TRAY_PATH__", &tray_path.display().to_string())
+    TRAY_PLIST_TEMPLATE.replace(
+        "__TRAY_PATH__",
+        &xml_escape(&tray_path.display().to_string()),
+    )
 }
 
 ///
@@ -204,7 +221,16 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
     let caffeinate2_managed_sleep = Path::new(coordinator::HELPER_LOCK_PATH).exists();
     let _ = fs::remove_file(coordinator::HELPER_LOCK_PATH);
     if caffeinate2_managed_sleep {
-        let _ = power_management::set_sleep_disabled(false, false);
+        // Re-enabling sleep is the one uninstall step that must not fail
+        // silently: reporting a successful uninstall while SleepDisabled stays
+        // on would leave the machine permanently unable to sleep with no helper
+        // left to fix it. Propagate the failure so the caller (and exit code)
+        // reflect it.
+        power_management::set_sleep_disabled(false, false).map_err(|code| {
+            InstallError::msg(format!(
+                "uninstalled helper but failed to re-enable system sleep (IOKit error {code:#x}); run `sudo pmset -a disablesleep 0` to restore it"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -250,7 +276,11 @@ pub fn install_tray_launch_agent(tray_path: &Path) -> Result<(), InstallError> {
         fs::create_dir_all(parent).map_err(InstallError::from)?;
     }
     let plist = tray_launch_agent_plist(tray_path);
-    fs_util::atomic_write(&plist_path, plist.as_bytes()).map_err(InstallError::from)?;
+    // Pin the mode like the helper plist instead of inheriting the caller's
+    // umask: a permissive umask would otherwise leave the LaunchAgent plist
+    // group/world-writable.
+    fs_util::atomic_write_with_mode(&plist_path, plist.as_bytes(), 0o644)
+        .map_err(InstallError::from)?;
     // Don't bootstrap the agent now: RunAtLoad would immediately launch a
     // second tray instance next to the one the user is clicking in. launchd
     // picks up ~/Library/LaunchAgents plists at the next login.

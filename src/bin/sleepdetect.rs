@@ -65,11 +65,11 @@ fn main() {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let len = guard.len();
             if len != 0 {
-                let total_secs = guard.iter().sum::<u64>();
+                let total_secs = guard.iter().map(Duration::as_secs_f64).sum::<f64>();
                 println!("\nSleep was detected {len} times");
                 println!(
                     "On average, slept for {:.1} seconds",
-                    total_secs as f64 / len as f64
+                    total_secs / len as f64
                 );
             } else {
                 println!("\nNo sleep was detected");
@@ -92,7 +92,7 @@ fn main() {
             let mut guard = sleep_arr
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.push(excess_duration.as_secs());
+            guard.push(excess_duration);
             let now = jiff::Zoned::now();
             println!(
                 "Sleep detected! Slept for {}, woke at {}",

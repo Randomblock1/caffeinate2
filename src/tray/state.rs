@@ -613,8 +613,14 @@ impl AppState {
                     // Preserve the prior session's "seen running" latch across a
                     // two-phase switch (OR'd with a fresh scan) so a watched app
                     // that quit during the acquire window can still auto-stop.
-                    app_saw_running: pending.app_saw_seed
-                        || process_enum::any_target_running(&self.config.wait_for_apps),
+                    // Invalidate the scan cache first: this seed is the session's
+                    // first "seen running" decision and must reflect processes
+                    // launched during the (possibly slow) acquire, not a scan
+                    // cached before the enable began.
+                    app_saw_running: pending.app_saw_seed || {
+                        process_enum::invalidate_exec_path_cache();
+                        process_enum::any_target_running(&self.config.wait_for_apps)
+                    },
                     started_by_upgrade,
                     upgrade_apps: pending.upgrade_apps,
                 });
@@ -728,6 +734,11 @@ impl AppState {
         // actually active — otherwise the (potentially expensive) process walk
         // is computed and discarded on the idle tray.
         if self.session.is_some() {
+            // The selection just changed, so this re-seed is a fresh "seen
+            // running" decision for the new set. Drop the cached scan first so a
+            // newly added, already-running target isn't missed by a scan cached
+            // before the change.
+            process_enum::invalidate_exec_path_cache();
             let seen = process_enum::any_target_running(&self.config.wait_for_apps);
             if let Some(session) = self.session.as_mut() {
                 session.app_saw_running = seen;
@@ -1056,6 +1067,20 @@ mod tests {
 
     #[test]
     fn mode_switch_enable_failure_restores_previous_mode() {
+        // Point HOME at a throwaway dir so AppState::new() (load_config) and the
+        // rollback's save_config() operate on an isolated config, never the
+        // user's real ~/Library/Application Support/caffeinate2/tray.toml. No
+        // other test reads or writes HOME-derived config, so this can't race.
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded with respect to HOME — no concurrent test
+        // reads or mutates it (see comment above).
+        unsafe { std::env::set_var("HOME", &temp_home) };
+
         let mut state = AppState::new();
         let original_mode = state.config.mode;
         let target_mode = if original_mode == SleepMode::Display {
@@ -1080,5 +1105,14 @@ mod tests {
         let outcome = state.poll_pending_enable();
         assert!(matches!(outcome, PendingEnableOutcome::Failed(_)));
         assert_eq!(state.config.mode, original_mode);
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 }

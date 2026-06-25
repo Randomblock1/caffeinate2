@@ -32,8 +32,19 @@ pub fn wait_mode(args: &Args) -> WaitMode {
 /// tokens as a command instead of part of the timeout string. Returns a help
 /// message so the caller can reject the invocation before taking a sleep hold,
 /// rather than silently running the first stray word (`hour`) as a command.
+///
+/// `command_explicitly_separated` reports whether the user delimited the command
+/// with `--` (clap strips the separator, so it is invisible in `args`). The
+/// documented escape hatch `caffeinate2 -t 3600 -- hour` runs a command that
+/// happens to be a duration word *on purpose*; honoring `--` keeps that from
+/// being misread as a misquoted duration.
 #[must_use]
-pub fn misquoted_duration_error(args: &Args) -> Option<String> {
+pub fn misquoted_duration_error(args: &Args, command_explicitly_separated: bool) -> Option<String> {
+    // An explicit `--` means the trailing tokens are unambiguously the command,
+    // not a continuation of the duration, so never second-guess them.
+    if command_explicitly_separated {
+        return None;
+    }
     let timeout = args.timeout.as_deref()?;
     let command = args.command.as_ref()?;
     if command.is_empty() {
@@ -197,7 +208,8 @@ mod tests {
     #[test]
     fn misquoted_duration_is_detected() {
         let args = parse_args(&["caffeinate2", "-t", "1", "hour", "and", "30", "minutes"]);
-        let message = misquoted_duration_error(&args).expect("should detect misquoted duration");
+        let message =
+            misquoted_duration_error(&args, false).expect("should detect misquoted duration");
         assert!(message.contains("multi-word durations must be quoted"));
         assert!(message.contains("-t \"1 hour and 30 minutes\""));
     }
@@ -206,7 +218,18 @@ mod tests {
     fn genuine_command_after_numeric_timeout_is_not_flagged() {
         // `-t 3600 -- myscript` is a legitimate timeout+command, not a misquote.
         let args = parse_args(&["caffeinate2", "-t", "3600", "--", "myscript"]);
-        assert!(misquoted_duration_error(&args).is_none());
+        assert!(misquoted_duration_error(&args, true).is_none());
+    }
+
+    #[test]
+    fn duration_word_command_after_separator_is_not_flagged() {
+        // The documented escape hatch `caffeinate2 -t 3600 -- hour` runs a
+        // command that happens to be a duration word on purpose. The `--`
+        // separator (reported via the flag) must suppress the misquote check.
+        let args = parse_args(&["caffeinate2", "-t", "3600", "--", "hour"]);
+        assert!(misquoted_duration_error(&args, true).is_none());
+        // Without the separator the same tokens look like a misquoted duration.
+        assert!(misquoted_duration_error(&args, false).is_some());
     }
 
     #[test]

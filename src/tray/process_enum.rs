@@ -151,6 +151,14 @@ fn running_executable_paths() -> Vec<String> {
     paths
 }
 
+/// Drop the cached process scan so the next [`running_executable_paths`] call
+/// does a fresh walk. Called when the watch set or enable state changes, where
+/// a scan cached up to [`PROC_SCAN_CACHE_TTL`] ago could predate a just-launched
+/// target and make the first "seen running" decision miss a short-lived process.
+pub fn invalidate_exec_path_cache() {
+    *exec_path_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Canonical path for stable comparison when checking executable targets.
 fn canonical_exec_path(path: &str) -> String {
     std::fs::canonicalize(path)

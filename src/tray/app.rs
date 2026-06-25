@@ -60,6 +60,10 @@ fn poll_pending_enable(state: &mut AppState, tray: &tray_icon::TrayIcon, handles
 /// Returns an error if tray setup or icon decoding fails.
 pub fn run() -> Result<(), TrayError> {
     single_instance::acquire_or_exit();
+    // Validate we're on the main thread before any AppKit-backed setup runs:
+    // init_tray_app, the event-handler/observer installers, and the event-loop
+    // pump all assume the main thread. Bail early rather than touch AppKit off it.
+    let mtm = MainThreadMarker::new().ok_or(TrayError::NotMainThread)?;
     crate::tray::macos_activation::init_tray_app();
     let (tray_events, menu_events) = crate::tray::macos_activation::install_tray_event_handlers();
     let (workspace_dirty, _workspace_guard) =
@@ -83,9 +87,8 @@ pub fn run() -> Result<(), TrayError> {
     let icon_off = Icon::from_rgba(icon_off_rgba, icon_width, icon_height)
         .map_err(|e| TrayError::BuildIcon(e.to_string()))?;
 
-    // Everything below runs on the main thread only; muda menu items are not
-    // Send, so no locking or sharing is involved.
-    let mtm = MainThreadMarker::new().ok_or(TrayError::NotMainThread)?;
+    // Everything below runs on the main thread only (validated above via `mtm`);
+    // muda menu items are not Send, so no locking or sharing is involved.
     let mut state = AppState::new();
     let initial = state.menu_snapshot();
 

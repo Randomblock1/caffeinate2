@@ -108,6 +108,16 @@ fn command_credentials(
     if args.drop_root {
         let sudo_uid = std::env::var("SUDO_UID").ok();
         let sudo_gid = std::env::var("SUDO_GID").ok();
+        // sudo always exports SUDO_UID and SUDO_GID together. Exactly one being
+        // set is a tampered or partial environment: falling back to the current
+        // (root) id for the missing half would drop privileges only halfway,
+        // running the child as root's uid or gid. Refuse rather than half-drop.
+        if sudo_uid.is_some() != sudo_gid.is_some() {
+            eprintln!(
+                "Error: --drop-root requires SUDO_UID and SUDO_GID to be set together; only one is present"
+            );
+            release_active_and_exit(active, 1);
+        }
         let uid_str = sudo_uid
             .clone()
             .unwrap_or_else(|| unistd::getuid().to_string());
@@ -452,7 +462,11 @@ fn main() {
     // A misquoted multi-word duration (`-t 1 hour and 30 minutes`) lands the
     // extra words in `command`. Reject it up front — before any sleep hold is
     // taken — instead of silently spawning `hour` as a command and exiting 127.
-    if let Some(message) = misquoted_duration_error(&args) {
+    // clap consumes the `--` end-of-options marker, so detect it from the raw
+    // argv to tell a deliberate `-t 3600 -- hour` command from a misquoted
+    // `-t 1 hour` duration.
+    let command_explicitly_separated = std::env::args_os().any(|arg| arg == "--");
+    if let Some(message) = misquoted_duration_error(&args, command_explicitly_separated) {
         eprintln!("{message}");
         process::exit(2);
     }

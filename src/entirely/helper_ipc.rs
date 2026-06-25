@@ -282,7 +282,26 @@ impl HelperHoldGuard {
         // Hold the count lock across the Hold RPC so a concurrent release can't
         // slip its decrement-and-Release between this RPC and the increment.
         let mut count = HELPER_HOLD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
-        rpc(&client.socket_path, &HelperRequest::Hold, true)?.into_hold_ok()?;
+        match rpc(&client.socket_path, &HelperRequest::Hold, true) {
+            // The helper answered. An explicit `Error` response means it did not
+            // commit a hold, so there is nothing to release; just surface it.
+            Ok(response) => response.into_hold_ok()?,
+            // Transport/read failure: the request may have reached the helper and
+            // been accepted even though we never saw the reply, leaving a hold
+            // committed against this process that no guard will ever release. If
+            // we are the first in-process hold (count == 0), send a best-effort
+            // Release so a lost response can't strand sleep disabled for the life
+            // of this process. Release is idempotent helper-side, so it is
+            // harmless if the Hold never actually landed. Skip it when other
+            // guards are live (count > 0): they share the per-process lockfile
+            // entry and releasing would yank it out from under them.
+            Err(e) => {
+                if *count == 0 {
+                    let _ = rpc(&client.socket_path, &HelperRequest::Release, true);
+                }
+                return Err(e);
+            }
+        }
         *count += 1;
         Ok(Self {
             client: client.clone(),

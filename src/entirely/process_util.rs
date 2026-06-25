@@ -64,7 +64,19 @@ pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
 pub fn process_id_from_pid(
     pid: i32,
 ) -> Result<crate::entirely::lockfile::ProcessId, std::io::Error> {
-    let start_time = get_process_start_time(pid)
-        .ok_or_else(|| std::io::Error::other("Failed to determine process start time"))?;
-    Ok(crate::entirely::lockfile::ProcessId { pid, start_time })
+    // `proc_pidinfo` can miss transiently (e.g. EBUSY) for a live process, so
+    // retry briefly before giving up — the same tolerance `default_process_checker`
+    // applies. Failing on the first miss would break peer-identity reads for a
+    // freshly connected helper client and hold acquisition for this process.
+    for attempt in 0..START_TIME_READ_ATTEMPTS {
+        if let Some(start_time) = get_process_start_time(pid) {
+            return Ok(crate::entirely::lockfile::ProcessId { pid, start_time });
+        }
+        if attempt + 1 < START_TIME_READ_ATTEMPTS {
+            std::thread::sleep(START_TIME_RETRY_DELAY);
+        }
+    }
+    Err(std::io::Error::other(
+        "Failed to determine process start time",
+    ))
 }
