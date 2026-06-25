@@ -16,7 +16,8 @@ use tray_cli::{Args, MaintenanceCommand};
 fn run_maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
     match command {
         MaintenanceCommand::InstallLaunchAgent => {
-            let tray_path = std::env::current_exe().context("could not resolve tray binary path")?;
+            let tray_path =
+                std::env::current_exe().context("could not resolve tray binary path")?;
             install::install_tray_launch_agent(&tray_path)?;
             let plist_path = install::tray_launch_agent_path()?;
             println!("Installed tray LaunchAgent at {}.", plist_path.display());

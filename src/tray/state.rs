@@ -1030,10 +1030,12 @@ mod tests {
 
     #[test]
     fn upgrade_failure_latching_rules() {
-        assert!(super::should_latch_upgrade_failure(&EnableError::NotAuthorized(
-            "denied".into()
-        )));
-        assert!(!super::should_latch_upgrade_failure(&EnableError::HelperUnavailable));
+        assert!(super::should_latch_upgrade_failure(
+            &EnableError::NotAuthorized("denied".into())
+        ));
+        assert!(!super::should_latch_upgrade_failure(
+            &EnableError::HelperUnavailable
+        ));
         assert!(!super::should_latch_upgrade_failure(&EnableError::Iokit(0)));
         assert!(!super::should_latch_upgrade_failure(&EnableError::Ipc(
             "connect failed: connection refused".into()

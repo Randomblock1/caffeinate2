@@ -169,7 +169,10 @@ impl SleepMode {
     /// # Errors
     ///
     /// Returns an error if tray sleep prevention or helper installation fails.
-    pub fn enable_for_tray(self, install_helper_if_missing: bool) -> Result<ActiveSleepHold, EnableError> {
+    pub fn enable_for_tray(
+        self,
+        install_helper_if_missing: bool,
+    ) -> Result<ActiveSleepHold, EnableError> {
         match self.enable(false, TRAY_ENTIRELY_POLICY) {
             Err(EnableError::HelperUnavailable)
                 if self == Self::Entirely && install_helper_if_missing =>
@@ -303,35 +306,25 @@ mod tests {
     #[test]
     fn helper_errors_classify_by_prefix() {
         assert_eq!(
-            classify_helper_error(HelperIpcError::new(
-                "connect failed: no socket".to_string()
-            )),
+            classify_helper_error(HelperIpcError::new("connect failed: no socket".to_string())),
             EnableError::HelperUnavailable
         );
         assert_eq!(
-            classify_helper_error(HelperIpcError::connect(std::io::Error::other(
-                "no socket"
-            ))),
+            classify_helper_error(HelperIpcError::connect(std::io::Error::other("no socket"))),
             EnableError::HelperUnavailable
         );
         assert_eq!(
             classify_helper_error(HelperIpcError::internal(std::io::Error::other(
                 "Failed to determine process start time"
             ))),
-            EnableError::Ipc(
-                "internal error: Failed to determine process start time".to_string()
-            )
+            EnableError::Ipc("internal error: Failed to determine process start time".to_string())
         );
         assert_eq!(
-            classify_helper_error(HelperIpcError::new(
-                "not authorized: nope".to_string()
-            )),
+            classify_helper_error(HelperIpcError::new("not authorized: nope".to_string())),
             EnableError::NotAuthorized("not authorized: nope".to_string())
         );
         assert_eq!(
-            classify_helper_error(HelperIpcError::new(
-                "read failed: timeout".to_string()
-            )),
+            classify_helper_error(HelperIpcError::new("read failed: timeout".to_string())),
             EnableError::Ipc("read failed: timeout".to_string())
         );
     }

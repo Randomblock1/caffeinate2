@@ -256,15 +256,15 @@ impl EntirelyCoordinator {
             // cycle) re-enabled sleep. The IOKit set is idempotent and this
             // runs at most once per reconcile interval, so re-applying is cheap.
             if inner.verbose {
-                tracing::info!(
-                    "Reconcile: {holders} live holder(s); disabling system sleep."
-                );
+                tracing::info!("Reconcile: {holders} live holder(s); disabling system sleep.");
             }
             if let Err(code) = (inner.sleep_disabler)(true, inner.verbose) {
                 return Err(CoordinatorError::ReconcileSleepFailed { code });
             }
             inner.sleep_disabled.store(true, Ordering::SeqCst);
-        } else if inner.sleep_disabled.load(Ordering::SeqCst) || (treat_pruned_as_intent && had_entries) {
+        } else if inner.sleep_disabled.load(Ordering::SeqCst)
+            || (treat_pruned_as_intent && had_entries)
+        {
             // No holders, but either we previously disabled sleep ourselves, or
             // this is a (re)start and the lockfile still held holders we just
             // pruned to zero (a helper crash before its holders died). Re-enable

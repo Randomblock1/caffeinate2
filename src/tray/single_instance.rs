@@ -33,7 +33,10 @@ pub fn acquire_or_exit() {
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-            eprintln!("caffeinate2-tray: could not create {}: {error}", parent.display());
+        eprintln!(
+            "caffeinate2-tray: could not create {}: {error}",
+            parent.display()
+        );
         std::process::exit(1);
     }
 

@@ -151,7 +151,8 @@ fn install_newsyslog_conf() {
         return;
     }
     // newsyslog also expects a root-owned, non-world-writable config.
-    if let Err(e) = fs_util::atomic_write_with_mode(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes(), 0o644) {
+    if let Err(e) = fs_util::atomic_write_with_mode(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes(), 0o644)
+    {
         tracing::warn!("could not install newsyslog config: {e}");
     }
 }

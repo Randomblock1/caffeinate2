@@ -72,14 +72,24 @@ fn supplementary_groups_for(user: &str, gid: u32) -> Option<Vec<u32>> {
     let mut ngroups: libc::c_int = 64;
     let mut buf: Vec<libc::c_int> = vec![0; ngroups as usize];
     let mut rc = unsafe {
-        libc::getgrouplist(cname.as_ptr(), gid as libc::c_int, buf.as_mut_ptr(), &mut ngroups)
+        libc::getgrouplist(
+            cname.as_ptr(),
+            gid as libc::c_int,
+            buf.as_mut_ptr(),
+            &mut ngroups,
+        )
     };
     if rc < 0 {
         // ngroups now holds the required size.
         let needed = usize::try_from(ngroups).ok()?.max(1);
         buf = vec![0; needed];
         rc = unsafe {
-            libc::getgrouplist(cname.as_ptr(), gid as libc::c_int, buf.as_mut_ptr(), &mut ngroups)
+            libc::getgrouplist(
+                cname.as_ptr(),
+                gid as libc::c_int,
+                buf.as_mut_ptr(),
+                &mut ngroups,
+            )
         };
         if rc < 0 {
             return None;
@@ -453,9 +463,7 @@ fn main() {
         .is_some_and(|command| !command.is_empty())
         && (args.timeout.is_some() || args.waitfor.is_some())
     {
-        eprintln!(
-            "Warning: trailing command takes priority over --timeout and --waitfor"
-        );
+        eprintln!("Warning: trailing command takes priority over --timeout and --waitfor");
     }
 
     let mut sleep_modes = args.sleep_modes();
@@ -487,7 +495,9 @@ fn main() {
         }
     };
 
-    if parsed_timeout.as_ref().is_some_and(|d| *d <= jiff::SignedDuration::ZERO)
+    if parsed_timeout
+        .as_ref()
+        .is_some_and(|d| *d <= jiff::SignedDuration::ZERO)
         && args.waitfor.is_none()
         && args
             .command
@@ -578,18 +588,22 @@ fn main() {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use crate::cli::{Args, parse_args, wait::WaitMode};
-    use clap::Parser;
     use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
     use caffeinate2::util::duration_parser;
+    use clap::Parser;
 
     #[test]
     fn timeout_parses_raw_number_as_seconds() {
         assert_eq!(
-            duration_parser::parse_duration("3600").unwrap().num_seconds(),
+            duration_parser::parse_duration("3600")
+                .unwrap()
+                .num_seconds(),
             3600
         );
         assert_eq!(
-            duration_parser::parse_duration("45323").unwrap().num_seconds(),
+            duration_parser::parse_duration("45323")
+                .unwrap()
+                .num_seconds(),
             45323
         );
     }

@@ -26,10 +26,7 @@ pub fn init_helper_tracing() {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,caffeinate2=info"));
-    let oslog = tracing_oslog::OsLogger::new(
-        "com.randomblock1.caffeinate2.helper",
-        "default",
-    );
+    let oslog = tracing_oslog::OsLogger::new("com.randomblock1.caffeinate2.helper", "default");
     let stderr = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(std::io::stderr);

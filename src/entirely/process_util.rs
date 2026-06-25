@@ -14,10 +14,12 @@ const START_TIME_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 #[must_use]
 pub fn get_process_start_time(pid: i32) -> Option<ProcessStartTime> {
-    pidinfo::<BSDInfo>(pid, 0).ok().map(|info| ProcessStartTime {
-        seconds: info.pbi_start_tvsec,
-        microseconds: info.pbi_start_tvusec,
-    })
+    pidinfo::<BSDInfo>(pid, 0)
+        .ok()
+        .map(|info| ProcessStartTime {
+            seconds: info.pbi_start_tvsec,
+            microseconds: info.pbi_start_tvusec,
+        })
 }
 
 #[must_use]

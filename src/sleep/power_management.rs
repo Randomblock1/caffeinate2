@@ -119,9 +119,7 @@ fn release_assertion(assertion_id: u32, verbose: bool) {
             }
         }
         _ => {
-            tracing::warn!(
-                "Failed to release power management assertion with code: {status:X}"
-            );
+            tracing::warn!("Failed to release power management assertion with code: {status:X}");
         }
     }
 }

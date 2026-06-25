@@ -128,8 +128,8 @@ fn configure_rpc_timeouts(stream: &UnixStream) -> Result<(), HelperIpcError> {
 }
 
 fn write_request(stream: &mut UnixStream, request: &HelperRequest) -> Result<(), HelperIpcError> {
-    let encoded =
-        try_encode_request(request).map_err(|e| HelperIpcError::new(format!("encode failed: {e}")))?;
+    let encoded = try_encode_request(request)
+        .map_err(|e| HelperIpcError::new(format!("encode failed: {e}")))?;
     stream
         .write_all(encoded.as_bytes())
         .map_err(|e| HelperIpcError::new(format!("write failed: {e}")))?;
@@ -400,9 +400,9 @@ fn authorize_hold(stream: &UnixStream) -> Result<(), HelperIpcError> {
     if crate::entirely::authz::uid_may_hold(uid) {
         Ok(())
     } else {
-        Err(HelperIpcError::new(
-            crate::entirely::authz::denial_message(uid),
-        ))
+        Err(HelperIpcError::new(crate::entirely::authz::denial_message(
+            uid,
+        )))
     }
 }
 
@@ -413,7 +413,9 @@ fn peer_uid_for_audit(stream: &UnixStream) -> Option<u32> {
     use nix::sys::socket::getsockopt;
     use nix::sys::socket::sockopt::LocalPeerCred;
 
-    getsockopt(stream, LocalPeerCred).ok().map(|cred| cred.uid())
+    getsockopt(stream, LocalPeerCred)
+        .ok()
+        .map(|cred| cred.uid())
 }
 
 /// Lightweight always-on audit trail for the privileged Hold/Release ops. Goes
@@ -461,7 +463,9 @@ fn serve_connection_inner(
     mut stream: UnixStream,
     coordinator: &Arc<EntirelyCoordinator>,
     authorize_hold: &dyn Fn(&UnixStream) -> Result<(), HelperIpcError>,
-    peer_process_id: &dyn Fn(&UnixStream) -> Result<crate::entirely::lockfile::ProcessId, HelperIpcError>,
+    peer_process_id: &dyn Fn(
+        &UnixStream,
+    ) -> Result<crate::entirely::lockfile::ProcessId, HelperIpcError>,
 ) -> Result<(), HelperIpcError> {
     // Bound the whole RPC so a client that connects and sends nothing can't
     // pin a helper thread forever.
@@ -722,7 +726,10 @@ mod tests {
             let _ = left.write_all(&payload);
         });
 
-        assert_eq!(read_line(&mut right).unwrap_err().message(), "request too large");
+        assert_eq!(
+            read_line(&mut right).unwrap_err().message(),
+            "request too large"
+        );
         writer.join().unwrap();
     }
 

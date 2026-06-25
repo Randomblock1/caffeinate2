@@ -32,11 +32,7 @@ fn poll_stop_conditions(state: &mut AppState) -> bool {
     timeout | app_watch | upgrade
 }
 
-fn poll_pending_enable(
-    state: &mut AppState,
-    tray: &tray_icon::TrayIcon,
-    handles: &MenuHandles,
-) {
+fn poll_pending_enable(state: &mut AppState, tray: &tray_icon::TrayIcon, handles: &MenuHandles) {
     match state.poll_pending_enable() {
         PendingEnableOutcome::Idle | PendingEnableOutcome::Pending => {}
         PendingEnableOutcome::Started => {
@@ -208,9 +204,11 @@ pub fn run() -> Result<(), TrayError> {
         // would never update after the user stops typing.
         let mut pump_timeout = state.pump_timeout();
         if wait_window.as_ref().is_some_and(WaitWindow::search_pending) {
-            pump_timeout = Some(pump_timeout.map_or(wait_window::SEARCH_DEBOUNCE, |timeout| {
-                timeout.min(wait_window::SEARCH_DEBOUNCE)
-            }));
+            pump_timeout = Some(
+                pump_timeout.map_or(wait_window::SEARCH_DEBOUNCE, |timeout| {
+                    timeout.min(wait_window::SEARCH_DEBOUNCE)
+                }),
+            );
         }
         // Never block the pump indefinitely. The SIGINT/SIGTERM handler runs off
         // the main thread, where `wake_event_loop` can only nudge the run loop

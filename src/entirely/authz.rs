@@ -143,7 +143,8 @@ pub fn denial_message(uid: libc::uid_t) -> String {
     // Single-quote the resolved name so the suggested command is copy-paste-safe
     // even for accounts with unusual characters; a bare name could otherwise be
     // re-split or interpreted by the shell.
-    let who = user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| sh_single_quote(&user.name));
+    let who =
+        user_for_uid(uid).map_or_else(|| format!("uid {uid}"), |user| sh_single_quote(&user.name));
     format!(
         "not authorized: entirely mode requires an administrator account or membership in the \
          '{GRANT_GROUP}' group; an administrator can grant it with: \

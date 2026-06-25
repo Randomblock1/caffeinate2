@@ -10,7 +10,7 @@ use crate::tray::app_target::WatchTarget;
 use crate::tray::macos_apps;
 use libproc::bsd_info::BSDInfo;
 use libproc::proc_pid::{pidinfo, pidpath};
-use libproc::processes::{pids_by_type, ProcFilter};
+use libproc::processes::{ProcFilter, pids_by_type};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

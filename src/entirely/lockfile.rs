@@ -163,7 +163,8 @@ fn prune_stale_holders(
             if verbose {
                 tracing::debug!(
                     "Removing stale process {}:{} from lockfile",
-                    p.pid, p.start_time
+                    p.pid,
+                    p.start_time
                 );
             }
             false
