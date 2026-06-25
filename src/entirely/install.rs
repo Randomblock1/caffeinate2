@@ -564,12 +564,7 @@ mod tests {
     fn ensure_secure_install_dir_rejects_relative_path() {
         let result = ensure_secure_install_dir(Path::new("usr/local/libexec/caffeinate2"));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("absolute path")
-        );
+        assert!(result.unwrap_err().to_string().contains("absolute path"));
     }
 
     #[test]
