@@ -119,3 +119,4 @@ required-features = ["helper-bin"]
 
 [dev-dependencies]
 proptest = "1.11.0"
+stateright = "0.31.0"
