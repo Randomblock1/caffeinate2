@@ -210,26 +210,26 @@ mod tests {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
         assert_eq!(
-            result.num_seconds(),
+            result.as_secs(),
             DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND
         );
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), DAY + 2 * HOUR + 3 * MINUTE);
+        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE);
 
         let duration = "3min 17h 2s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
+        assert_eq!(result.as_secs(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
 
         let duration = "1 hour and 30 minutes";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
 
         // Connector commas (not between digits) are stripped, not rejected.
         let duration = "1 hour, 30 minutes";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
     }
 
     #[test]
@@ -247,38 +247,38 @@ mod tests {
 
     #[test]
     fn test_parse_duration_accepts_zero() {
-        assert_eq!(parse_duration("0").unwrap().num_seconds(), 0);
-        assert_eq!(parse_duration("0s").unwrap().num_seconds(), 0);
+        assert_eq!(parse_duration("0").unwrap().as_secs(), 0);
+        assert_eq!(parse_duration("0s").unwrap().as_secs(), 0);
     }
 
     #[test]
     fn test_parse_duration_valid_numbers() {
         let duration = "45323";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 45323);
+        assert_eq!(result.as_secs(), 45323);
 
         let duration = "60";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 60 * SECOND);
+        assert_eq!(result.as_secs(), 60 * SECOND);
     }
 
     #[test]
     fn test_parse_duration_edge_cases() {
         let duration = "1000000s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 1_000_000);
+        assert_eq!(result.as_secs(), 1_000_000);
 
         let duration = "  15m  ";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 15 * MINUTE);
+        assert_eq!(result.as_secs(), 15 * MINUTE);
 
         let duration = "1.5h";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
 
         let duration = "250ms";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_milliseconds(), 250);
+        assert_eq!(result.as_millis(), 250);
     }
 
     #[test]

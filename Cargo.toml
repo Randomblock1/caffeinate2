@@ -116,3 +116,6 @@ required-features = ["tray"]
 name = "caffeinate2-helper"
 path = "src/bin/caffeinate2-helper.rs"
 required-features = ["helper-bin"]
+
+[dev-dependencies]
+proptest = "1.11.0"

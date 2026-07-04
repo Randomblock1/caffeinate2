@@ -611,13 +611,13 @@ mod tests {
         assert_eq!(
             duration_parser::parse_duration("3600")
                 .unwrap()
-                .num_seconds(),
+                .as_secs(),
             3600
         );
         assert_eq!(
             duration_parser::parse_duration("45323")
                 .unwrap()
-                .num_seconds(),
+                .as_secs(),
             45323
         );
     }
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(
             duration_parser::parse_duration(args.timeout.as_ref().unwrap())
                 .unwrap()
-                .num_seconds(),
+                .as_secs(),
             5400
         );
     }
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(
             duration_parser::parse_duration(args.timeout.as_ref().unwrap())
                 .unwrap()
-                .num_seconds(),
+                .as_secs(),
             3600
         );
     }
