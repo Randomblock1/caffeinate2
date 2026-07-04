@@ -5,7 +5,6 @@ use crate::entirely::{
 };
 use crate::sleep::power_management;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,9 +30,13 @@ struct EntirelyCoordinatorInner {
     lock_file_path: PathBuf,
     sleep_disabler: SleepDisabler,
     process_checker: Arc<ProcessChecker>,
-    sleep_disabled: AtomicBool,
     /// Serializes hold/release/reconcile so concurrent connections can't
     /// interleave their lockfile reads with each other's sleep toggles.
+    ///
+    /// Whether caffeinate2 owns the current sleep disable is *not* cached here:
+    /// it lives durably in the lockfile (the ownership marker) and is read back
+    /// under the lock on every operation. A cached flag cannot survive a helper
+    /// restart, which is exactly when the intent must be recovered.
     ops: Mutex<()>,
 }
 
@@ -55,7 +58,6 @@ impl EntirelyCoordinator {
                 lock_file_path,
                 sleep_disabler,
                 process_checker,
-                sleep_disabled: AtomicBool::new(false),
                 ops: Mutex::new(()),
             }),
         }
@@ -121,8 +123,9 @@ impl EntirelyCoordinator {
     pub fn hold(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
         let _ops = self.lock_ops();
-        let should_disable = lockfile::update_lockfile(
-            true,
+        // `acquire` records ownership of the disable in the same write that adds
+        // the holder, before we actually toggle sleep below.
+        let should_disable = lockfile::acquire(
             inner.verbose,
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
@@ -134,16 +137,22 @@ impl EntirelyCoordinator {
                 tracing::info!("First holder detected. Disabling system sleep globally.");
             }
             if let Err(code) = (inner.sleep_disabler)(true, inner.verbose) {
-                let _ = lockfile::update_lockfile(
-                    false,
+                // The disable failed, so we don't actually own it: back out both
+                // the holder entry and the ownership marker.
+                let _ = lockfile::release(
                     inner.verbose,
                     &inner.lock_file_path,
                     inner.process_checker.as_ref(),
                     &process_id,
                 );
+                let _ = lockfile::set_owns_disable(
+                    inner.verbose,
+                    &inner.lock_file_path,
+                    inner.process_checker.as_ref(),
+                    false,
+                );
                 return Err(CoordinatorError::DisableSleepFailed { code });
             }
-            inner.sleep_disabled.store(true, Ordering::SeqCst);
         } else if inner.verbose {
             tracing::info!("Other holders running. Sleep already disabled.");
         }
@@ -158,8 +167,9 @@ impl EntirelyCoordinator {
     pub fn release(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
         let _ops = self.lock_ops();
-        let should_enable = lockfile::update_lockfile(
-            false,
+        // `release` removes the holder but leaves the ownership marker set; it
+        // reports whether no live holders remain while we still own the disable.
+        let should_enable = lockfile::release(
             inner.verbose,
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
@@ -171,10 +181,10 @@ impl EntirelyCoordinator {
                 tracing::info!("Last holder released. Re-enabling system sleep globally.");
             }
             if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
-                // Mirror hold(): restore the lockfile entry when re-enabling sleep
-                // fails so we don't drop the last holder while SleepDisabled stays on.
-                let _ = lockfile::update_lockfile(
-                    true,
+                // Restore the holder entry when re-enabling sleep fails so we
+                // don't drop the last holder while SleepDisabled stays on. The
+                // marker is still set, so the state remains recoverable.
+                let _ = lockfile::acquire(
                     inner.verbose,
                     &inner.lock_file_path,
                     inner.process_checker.as_ref(),
@@ -182,7 +192,15 @@ impl EntirelyCoordinator {
                 );
                 return Err(CoordinatorError::EnableSleepFailed { code });
             }
-            inner.sleep_disabled.store(false, Ordering::SeqCst);
+            // Only now that sleep is confirmed re-enabled do we clear ownership.
+            // A crash before this point leaves the marker set, so a reconcile
+            // re-enables (idempotently) instead of stranding sleep disabled.
+            lockfile::set_owns_disable(
+                inner.verbose,
+                &inner.lock_file_path,
+                inner.process_checker.as_ref(),
+                false,
+            )?;
         } else if inner.verbose {
             tracing::info!("Other holders still running. Keeping sleep disabled.");
         }
@@ -203,11 +221,11 @@ impl EntirelyCoordinator {
     /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile_startup(&self) -> Result<(), CoordinatorError> {
         let _ops = self.lock_ops();
-        // At (re)start the in-memory `sleep_disabled` flag is freshly false, so
-        // a helper that crashed while holding the disable would otherwise never
-        // re-enable sleep after its holders die. Treat "the lockfile still had
-        // holders that we just pruned to zero" as evidence caffeinate2 disabled
-        // sleep, and converge by re-enabling it.
+        // At (re)start there is no in-memory state, so intent must come from the
+        // lockfile: the durable ownership marker says whether caffeinate2 had
+        // disabled sleep. `treat_pruned_as_intent` additionally treats "the
+        // lockfile still had holders we just pruned to zero" as intent — a
+        // legacy fallback for lockfiles written before the marker existed.
         self.reconcile_locked(true).map(|_| ())
     }
 
@@ -218,8 +236,8 @@ impl EntirelyCoordinator {
     /// is idempotent), so an external `pmset enablesleep` (or a wake from a
     /// sleep cycle) made while holds are active is corrected on the next pass
     /// instead of being trusted away by cached state. It still never
-    /// force-enables on an empty lockfile, so it won't fight a manual
-    /// `pmset disablesleep` made outside of any holds.
+    /// force-enables on an empty lockfile *that caffeinate2 does not own*, so it
+    /// won't fight a manual `pmset disablesleep` made outside of any holds.
     ///
     /// # Errors
     ///
@@ -232,16 +250,19 @@ impl EntirelyCoordinator {
     /// Prune dead holders and converge the system sleep setting, returning the
     /// live holder count. The caller must already hold the ops lock.
     ///
-    /// `treat_pruned_as_intent` re-enables sleep when pruning empties a lockfile
-    /// that *had* holders (used only at startup, where the in-memory
-    /// `sleep_disabled` flag is not yet trustworthy). The periodic reconcile
-    /// passes `false` and relies on the cached flag, so it never force-enables
-    /// against a manual `pmset disablesleep`.
+    /// The durable ownership marker (`owns_disable`) is the source of truth for
+    /// whether caffeinate2 disabled sleep, so it survives a helper restart.
+    /// `treat_pruned_as_intent` additionally re-enables when pruning empties a
+    /// lockfile that *had* holders — a legacy fallback (used only at startup)
+    /// for lockfiles written before the marker existed. Neither path
+    /// force-enables an empty, unmarked lockfile, so a manual `pmset
+    /// disablesleep` is left untouched.
     fn reconcile_locked(&self, treat_pruned_as_intent: bool) -> Result<usize, CoordinatorError> {
         let inner = &self.inner;
         let lockfile::PruneOutcome {
             live: holders,
             had_entries,
+            owns_disable,
         } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
@@ -250,7 +271,7 @@ impl EntirelyCoordinator {
         if holders > 0 {
             // Live holders remain: always re-apply the disable. The
             // SleepDisabler abstraction is write-only, so we can't read the
-            // real SleepDisabled state to compare against; trusting the cached
+            // real SleepDisabled state to compare against; trusting cached
             // intent would silently leave holders ineffective if something
             // external (manual `pmset enablesleep`, another tool, a sleep/wake
             // cycle) re-enabled sleep. The IOKit set is idempotent and this
@@ -261,23 +282,37 @@ impl EntirelyCoordinator {
             if let Err(code) = (inner.sleep_disabler)(true, inner.verbose) {
                 return Err(CoordinatorError::ReconcileSleepFailed { code });
             }
-            inner.sleep_disabled.store(true, Ordering::SeqCst);
-        } else if inner.sleep_disabled.load(Ordering::SeqCst)
-            || (treat_pruned_as_intent && had_entries)
-        {
-            // No holders, but either we previously disabled sleep ourselves, or
-            // this is a (re)start and the lockfile still held holders we just
-            // pruned to zero (a helper crash before its holders died). Re-enable
-            // sleep to converge. An empty lockfile (no `had_entries`) never
-            // force-enables, so a manual `pmset disablesleep` made outside
-            // caffeinate2 is left untouched.
+            // Record ownership if it wasn't already (e.g. a legacy lockfile, or
+            // holders that appeared without us having toggled sleep yet).
+            if !owns_disable {
+                lockfile::set_owns_disable(
+                    inner.verbose,
+                    &inner.lock_file_path,
+                    inner.process_checker.as_ref(),
+                    true,
+                )?;
+            }
+        } else if owns_disable || (treat_pruned_as_intent && had_entries) {
+            // No live holders, but caffeinate2 owns the disable (durable marker),
+            // or — as a startup-only fallback — the lockfile held holders we just
+            // pruned to zero. Either way, re-enable sleep to converge. An empty,
+            // unmarked lockfile never reaches here, so a manual `pmset
+            // disablesleep` made outside caffeinate2 is left untouched.
             if inner.verbose {
                 tracing::info!("Reconcile: no live holders; re-enabling system sleep.");
             }
             if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
                 return Err(CoordinatorError::ReconcileSleepFailed { code });
             }
-            inner.sleep_disabled.store(false, Ordering::SeqCst);
+            // Clear ownership only after the re-enable succeeded.
+            if owns_disable {
+                lockfile::set_owns_disable(
+                    inner.verbose,
+                    &inner.lock_file_path,
+                    inner.process_checker.as_ref(),
+                    false,
+                )?;
+            }
         }
         Ok(holders)
     }
@@ -290,32 +325,43 @@ impl EntirelyCoordinator {
     pub fn status(&self) -> Result<EntirelyStatus, CoordinatorError> {
         let inner = &self.inner;
         let _ops = self.lock_ops();
-        let lockfile::PruneOutcome { live: holders, .. } = lockfile::prune_lockfile(
+        let lockfile::PruneOutcome {
+            live: holders,
+            owns_disable,
+            ..
+        } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
         )?;
-        if holders == 0 && inner.sleep_disabled.load(Ordering::SeqCst) {
-            // Pruning just dropped the last holder. Converge immediately by
-            // re-enabling sleep instead of waiting up to a full reconcile
-            // interval for the periodic reaper to notice.
+        let mut owns_disable = owns_disable;
+        if holders == 0 && owns_disable {
+            // Pruning just dropped the last holder while we owned the disable.
+            // Converge immediately by re-enabling sleep instead of waiting up to
+            // a full reconcile interval for the periodic reaper to notice.
             if inner.verbose {
                 tracing::info!("Status: last holder pruned; re-enabling system sleep.");
             }
             if let Err(code) = (inner.sleep_disabler)(false, inner.verbose) {
                 return Err(CoordinatorError::EnableSleepFailed { code });
             }
-            inner.sleep_disabled.store(false, Ordering::SeqCst);
+            lockfile::set_owns_disable(
+                inner.verbose,
+                &inner.lock_file_path,
+                inner.process_checker.as_ref(),
+                false,
+            )?;
+            owns_disable = false;
         }
         Ok(EntirelyStatus {
             holders,
-            // `sleep_disabled` reflects the coordinator's applied intent, not a
-            // fresh read of the kernel's SleepDisabled setting (the
-            // SleepDisabler abstraction is write-only). Because the periodic
-            // reconcile re-applies the disable while holders remain, this stays
-            // aligned with reality in the steady state; a transient external
-            // change can briefly make it stale until the next reconcile.
-            sleep_disabled: holders > 0 || inner.sleep_disabled.load(Ordering::SeqCst),
+            // Derived from the durable ownership marker, not a fresh read of the
+            // kernel's SleepDisabled setting (the SleepDisabler abstraction is
+            // write-only). Because the periodic reconcile re-applies the disable
+            // while holders remain, this stays aligned with reality in the steady
+            // state; a transient external change can briefly make it stale until
+            // the next reconcile.
+            sleep_disabled: holders > 0 || owns_disable,
         })
     }
 
@@ -541,6 +587,71 @@ mod tests {
         coordinator.reconcile_startup().unwrap();
 
         assert_eq!(*sleep_calls.lock().unwrap(), vec![true]);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn reconcile_startup_reenables_from_owned_marker_without_holders() {
+        // Models a crash between release()'s holder-removal write and its
+        // re-enable: the lockfile carries the ownership marker but zero holders,
+        // and sleep is still disabled. A restart must re-enable and clear the
+        // marker — driven purely by the marker, since `had_entries` is false.
+        let lock_path = temp_lock_path();
+        let _ = std::fs::remove_file(&lock_path);
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        // Create the marker-only state (no holders).
+        lockfile::set_owns_disable(false, &lock_path, process_checker.as_ref(), true).unwrap();
+
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            Ok(())
+        });
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile_startup().unwrap();
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
+
+        // The marker was cleared, so a second reconcile is a no-op.
+        coordinator.reconcile().unwrap();
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
+
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn periodic_reconcile_honors_owned_marker_without_holders() {
+        // The periodic reaper (treat_pruned_as_intent = false) must also honor
+        // the durable marker: no live holders while we own the disable =>
+        // re-enable. This is the path that self-heals the found bug even without
+        // the immediate re-enable in release().
+        let lock_path = temp_lock_path();
+        let _ = std::fs::remove_file(&lock_path);
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        lockfile::set_owns_disable(false, &lock_path, process_checker.as_ref(), true).unwrap();
+
+        let sleep_calls = Arc::new(Mutex::new(Vec::new()));
+        let sleep_calls_clone = sleep_calls.clone();
+        let sleep_disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+            sleep_calls_clone.lock().unwrap().push(state);
+            Ok(())
+        });
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile().unwrap();
+        assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
+
         let _ = std::fs::remove_file(&lock_path);
     }
 

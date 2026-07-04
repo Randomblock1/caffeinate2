@@ -16,6 +16,28 @@ pub(crate) const LOCK_FILE_MODE: u32 = 0o600;
 /// it unbounded into a String.
 const MAX_LOCKFILE_BYTES: u64 = 64 * 1024;
 
+/// Sentinel line recording that caffeinate2 owns the current sleep disable —
+/// i.e. it called `pmset disablesleep`/IOKit to disable sleep and has not yet
+/// re-enabled it. It is written durably (under the same lock as the holder set)
+/// so that intent survives a helper crash/restart even when the holder list has
+/// been pruned to empty. Without it, an empty lockfile is ambiguous: it could
+/// mean "we never disabled sleep" or "we disabled sleep but the last holder's
+/// entry was already reaped", and treating the latter as the former strands the
+/// machine with sleep disabled and no holders.
+///
+/// It deliberately does not parse as a `ProcessId` (which requires a positive
+/// `pid:seconds:microseconds` triple), so older code that only understood
+/// holder lines simply ignored it.
+const DISABLE_MARKER: &str = "!disabled";
+
+/// The full parsed contents of the lockfile: the live holder set plus whether
+/// caffeinate2 owns the current sleep disable (see [`DISABLE_MARKER`]).
+#[derive(Debug, Default)]
+struct LockfileState {
+    holders: HashSet<ProcessId>,
+    owns_disable: bool,
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ProcessStartTime {
     pub seconds: u64,
@@ -114,7 +136,7 @@ fn open_validated_lockfile(path: &Path) -> Result<Flock<File>, std::io::Error> {
     Ok(file)
 }
 
-fn read_holder_set(file: &mut Flock<File>) -> Result<HashSet<ProcessId>, std::io::Error> {
+fn read_state(file: &mut Flock<File>) -> Result<LockfileState, std::io::Error> {
     let size = file.seek(SeekFrom::End(0))?;
     if size > MAX_LOCKFILE_BYTES {
         return Err(std::io::Error::other(format!(
@@ -124,18 +146,28 @@ fn read_holder_set(file: &mut Flock<File>) -> Result<HashSet<ProcessId>, std::io
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    Ok(content
-        .lines()
-        .filter_map(|line| line.parse::<ProcessId>().ok())
-        .collect())
+    let mut state = LockfileState::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line == DISABLE_MARKER {
+            state.owns_disable = true;
+        } else if let Ok(pid) = line.parse::<ProcessId>() {
+            state.holders.insert(pid);
+        }
+    }
+    Ok(state)
 }
 
-fn write_holder_set(
-    file: &mut Flock<File>,
-    pids: &HashSet<ProcessId>,
-) -> Result<(), std::io::Error> {
+fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std::io::Error> {
     let mut content = String::new();
-    for p in pids {
+    // Write the ownership marker first so that even a torn write that persists
+    // only the leading bytes preserves the "we disabled sleep" fact — the
+    // conservative direction (an extra reconcile re-enable, never a missed one).
+    if state.owns_disable {
+        content.push_str(DISABLE_MARKER);
+        content.push('\n');
+    }
+    for p in &state.holders {
         content.push_str(&format!("{p}\n"));
     }
     // Write the full snapshot before truncating so a crash mid-update is less
@@ -177,41 +209,88 @@ fn mutate_lockfile<R>(
     path: &Path,
     process_checker: &ProcessChecker,
     pin: Option<&ProcessId>,
-    mutate: impl FnOnce(&mut HashSet<ProcessId>) -> Result<R, std::io::Error>,
+    mutate: impl FnOnce(&mut LockfileState) -> Result<R, std::io::Error>,
 ) -> Result<R, std::io::Error> {
     let mut file = open_validated_lockfile(path)?;
-    let mut pids = read_holder_set(&mut file)?;
-    prune_stale_holders(&mut pids, verbose, process_checker, pin);
-    let result = mutate(&mut pids)?;
-    write_holder_set(&mut file, &pids)?;
+    let mut state = read_state(&mut file)?;
+    prune_stale_holders(&mut state.holders, verbose, process_checker, pin);
+    let result = mutate(&mut state)?;
+    write_state(&mut file, &state)?;
     Ok(result)
 }
 
-/// Returns true when the global sleep state should change.
-pub(crate) fn update_lockfile(
-    add: bool,
+/// Register `current_proc` as a holder. Returns true when this is the first
+/// holder and the caller must therefore disable sleep.
+///
+/// When it is the first holder, the ownership marker is set in the *same* write
+/// that adds the holder — before the caller toggles sleep — so a crash between
+/// this write and the actual disable still leaves durable evidence to reconcile
+/// against (the safe direction).
+pub(crate) fn acquire(
     verbose: bool,
     path: &Path,
     process_checker: &ProcessChecker,
     current_proc: &ProcessId,
 ) -> Result<bool, std::io::Error> {
-    mutate_lockfile(verbose, path, process_checker, Some(current_proc), |pids| {
-        let active_count_before = pids.len();
-        if add {
-            pids.insert(*current_proc);
-            // Toggle sleep off only when this is the first holder.
-            Ok(active_count_before == 0)
-        } else {
-            // Only signal "re-enable sleep" when we actually removed a live
-            // holder and none remain. A Release from a process that was never a
-            // holder (or a double-release) must not flip the global setting:
-            // otherwise an unauthenticated Release against an empty lockfile
-            // would re-enable sleep, clobbering an unrelated manual
-            // `pmset disablesleep`.
-            let removed = pids.remove(current_proc);
-            let active_count_after = pids.len();
-            Ok(removed && active_count_after == 0)
-        }
+    mutate_lockfile(
+        verbose,
+        path,
+        process_checker,
+        Some(current_proc),
+        |state| {
+            let first_holder = state.holders.is_empty();
+            state.holders.insert(*current_proc);
+            if first_holder {
+                state.owns_disable = true;
+            }
+            Ok(first_holder)
+        },
+    )
+}
+
+/// Remove `current_proc` from the holder set. Returns true when no live holders
+/// remain *and* caffeinate2 owns the disable, i.e. the caller must re-enable
+/// sleep.
+///
+/// The ownership marker is intentionally left set here: it is cleared only once
+/// the caller confirms sleep was actually re-enabled (via
+/// [`set_owns_disable`]), so a crash between this write and the re-enable is
+/// recoverable. Signalling on "no live holders remain && we own the disable" —
+/// rather than only when this specific caller removed the last live holder —
+/// means a stale entry pruned to empty by an unrelated Release still triggers
+/// the re-enable instead of stranding sleep disabled. An empty lockfile with no
+/// marker (e.g. a manual `pmset disablesleep`) never signals a re-enable.
+pub(crate) fn release(
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+    current_proc: &ProcessId,
+) -> Result<bool, std::io::Error> {
+    mutate_lockfile(
+        verbose,
+        path,
+        process_checker,
+        Some(current_proc),
+        |state| {
+            state.holders.remove(current_proc);
+            Ok(state.holders.is_empty() && state.owns_disable)
+        },
+    )
+}
+
+/// Set or clear the ownership marker without otherwise changing the holder set
+/// (dead holders are still pruned, as with every locked mutation). Used to clear
+/// the marker after a confirmed re-enable, and to record ownership when a
+/// reconcile re-applies the disable.
+pub(crate) fn set_owns_disable(
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+    owns: bool,
+) -> Result<(), std::io::Error> {
+    mutate_lockfile(verbose, path, process_checker, None, |state| {
+        state.owns_disable = owns;
+        Ok(())
     })
 }
 
@@ -221,14 +300,18 @@ pub(crate) struct PruneOutcome {
     /// Live holders remaining after pruning dead/malformed entries.
     pub live: usize,
     /// Whether the lockfile contained any parseable holders before pruning.
-    /// Distinguishes "we just pruned dead holders to zero" (caffeinate2 was
-    /// managing sleep) from "the lockfile was already empty" (no evidence we
-    /// disabled sleep).
+    /// A legacy fallback (for lockfiles written before the ownership marker
+    /// existed) distinguishing "we just pruned dead holders to zero" from "the
+    /// lockfile was already empty". The `owns_disable` marker supersedes it for
+    /// any lockfile this version wrote.
     pub had_entries: bool,
+    /// Whether caffeinate2 owns the current sleep disable (the durable marker).
+    pub owns_disable: bool,
 }
 
 /// Prune stale lockfile entries under an exclusive lock and report the live
-/// holder count plus whether the file had any holders beforehand.
+/// holder count, whether the file had any holders beforehand, and whether
+/// caffeinate2 owns the current sleep disable.
 #[cfg(target_os = "macos")]
 pub(crate) fn prune_lockfile(
     verbose: bool,
@@ -236,12 +319,17 @@ pub(crate) fn prune_lockfile(
     process_checker: &ProcessChecker,
 ) -> Result<PruneOutcome, std::io::Error> {
     let mut file = open_validated_lockfile(path)?;
-    let mut pids = read_holder_set(&mut file)?;
-    let had_entries = !pids.is_empty();
-    prune_stale_holders(&mut pids, verbose, process_checker, None);
-    let live = pids.len();
-    write_holder_set(&mut file, &pids)?;
-    Ok(PruneOutcome { live, had_entries })
+    let mut state = read_state(&mut file)?;
+    let had_entries = !state.holders.is_empty();
+    prune_stale_holders(&mut state.holders, verbose, process_checker, None);
+    let live = state.holders.len();
+    let owns_disable = state.owns_disable;
+    write_state(&mut file, &state)?;
+    Ok(PruneOutcome {
+        live,
+        had_entries,
+        owns_disable,
+    })
 }
 
 #[cfg(test)]
@@ -278,10 +366,18 @@ mod tests {
         let mut entries = std::fs::read_to_string(path)
             .unwrap()
             .lines()
-            .map(|line| line.parse::<ProcessId>().unwrap())
+            // Skip the ownership marker (and any other non-holder line).
+            .filter_map(|line| line.trim().parse::<ProcessId>().ok())
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.pid);
         entries
+    }
+
+    fn owns_disable(path: &Path) -> bool {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .any(|line| line.trim() == DISABLE_MARKER)
     }
 
     #[test]
@@ -320,11 +416,12 @@ mod tests {
         let current_proc = proc(100, 123);
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle =
-            update_lockfile(true, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(should_toggle);
         assert_eq!(read_entries(&lock_path), vec![current_proc]);
+        // Acquiring the first holder records ownership of the disable.
+        assert!(owns_disable(&lock_path));
         let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, LOCK_FILE_MODE);
 
@@ -344,14 +441,12 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle =
-            update_lockfile(true, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(!should_toggle);
         assert_eq!(read_entries(&lock_path), vec![current_proc, other_proc]);
 
-        let should_toggle =
-            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(!should_toggle);
         assert_eq!(read_entries(&lock_path), vec![other_proc]);
@@ -377,8 +472,7 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle =
-            update_lockfile(true, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(!should_toggle);
         assert_eq!(read_entries(&lock_path), vec![current_proc, live_proc]);
@@ -391,16 +485,20 @@ mod tests {
         let lock_path = temp_lock_path();
         let current_proc = proc(100, 123);
         {
+            // A real lockfile with a live holder also carries the ownership
+            // marker (written when that holder was acquired).
             let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{DISABLE_MARKER}").unwrap();
             writeln!(file, "{current_proc}").unwrap();
         }
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle =
-            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(should_toggle);
         assert!(read_entries(&lock_path).is_empty());
+        // The marker is left set until the caller confirms the re-enable.
+        assert!(owns_disable(&lock_path));
 
         std::fs::remove_file(&lock_path).unwrap();
     }
@@ -414,8 +512,7 @@ mod tests {
         let current_proc = proc(100, 123);
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle =
-            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(!should_toggle);
         let _ = std::fs::remove_file(&lock_path);
@@ -435,8 +532,7 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle =
-            update_lockfile(false, false, &lock_path, &process_checker, &current_proc).unwrap();
+        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
         assert!(!should_toggle);
         assert_eq!(read_entries(&lock_path), vec![other_proc]);
@@ -453,7 +549,7 @@ mod tests {
         std::fs::write(&lock_path, line.repeat(repeats)).unwrap();
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| true;
 
-        let result = update_lockfile(true, false, &lock_path, &process_checker, &current_proc);
+        let result = acquire(false, &lock_path, &process_checker, &current_proc);
 
         assert!(result.is_err());
         let message = result.unwrap_err().to_string();
@@ -471,12 +567,77 @@ mod tests {
         let current_proc = proc(100, 123);
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let result = update_lockfile(true, false, &symlink_path, &process_checker, &current_proc);
+        let result = acquire(false, &symlink_path, &process_checker, &current_proc);
 
         assert!(result.is_err());
         assert!(read_entries(&target_path).is_empty());
 
         std::fs::remove_file(&target_path).unwrap();
         std::fs::remove_file(&symlink_path).unwrap();
+    }
+
+    #[test]
+    fn release_pruning_last_dead_holder_to_empty_toggles_when_owned() {
+        // A holder was SIGKILLed (now dead) while we owned the disable, leaving a
+        // stale entry. A Release from an unrelated process prunes that entry to
+        // empty; because the marker says we own the disable, it must still signal
+        // a re-enable rather than stranding sleep disabled.
+        let lock_path = temp_lock_path();
+        let dead_holder = proc(200, 456);
+        let unrelated = proc(100, 123);
+        {
+            let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{DISABLE_MARKER}").unwrap();
+            writeln!(file, "{dead_holder}").unwrap();
+        }
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        let should_toggle = release(false, &lock_path, &process_checker, &unrelated).unwrap();
+
+        assert!(should_toggle);
+        assert!(read_entries(&lock_path).is_empty());
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn release_pruning_to_empty_without_marker_does_not_toggle() {
+        // Same prune-to-empty, but no ownership marker: this models a manual
+        // `pmset disablesleep` (or a legacy/foreign entry) that caffeinate2 does
+        // not own, so it must not re-enable sleep.
+        let lock_path = temp_lock_path();
+        let dead_holder = proc(200, 456);
+        let unrelated = proc(100, 123);
+        {
+            let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{dead_holder}").unwrap();
+        }
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        let should_toggle = release(false, &lock_path, &process_checker, &unrelated).unwrap();
+
+        assert!(!should_toggle);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn set_owns_disable_toggles_marker_without_touching_live_holders() {
+        let lock_path = temp_lock_path();
+        let holder = proc(100, 123);
+        {
+            let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{DISABLE_MARKER}").unwrap();
+            writeln!(file, "{holder}").unwrap();
+        }
+        let process_checker =
+            |pid: i32, start_time: ProcessStartTime| pid == 100 && start_time.seconds == 123;
+
+        set_owns_disable(false, &lock_path, &process_checker, false).unwrap();
+
+        assert!(!owns_disable(&lock_path));
+        assert_eq!(read_entries(&lock_path), vec![holder]);
+
+        std::fs::remove_file(&lock_path).unwrap();
     }
 }
