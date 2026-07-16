@@ -6,6 +6,7 @@ use crate::entirely::process_util;
 use crate::sleep::power_management;
 use crate::util::fs_util;
 use libc::{S_IFDIR, S_IFMT};
+use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -29,10 +30,10 @@ pub const TRAY_LAUNCH_AGENT_LABEL: &str = "com.randomblock1.caffeinate2-tray";
 
 const NEWSYSLOG_CONF_PATH: &str = "/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf";
 
-const HELPER_PLIST_TEMPLATE: &str =
-    include_str!("../../resources/com.randomblock1.caffeinate2.helper.plist");
-const TRAY_PLIST_TEMPLATE: &str =
-    include_str!("../../resources/com.randomblock1.caffeinate2-tray.plist");
+// Must match the path in resources/newsyslog/…helper.conf so newsyslog rotates
+// the file the daemon writes.
+const HELPER_LOG_PATH: &str = "/var/log/caffeinate2-helper.log";
+
 const NEWSYSLOG_CONF_TEMPLATE: &str =
     include_str!("../../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
 
@@ -78,31 +79,65 @@ pub fn resolve_helper_source() -> Result<PathBuf, InstallError> {
     resolve_sibling_binary("caffeinate2-helper", HELPER_BINARY_HINT)
 }
 
-/// Escape the five XML metacharacters so a path containing `&`, `<`, `>`, or
-/// quotes can't break (or inject into) the surrounding plist `<string>`.
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+// launchd LaunchDaemon definition for the root helper. serde serializes the
+// fields to a plist `<dict>` in declaration order, so the field order below is
+// the on-disk key order. Renames map each field to the exact launchd key.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct HelperLaunchDaemon {
+    label: String,
+    program_arguments: Vec<String>,
+    run_at_load: bool,
+    keep_alive: bool,
+    /// `Interactive` keeps the daemon responsive to RPCs and exempt from the
+    /// aggressive throttling applied to background ProcessTypes; it still runs
+    /// as root with full privileges, so this does not weaken helper operation.
+    process_type: String,
+    standard_error_path: String,
+    standard_out_path: String,
+}
+
+// launchd LaunchAgent definition for the per-user tray. Field order is the
+// on-disk key order, as above.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct TrayLaunchAgent {
+    label: String,
+    program_arguments: Vec<String>,
+    run_at_load: bool,
+    keep_alive: bool,
+}
+
+// The plist XML writer escapes `<string>` values, so a path containing `&`,
+// `<`, `>`, or quotes can't break out of or inject into the surrounding
+// element. Serialization into a `Vec<u8>` is infallible.
+fn to_plist_xml<T: Serialize>(value: &T) -> String {
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, value).expect("plist serialization into a Vec cannot fail");
+    String::from_utf8(buf).expect("plist XML writer emits UTF-8")
 }
 
 #[must_use]
 pub fn helper_plist_content(helper_path: &Path) -> String {
-    HELPER_PLIST_TEMPLATE.replace(
-        "__HELPER_PATH__",
-        &xml_escape(&helper_path.display().to_string()),
-    )
+    to_plist_xml(&HelperLaunchDaemon {
+        label: HELPER_PLIST_LABEL.to_string(),
+        program_arguments: vec![helper_path.display().to_string()],
+        run_at_load: true,
+        keep_alive: true,
+        process_type: "Interactive".to_string(),
+        standard_error_path: HELPER_LOG_PATH.to_string(),
+        standard_out_path: HELPER_LOG_PATH.to_string(),
+    })
 }
 
 #[must_use]
 pub fn tray_launch_agent_plist(tray_path: &Path) -> String {
-    TRAY_PLIST_TEMPLATE.replace(
-        "__TRAY_PATH__",
-        &xml_escape(&tray_path.display().to_string()),
-    )
+    to_plist_xml(&TrayLaunchAgent {
+        label: TRAY_LAUNCH_AGENT_LABEL.to_string(),
+        program_arguments: vec![tray_path.display().to_string()],
+        run_at_load: true,
+        keep_alive: false,
+    })
 }
 
 ///
@@ -546,10 +581,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn helper_plist_substitutes_path() {
+    fn helper_plist_contains_path_and_keys() {
         let content = helper_plist_content(Path::new(HELPER_INSTALL_PATH));
         assert!(content.contains(HELPER_INSTALL_PATH));
-        assert!(!content.contains("__HELPER_PATH__"));
+        assert!(content.contains("<key>Label</key>"));
+        assert!(content.contains(HELPER_PLIST_LABEL));
+        assert!(content.contains("<key>ProcessType</key>"));
+        assert!(content.contains("<string>Interactive</string>"));
+        assert!(content.contains(HELPER_LOG_PATH));
+    }
+
+    #[test]
+    fn helper_plist_escapes_xml_metacharacters_in_path() {
+        // Injection via the helper path must be structurally impossible: a
+        // path with `&` and `<` is escaped, never emitted raw, and round-trips.
+        let nasty = "/Users/a & b/<caffeinate2-helper>";
+        let content = helper_plist_content(Path::new(nasty));
+        assert!(content.contains("&amp;"));
+        assert!(content.contains("&lt;"));
+        assert!(!content.contains("a & b"));
+        let parsed: plist::Value =
+            plist::from_bytes(content.as_bytes()).expect("output is valid plist XML");
+        let args = parsed
+            .as_dictionary()
+            .and_then(|d| d.get("ProgramArguments"))
+            .and_then(plist::Value::as_array)
+            .expect("ProgramArguments array");
+        assert_eq!(args[0].as_string(), Some(nasty));
     }
 
     #[test]
@@ -573,11 +631,12 @@ mod tests {
     }
 
     #[test]
-    fn tray_plist_substitutes_path() {
+    fn tray_plist_contains_path_and_label() {
         let content = tray_launch_agent_plist(Path::new("/Users/test/.cargo/bin/caffeinate2-tray"));
         assert!(content.contains("/Users/test/.cargo/bin/caffeinate2-tray"));
         assert!(content.contains(TRAY_LAUNCH_AGENT_LABEL));
-        assert!(!content.contains("__TRAY_PATH__"));
+        assert!(content.contains("<key>KeepAlive</key>"));
+        assert!(content.contains("<false/>"));
     }
 
     #[test]
