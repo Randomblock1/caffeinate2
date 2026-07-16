@@ -208,6 +208,11 @@ pub struct AppState {
     icon_on_rgba: Option<(Vec<u8>, u32, u32)>,
     icon_off_rgba: Option<(Vec<u8>, u32, u32)>,
     last_tooltip: Option<String>,
+    /// Last menu bar title text pushed to the tray (the live countdown while a
+    /// timed session runs, `None` when the icon should stand alone). Mirrors
+    /// `last_tooltip`: cached so a per-second refresh only calls `set_title`
+    /// when the displayed value actually changes.
+    last_title: Option<String>,
     start_at_login: bool,
     /// When the external trigger assertion first went away while an upgrade
     /// session was active, used to debounce against agents briefly dropping it.
@@ -238,6 +243,7 @@ impl AppState {
             icon_on_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_ON).ok(),
             icon_off_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_OFF).ok(),
             last_tooltip: None,
+            last_title: None,
             start_at_login: install::tray_launch_agent_installed(),
             upgrade_clear_since: None,
             upgrade_failed: false,
@@ -304,7 +310,9 @@ impl AppState {
         if self.pending_enable.is_some() {
             return Some(Duration::from_millis(200));
         }
-        // A timed session needs ~1s ticks to update the countdown tooltip.
+        // A timed session needs ~1s ticks to update the countdown tooltip and
+        // the menu bar title (which flips only once a minute, so sub-second
+        // wake phase doesn't matter).
         let countdown = self.session.as_ref().and_then(|s| s.until).map(|until| {
             until
                 .saturating_duration_since(Instant::now())
@@ -380,7 +388,43 @@ impl AppState {
         self.update_tooltip(tray);
     }
 
+    /// Whole seconds left on the active timed session, or `None` when there is
+    /// no session or the session carries no time limit (upgrade sessions and
+    /// untimed manual holds). Recomputed from `until` on demand — there is no
+    /// stored countdown to drift.
+    fn remaining_secs(&self) -> Option<u64> {
+        self.session.as_ref().and_then(|session| {
+            session
+                .until
+                .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+        })
+    }
+
+    /// The menu bar title shown next to the icon: the minutes remaining while a
+    /// timed session runs (see `format_countdown_minutes` for why not seconds),
+    /// `None` otherwise (idle, enabling, or a session with no time limit) so
+    /// the icon stands alone. Zero is treated as "no title": the session is
+    /// torn down by `check_timeout` on the same tick it hits 0, so there is
+    /// nothing left to count down to.
+    fn menu_bar_title(&self) -> Option<String> {
+        self.remaining_secs()
+            .filter(|&secs| secs > 0)
+            .map(crate::util::duration_parser::format_countdown_minutes)
+    }
+
     pub fn update_tooltip(&mut self, tray: &TrayIcon) {
+        // Keep the menu bar countdown text in step with the tooltip; this runs
+        // on the same ~1s cadence while a timed session is active.
+        let title = self.menu_bar_title();
+        if self.last_title != title {
+            self.last_title = title.clone();
+            // Clear with `Some("")`, never `None`: tray-icon's macOS backend
+            // silently ignores `set_title(None)` (its `set_title_inner` only
+            // acts on `Some`), which would leave the final countdown value
+            // stuck in the menu bar after the session ends.
+            tray.set_title(Some(title.as_deref().unwrap_or("")));
+        }
+
         let tooltip = if self.pending_enable.is_some() {
             if self.pending_mode() == Some(SleepMode::Entirely) {
                 "caffeinate2 (enabling Entirely mode…)".to_string()
@@ -388,11 +432,7 @@ impl AppState {
                 "caffeinate2 (enabling…)".to_string()
             }
         } else if self.is_on() {
-            let remaining = self.session.as_ref().and_then(|session| {
-                session
-                    .until
-                    .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
-            });
+            let remaining = self.remaining_secs();
             let waiting = self.waiting_for_app_launch();
             let upgrading = self
                 .session
@@ -416,6 +456,7 @@ impl AppState {
 
     pub fn invalidate_tooltip(&mut self) {
         self.last_tooltip = None;
+        self.last_title = None;
     }
 
     /// Show an error in the tooltip (e.g. a denied entirely-mode hold).

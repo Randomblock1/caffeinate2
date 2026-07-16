@@ -157,6 +157,32 @@ pub fn format_remaining_secs(secs: u64) -> String {
     }
 }
 
+/// Format a remaining-seconds count for the menu bar title at minute
+/// granularity: `29m`, `1h 29m`, `8h`. Rounded *up*, so a fresh 30-minute
+/// limit reads `30m` (not `29m`), and the final minute reads `1m` (never a
+/// confusing `0m`) until expiry.
+///
+/// Minute granularity is deliberate — a per-second clock was tried and
+/// abandoned: WindowServer composites background status items erratically
+/// enough (macOS 26) that seconds visibly stutter even when every stage the
+/// app controls (title set, view draw, CA commit) is provably metronomic.
+#[must_use]
+pub fn format_countdown_minutes(secs: u64) -> String {
+    let total_minutes = secs.div_ceil(60);
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+
+    if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +229,22 @@ mod tests {
         assert_eq!(format_remaining_secs(45), "45s remaining");
         assert_eq!(format_remaining_secs(90), "1m remaining");
         assert_eq!(format_remaining_secs(3661), "1h 1m remaining");
+    }
+
+    #[test]
+    fn format_countdown_minutes_display() {
+        // Rounds up: the final minute shows "1m", never "0m".
+        assert_eq!(format_countdown_minutes(1), "1m");
+        assert_eq!(format_countdown_minutes(45), "1m");
+        assert_eq!(format_countdown_minutes(60), "1m");
+        assert_eq!(format_countdown_minutes(61), "2m");
+        // A fresh 30-minute limit reads "30m" for the whole first minute.
+        assert_eq!(format_countdown_minutes(1799), "30m");
+        assert_eq!(format_countdown_minutes(1800), "30m");
+        assert_eq!(format_countdown_minutes(3600), "1h");
+        assert_eq!(format_countdown_minutes(3601), "1h 1m");
+        assert_eq!(format_countdown_minutes(5400), "1h 30m");
+        assert_eq!(format_countdown_minutes(8 * 3600), "8h");
     }
 
     #[test]
