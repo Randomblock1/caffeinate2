@@ -1,6 +1,8 @@
 use crate::entirely::coordinator;
 use crate::entirely::error::InstallError;
 use crate::entirely::helper_ipc;
+use crate::entirely::lockfile;
+use crate::entirely::process_util;
 use crate::sleep::power_management;
 use crate::util::fs_util;
 use libc::{S_IFDIR, S_IFMT};
@@ -16,6 +18,10 @@ use std::process::Command;
 // redirect the path via a writable ancestor.
 pub const HELPER_INSTALL_PATH: &str =
     "/Library/PrivilegedHelperTools/com.randomblock1.caffeinate2.helper";
+// Pre-migration versions installed the root-owned helper here; nothing writes
+// this path anymore, so install/uninstall clean it up rather than orphaning a
+// stale privileged binary.
+const LEGACY_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/caffeinate2/caffeinate2-helper";
 pub const HELPER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.randomblock1.caffeinate2.helper.plist";
 pub const HELPER_PLIST_LABEL: &str = "com.randomblock1.caffeinate2.helper";
@@ -148,6 +154,7 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("could not remove old helper binary: {e}"),
     }
+    remove_legacy_helper();
     // Copy with O_NOFOLLOW|O_EXCL and pin root:wheel 0o755 on the open fd, so a
     // symlink planted at the destination cannot redirect the privileged write
     // and the installed binary is never momentarily owned or writable by a
@@ -320,9 +327,20 @@ fn install_newsyslog_conf() {
     }
 }
 
+/// Best-effort removal of the pre-migration helper binary (and the caffeinate2
+/// directory that existed only to hold it). Errors are ignored: the path may be
+/// absent, or the directory non-empty because something else was placed there.
+fn remove_legacy_helper() {
+    let legacy = Path::new(LEGACY_HELPER_INSTALL_PATH);
+    let _ = fs::remove_file(legacy);
+    if let Some(parent) = legacy.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
 fn ensure_grant_group() {
     let group = crate::entirely::authz::GRANT_GROUP;
-    let exists = Command::new("dseditgroup")
+    let exists = Command::new("/usr/sbin/dseditgroup")
         .args(["-o", "read", group])
         .output()
         .map(|output| output.status.success())
@@ -330,7 +348,7 @@ fn ensure_grant_group() {
     if exists {
         return;
     }
-    match Command::new("dseditgroup")
+    match Command::new("/usr/sbin/dseditgroup")
         .args(["-o", "create", group])
         .output()
     {
@@ -357,27 +375,42 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
     let _ = fs::remove_file(NEWSYSLOG_CONF_PATH);
     let _ = fs::remove_file(HELPER_INSTALL_PATH);
     let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
+    remove_legacy_helper();
 
-    // The lockfile is caffeinate2's marker that it is (or was) managing the
-    // global SleepDisabled setting. Once the helper is removed, nobody can send
-    // Release, so if that marker is present we re-enable sleep to avoid leaving
-    // SleepDisabled stuck on. If there is no lockfile we have no evidence that
-    // caffeinate2 disabled sleep, so we leave the setting untouched rather than
-    // clobber an unrelated manual `pmset disablesleep`.
-    let caffeinate2_managed_sleep = Path::new(coordinator::HELPER_LOCK_PATH).exists();
-    let _ = fs::remove_file(coordinator::HELPER_LOCK_PATH);
+    // Once the helper is removed nobody can send Release, so re-enable sleep if
+    // caffeinate2 is (or was) managing the SleepDisabled setting. That evidence
+    // is the lockfile's *contents* — the durable ownership marker or live
+    // holders still recorded — never its mere existence: the helper's startup
+    // reconcile creates the file on every boot, so an existence check is always
+    // true on a helper machine and would clobber an unrelated manual
+    // `pmset disablesleep`.
+    let lock_path = Path::new(coordinator::HELPER_LOCK_PATH);
+    let caffeinate2_managed_sleep = lock_path.exists()
+        && match lockfile::prune_lockfile(false, lock_path, &process_util::default_process_checker)
+        {
+            Ok(outcome) => outcome.owns_disable || outcome.live > 0,
+            Err(e) => {
+                // Unreadable/invalid lockfile: no evidence caffeinate2 disabled
+                // sleep, so leave the setting untouched.
+                tracing::warn!("could not read helper lockfile during uninstall: {e}");
+                false
+            }
+        };
     if caffeinate2_managed_sleep {
         // Re-enabling sleep is the one uninstall step that must not fail
         // silently: reporting a successful uninstall while SleepDisabled stays
         // on would leave the machine permanently unable to sleep with no helper
         // left to fix it. Propagate the failure so the caller (and exit code)
-        // reflect it.
+        // reflect it — and attempt it BEFORE removing the lockfile, so a failed
+        // re-enable leaves the evidence in place and a retried
+        // --uninstall-helper attempts it again instead of reporting success.
         power_management::set_sleep_disabled(false, false).map_err(|code| {
             InstallError::msg(format!(
                 "uninstalled helper but failed to re-enable system sleep (IOKit error {code:#x}); run `sudo pmset -a disablesleep 0` to restore it"
             ))
         })?;
     }
+    let _ = fs::remove_file(coordinator::HELPER_LOCK_PATH);
     Ok(())
 }
 
@@ -398,7 +431,7 @@ pub fn install_helper_privileged() -> Result<(), InstallError> {
     let script = format!(
         "do shell script \"{cli_escaped} --install-helper-internal\" with administrator privileges"
     );
-    let status = Command::new("osascript")
+    let status = Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(script)
         .status()
@@ -489,7 +522,11 @@ fn launchctl_bootout_system(label: &str) -> Result<(), InstallError> {
 }
 
 fn run_launchctl(args: &[&str]) -> Result<(), InstallError> {
-    let output = Command::new("launchctl")
+    // External tools are invoked by absolute path throughout this file: this
+    // code runs privileged and macOS sudoers sets no secure_path, so resolving
+    // via the inherited PATH would execute whatever the invoking user put
+    // first on it.
+    let output = Command::new("/bin/launchctl")
         .args(args)
         .output()
         .map_err(InstallError::from)?;

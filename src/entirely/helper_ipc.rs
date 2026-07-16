@@ -6,10 +6,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const HELPER_SOCKET_PATH: &str = "/var/run/caffeinate2.sock";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Absolute wall-clock budget for reading one request on the helper side. The
+/// 5s RPC timeouts are per-recv (`SO_RCVTIMEO`), so a client trickling one byte
+/// per timeout window would otherwise hold a connection slot indefinitely; this
+/// deadline bounds the whole read no matter how the bytes arrive.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Holds are keyed by the requesting process (pid + start time, taken from the
 /// socket peer), not by the connection.
@@ -161,8 +167,71 @@ fn read_response_line(stream: &mut UnixStream) -> Result<HelperResponse, HelperI
     decode_response(&line).map_err(|e| HelperIpcError::new(format!("invalid response: {e}")))
 }
 
-fn read_request_line(stream: &mut UnixStream) -> Result<HelperRequest, HelperIpcError> {
-    let line = read_line(stream)?;
+/// Read one newline-framed line, enforcing `deadline` across the whole read:
+/// the read timeout is shrunk to the time remaining before every recv, so a
+/// writer feeding one byte per timeout window hits the deadline instead of
+/// resetting a fresh `SO_RCVTIMEO` window with each byte. Server-side only —
+/// clients talk to a helper that answers in one write, so [`read_line`]'s
+/// per-recv timeout suffices there.
+fn read_line_with_deadline(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<String, HelperIpcError> {
+    const PER_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HelperIpcError::new("connection deadline exceeded"));
+        }
+        let timeout = remaining.min(PER_RECV_TIMEOUT);
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| HelperIpcError::new(format!("set timeout: {e}")))?;
+        let mut chunk = [0u8; 1024];
+        let bytes = match stream.read(&mut chunk) {
+            Ok(bytes) => bytes,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // A recv that timed out on a window shrunk below the per-recv
+                // timeout ran out of *deadline*, not of client patience.
+                if timeout < PER_RECV_TIMEOUT {
+                    return Err(HelperIpcError::new("connection deadline exceeded"));
+                }
+                return Err(HelperIpcError::new(format!("read failed: {e}")));
+            }
+            Err(e) => return Err(HelperIpcError::new(format!("read failed: {e}"))),
+        };
+        if bytes == 0 {
+            if buf.is_empty() {
+                return Err(HelperIpcError::new("missing request"));
+            }
+            return Err(HelperIpcError::new("request missing newline"));
+        }
+        buf.extend_from_slice(&chunk[..bytes]);
+        if let Some(newline) = buf.iter().position(|&b| b == b'\n') {
+            if newline + 1 > MAX_REQUEST_BYTES {
+                return Err(HelperIpcError::new("request too large"));
+            }
+            return String::from_utf8(buf[..=newline].to_vec())
+                .map_err(|e| HelperIpcError::new(format!("read failed: {e}")));
+        }
+        if buf.len() > MAX_REQUEST_BYTES {
+            return Err(HelperIpcError::new("request missing newline"));
+        }
+    }
+}
+
+fn read_request_line(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<HelperRequest, HelperIpcError> {
+    let line = read_line_with_deadline(stream, deadline)?;
     decode_request(&line).map_err(|e| HelperIpcError::new(format!("invalid request: {e}")))
 }
 
@@ -314,6 +383,18 @@ impl HelperHoldGuard {
     ///
     /// Returns an error if the release RPC fails.
     pub fn release(&mut self) -> Result<(), HelperIpcError> {
+        self.release_inner(false)
+    }
+
+    /// `discarding` is true only for the Drop-time attempt, when the guard is
+    /// about to cease existing: the count must then stop reflecting it even if
+    /// the Release RPC fails. A count stranded at 1 for a discarded guard would
+    /// send every later release in this process down the `count > 1` fast path,
+    /// so the Release RPC would never be sent again for the process lifetime
+    /// and the helper's reconcile would keep re-applying the disable for this
+    /// live pid. The stale helper-side entry self-heals instead: the next
+    /// session's true 1 -> 0 transition sends the idempotent Release RPC.
+    fn release_inner(&mut self, discarding: bool) -> Result<(), HelperIpcError> {
         if self.released {
             return Ok(());
         }
@@ -335,8 +416,9 @@ impl HelperHoldGuard {
         // otherwise a transient helper outage strands the hold for as long as
         // this process lives (the reaper only prunes dead pids). Release is
         // idempotent on the helper side, so a duplicate after a lost response is
-        // harmless. On failure the count stays at 1 so a later retry still owns
-        // the 1 -> 0 transition.
+        // harmless. On failure the count stays at 1 so a later explicit retry
+        // still owns the 1 -> 0 transition — unless this is the final Drop-time
+        // attempt (`discarding`), after which no guard remains to retry.
         match rpc(&self.client.socket_path, &HelperRequest::Release, true)
             .and_then(HelperResponse::into_release_ok)
         {
@@ -345,7 +427,13 @@ impl HelperHoldGuard {
                 self.released = true;
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if discarding {
+                    *count -= 1;
+                    self.released = true;
+                }
+                Err(e)
+            }
         }
     }
 }
@@ -353,7 +441,7 @@ impl HelperHoldGuard {
 impl Drop for HelperHoldGuard {
     fn drop(&mut self) {
         if !self.released
-            && let Err(e) = self.release()
+            && let Err(e) = self.release_inner(true)
         {
             tracing::warn!("Error releasing helper hold: {e}");
         }
@@ -486,11 +574,13 @@ fn serve_connection_inner(
         &UnixStream,
     ) -> Result<crate::entirely::lockfile::ProcessId, HelperIpcError>,
 ) -> Result<(), HelperIpcError> {
-    // Bound the whole RPC so a client that connects and sends nothing can't
-    // pin a helper thread forever.
+    // Bound the whole RPC so a client that connects and sends nothing — or
+    // trickles bytes to keep resetting the per-recv timeout — can't pin a
+    // helper connection slot forever.
+    let deadline = Instant::now() + CONNECTION_DEADLINE;
     configure_rpc_timeouts(&stream)?;
 
-    let request = match read_request_line(&mut stream) {
+    let request = match read_request_line(&mut stream, deadline) {
         Ok(req) => req,
         Err(e) => {
             return write_response(
@@ -586,9 +676,17 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
 
+    /// Serializes the tests that take real guards: `HELPER_HOLD_COUNT` is
+    /// process-wide, so concurrent guards from different tests would observe
+    /// each other's counts and take the wrong release path.
+    static HOLD_COUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[cfg(target_os = "macos")]
     #[test]
     fn hold_status_release_round_trip_over_socket() {
+        let _serial = HOLD_COUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir();
         let sock_path = dir.join(format!("caffeinate2_ipc_{}.sock", std::process::id()));
         let lock_path = dir.join(format!("caffeinate2_ipc_{}.lock", std::process::id()));
@@ -631,6 +729,80 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dropped_guard_with_failed_release_frees_the_hold_count() {
+        let _serial = HOLD_COUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("caffeinate2_dropfail_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_server = requests.clone();
+        let server = std::thread::spawn(move || {
+            // Scripted helper: Hold ok; the explicit Release and the Drop retry
+            // both fail; then a fresh Hold/Release session succeeds.
+            let script = [
+                HelperResponse::HoldOk,
+                HelperResponse::Error {
+                    message: "injected release failure".to_string(),
+                },
+                HelperResponse::Error {
+                    message: "injected release failure".to_string(),
+                },
+                HelperResponse::HoldOk,
+                HelperResponse::ReleaseOk,
+            ];
+            for response in script {
+                let (mut stream, _) = listener.accept().unwrap();
+                let line = read_line(&mut stream).unwrap();
+                requests_server
+                    .lock()
+                    .unwrap()
+                    .push(decode_request(&line).unwrap());
+                write_response(&mut stream, &response).unwrap();
+            }
+        });
+
+        let client = HelperClient {
+            socket_path: sock_path.display().to_string(),
+        };
+        let mut guard = HelperHoldGuard::try_acquire(&client).unwrap();
+        assert!(guard.release().is_err());
+        // Drop is the final retry: it fails again, but the count must stop
+        // reflecting the discarded guard.
+        drop(guard);
+        assert_eq!(
+            *HELPER_HOLD_COUNT.lock().unwrap(),
+            0,
+            "discarded guard must not strand the process-wide hold count"
+        );
+
+        // The next session owns the 1 -> 0 transition again, so its release
+        // sends the (idempotent) Release RPC that heals the stale helper-side
+        // entry. A stranded count would take the `count > 1` fast path here and
+        // never send it.
+        let mut guard = HelperHoldGuard::try_acquire(&client).unwrap();
+        guard.release().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                HelperRequest::Hold,
+                HelperRequest::Release,
+                HelperRequest::Release,
+                HelperRequest::Hold,
+                HelperRequest::Release,
+            ]
+        );
+
+        let _ = std::fs::remove_file(&sock_path);
     }
 
     #[cfg(target_os = "macos")]
@@ -750,6 +922,43 @@ mod tests {
             "request too large"
         );
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn trickling_writer_hits_the_connection_deadline() {
+        // One byte per interval keeps every individual recv well under its
+        // timeout; only the absolute deadline can cut the connection off.
+        let (mut left, mut right) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            // Bounded in case the reader never closes; exits early once the
+            // reader's end is gone and the write fails.
+            for _ in 0..100 {
+                if left.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert_eq!(
+            read_line_with_deadline(&mut right, deadline)
+                .unwrap_err()
+                .message(),
+            "connection deadline exceeded"
+        );
+        drop(right);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn deadline_read_accepts_a_prompt_request() {
+        let (mut left, mut right) = UnixStream::pair().unwrap();
+        left.write_all(b"{\"op\":\"status\"}\n").unwrap();
+
+        let line =
+            read_line_with_deadline(&mut right, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(decode_request(&line).unwrap(), HelperRequest::Status);
     }
 
     #[test]

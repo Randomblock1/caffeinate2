@@ -20,6 +20,35 @@
 //! The single safety property is the same convergence oracle the property tests
 //! use: once a reconcile runs to completion, the kernel's SleepDisabled bit must
 //! equal "there is at least one live holder".
+//!
+//! A second model, [`CrossProcess`], covers the CLI-fallback deployment: with
+//! no helper installed, two root CLI *processes* share the lockfile and the
+//! `ops` mutex is per-process, so the decomposed steps of their operations
+//! interleave freely (each flock'd lockfile mutation stays atomic, but one
+//! process's kernel toggle and follow-up marker write may land between the
+//! other's mutations). It compares the two post-toggle marker-write designs:
+//!
+//! * [`MarkerWrite::Unconditional`] — the pre-fix code: release()/status()/
+//!   reconcile clear the marker without re-checking the holder set, and the
+//!   reconcile disable path records ownership only when the prune saw no
+//!   marker. Kept so the checker demonstrates it catches both cross-process
+//!   marker races (a clobbered fresh marker, and a re-applied disable owned by
+//!   nobody).
+//! * [`MarkerWrite::Guarded`] — the fixed code: the clear re-checks, inside the
+//!   same flock mutation, that no holders remain *and* that the persisted
+//!   ownership generation still matches the one captured with the re-enable
+//!   decision (`clear_owns_disable_if_current`), and the reconcile disable path
+//!   always re-records ownership — bumping the generation — after its toggle.
+//!
+//! The cross-process model includes status(): it is IPC-reachable and its
+//! `holders == 0 && owns_disable` path decomposes exactly like reconcile's
+//! Enable path (prune+decide, kernel toggle, marker clear), with the same
+//! post-toggle marker race. The single-process model above leaves status out
+//! for the same reason: under a single serialized coordinator its step
+//! sequences are a strict subset of reconcile's. The cross-process model in
+//! turn omits helper crashes and the startup-only legacy `had_entries`
+//! fallback — sub-operation crash recovery is the single-process model's job,
+//! and the fallback only widens the Enable condition.
 
 use stateright::{Checker, Model, Property};
 use std::collections::BTreeSet;
@@ -379,6 +408,425 @@ fn buggy_protocol_is_caught_by_the_checker() {
     );
     eprintln!(
         "Buggy protocol counterexample ({} actions):\n{:#?}",
+        path.clone().into_actions().len(),
+        path.into_actions()
+    );
+}
+
+/// Which post-toggle marker-write design the cross-process model checks (see
+/// the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MarkerWrite {
+    /// Pre-fix: clear without re-checking anything; record ownership on a
+    /// reconcile disable only when the prune saw no marker.
+    Unconditional,
+    /// Fixed: `clear_owns_disable_if_current` semantics — the clear re-checks,
+    /// inside the same flock write, that no holders remain and that the
+    /// ownership generation still matches the one captured with the re-enable
+    /// decision — and the reconcile disable path always re-records ownership
+    /// (bumping the generation) after its toggle.
+    Guarded,
+}
+
+/// One process's in-flight operation, decomposed at its atomicity boundaries:
+/// each lockfile mutation is one flock'd write, the kernel toggle is a separate
+/// step, and the follow-up marker mutation is a second lockfile write.
+/// Operations whose initial lockfile mutation is their only effect (a non-first
+/// hold, a release/status that decides against toggling, a reconcile that
+/// decides `Nothing`) complete atomically at start and never appear here.
+///
+/// `gen_valid` abstracts the persisted ownership generation exactly: the code
+/// compares "generation captured with the re-enable decision" against the
+/// current one, and the counter is monotonic (never recycled), so the
+/// comparison is precisely "has any marker set happened since the decision".
+/// Every marker set flips the token to false via [`invalidate_generations`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProcPending {
+    None,
+    /// hold(): first holder + marker written; the kernel disable is to come.
+    HoldToggle,
+    /// release(): holder removed, re-enable decided; the kernel enable is to come.
+    ReleaseToggle {
+        gen_valid: bool,
+    },
+    /// release(): kernel re-enabled; the marker clear is to come.
+    ReleaseClear {
+        gen_valid: bool,
+    },
+    /// reconcile(): pruned and decided; the kernel toggle is to come. `owned`
+    /// is the marker as seen at prune time (the Unconditional disable path
+    /// consults it).
+    ReconcileToggle {
+        effect: Effect,
+        owned: bool,
+        gen_valid: bool,
+    },
+    /// reconcile(): kernel toggled; the marker write is to come.
+    ReconcileMarker {
+        effect: Effect,
+        owned: bool,
+        gen_valid: bool,
+    },
+    /// status(): pruned to zero holders while owning the disable; the kernel
+    /// enable is to come.
+    StatusToggle {
+        gen_valid: bool,
+    },
+    /// status(): kernel re-enabled; the marker clear is to come.
+    StatusClear {
+        gen_valid: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CrossState {
+    /// Durable holder entries (may include dead pids not yet pruned).
+    lockfile: BTreeSet<Pid>,
+    /// Durable ownership marker.
+    marker: bool,
+    /// The kernel SleepDisabled bit.
+    kernel_disabled: bool,
+    /// Which holder pids are currently alive.
+    alive: BTreeSet<Pid>,
+    /// Each process's in-flight operation (its own `ops` mutex allows one).
+    pending: [ProcPending; 2],
+    /// interfered[i]: the other process mutated shared state while process i's
+    /// current operation was in flight, so i's locked-in decision may be stale
+    /// and its completion is not a convergence checkpoint.
+    interfered: [bool; 2],
+    /// True in exactly the states reached by completing a *solo* reconcile:
+    /// interference-free and with the other process idle. Only there is
+    /// convergence promised — a reconcile finishing while the other process is
+    /// mid-operation may observe a state that op's remaining steps (e.g. its
+    /// pending marker write) are about to repair.
+    just_reconciled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CrossAction {
+    /// Process `who` takes a hold for its own pid.
+    Hold(u8),
+    /// Process `who` releases its own pid (possibly a stray non-holder release).
+    Release(u8),
+    /// Process `who` runs its periodic reconcile.
+    Reconcile(u8),
+    /// Process `who` serves a Status RPC.
+    Status(u8),
+    /// Advance process `who`'s in-flight operation by one atomic step.
+    StepOp(u8),
+    /// SIGKILL the process owning `Pid`. Offered only when both processes are
+    /// quiescent, for the same reason the single-process model restricts kills:
+    /// in-flight decisions are already locked in, so a kill mid-operation is
+    /// equivalent to one just after it.
+    Kill(Pid),
+}
+
+struct CrossProcess {
+    marker_write: MarkerWrite,
+}
+
+/// Each modelled process holds under its own pid.
+fn pid_of(who: usize) -> Pid {
+    u8::try_from(who).unwrap() + 1
+}
+
+fn cross_live_count(s: &CrossState) -> usize {
+    s.lockfile.iter().filter(|p| s.alive.contains(p)).count()
+}
+
+fn cross_prune(s: &mut CrossState) {
+    let alive = &s.alive;
+    s.lockfile.retain(|p| alive.contains(p));
+}
+
+/// A marker set bumps the persisted ownership generation, invalidating every
+/// in-flight re-enable decision that captured the previous one.
+fn invalidate_generations(s: &mut CrossState) {
+    for pending in &mut s.pending {
+        match pending {
+            ProcPending::ReleaseToggle { gen_valid }
+            | ProcPending::ReleaseClear { gen_valid }
+            | ProcPending::StatusToggle { gen_valid }
+            | ProcPending::StatusClear { gen_valid }
+            | ProcPending::ReconcileToggle { gen_valid, .. }
+            | ProcPending::ReconcileMarker { gen_valid, .. } => *gen_valid = false,
+            ProcPending::None | ProcPending::HoldToggle => {}
+        }
+    }
+}
+
+impl CrossProcess {
+    /// The post-toggle marker clear. Guarded re-checks the holder set and the
+    /// ownership generation inside the same flock mutation; Unconditional is
+    /// the pre-fix clear.
+    fn clear_marker(&self, s: &mut CrossState, gen_valid: bool) {
+        match self.marker_write {
+            MarkerWrite::Unconditional => s.marker = false,
+            MarkerWrite::Guarded => {
+                if gen_valid && s.lockfile.is_empty() {
+                    s.marker = false;
+                }
+            }
+        }
+    }
+}
+
+impl Model for CrossProcess {
+    type State = CrossState;
+    type Action = CrossAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        vec![CrossState {
+            lockfile: BTreeSet::new(),
+            marker: false,
+            kernel_disabled: false,
+            alive: BTreeSet::new(),
+            pending: [ProcPending::None; 2],
+            interfered: [false; 2],
+            just_reconciled: false,
+        }]
+    }
+
+    fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
+        for who in 0..2 {
+            if state.pending[who] == ProcPending::None {
+                let who = u8::try_from(who).unwrap();
+                actions.push(CrossAction::Hold(who));
+                actions.push(CrossAction::Release(who));
+                actions.push(CrossAction::Reconcile(who));
+                actions.push(CrossAction::Status(who));
+            } else {
+                actions.push(CrossAction::StepOp(u8::try_from(who).unwrap()));
+            }
+        }
+        if state.pending.iter().all(|p| *p == ProcPending::None) {
+            for who in 0..2 {
+                let p = pid_of(who);
+                if state.alive.contains(&p) {
+                    actions.push(CrossAction::Kill(p));
+                }
+            }
+        }
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut s = last.clone();
+        s.just_reconciled = false;
+
+        // Any move by one process while the other has an operation in flight
+        // taints that operation's locked-in decision. Over-approximate (taint
+        // on every move, mutating or not): a skipped assertion is sound, and a
+        // later solo reconcile still has to converge from whatever state the
+        // interleaving produced.
+        let taint_other_of = |s: &mut CrossState, who: usize| {
+            let other = 1 - who;
+            if s.pending[other] != ProcPending::None {
+                s.interfered[other] = true;
+            }
+        };
+
+        match action {
+            CrossAction::Kill(p) => {
+                // Only offered when both processes are quiescent.
+                s.alive.remove(&p);
+            }
+
+            CrossAction::Hold(who) => {
+                let who = usize::from(who);
+                let p = pid_of(who);
+                s.alive.insert(p);
+                cross_prune(&mut s);
+                let first = s.lockfile.is_empty();
+                s.lockfile.insert(p);
+                if first {
+                    // Marker written (and the generation bumped) in the same
+                    // flock write that adds the holder; the kernel disable is a
+                    // later step.
+                    s.marker = true;
+                    invalidate_generations(&mut s);
+                    s.pending[who] = ProcPending::HoldToggle;
+                    s.interfered[who] = false;
+                }
+                taint_other_of(&mut s, who);
+            }
+
+            CrossAction::Release(who) => {
+                let who = usize::from(who);
+                cross_prune(&mut s);
+                s.lockfile.remove(&pid_of(who));
+                if s.lockfile.is_empty() && s.marker {
+                    s.pending[who] = ProcPending::ReleaseToggle { gen_valid: true };
+                    s.interfered[who] = false;
+                }
+                taint_other_of(&mut s, who);
+            }
+
+            CrossAction::Reconcile(who) => {
+                let who = usize::from(who);
+                cross_prune(&mut s);
+                let owned = s.marker;
+                if !s.lockfile.is_empty() {
+                    s.pending[who] = ProcPending::ReconcileToggle {
+                        effect: Effect::Disable,
+                        owned,
+                        gen_valid: false, // unused on the disable path
+                    };
+                    s.interfered[who] = false;
+                } else if owned {
+                    s.pending[who] = ProcPending::ReconcileToggle {
+                        effect: Effect::Enable,
+                        owned,
+                        gen_valid: true,
+                    };
+                    s.interfered[who] = false;
+                } else {
+                    // Nothing to converge: the prune was the whole reconcile,
+                    // completing atomically (and interference-free). Solo only
+                    // if the other process is idle.
+                    s.just_reconciled = s.pending[1 - who] == ProcPending::None;
+                }
+                taint_other_of(&mut s, who);
+            }
+
+            CrossAction::Status(who) => {
+                let who = usize::from(who);
+                cross_prune(&mut s);
+                if s.lockfile.is_empty() && s.marker {
+                    s.pending[who] = ProcPending::StatusToggle { gen_valid: true };
+                    s.interfered[who] = false;
+                }
+                taint_other_of(&mut s, who);
+            }
+
+            CrossAction::StepOp(who) => {
+                let who = usize::from(who);
+                match last.pending[who] {
+                    ProcPending::None => return None,
+
+                    ProcPending::HoldToggle => {
+                        s.kernel_disabled = true;
+                        s.pending[who] = ProcPending::None;
+                    }
+
+                    ProcPending::ReleaseToggle { gen_valid } => {
+                        s.kernel_disabled = false;
+                        s.pending[who] = ProcPending::ReleaseClear { gen_valid };
+                    }
+
+                    ProcPending::ReleaseClear { gen_valid } => {
+                        self.clear_marker(&mut s, gen_valid);
+                        s.pending[who] = ProcPending::None;
+                    }
+
+                    ProcPending::StatusToggle { gen_valid } => {
+                        s.kernel_disabled = false;
+                        s.pending[who] = ProcPending::StatusClear { gen_valid };
+                    }
+
+                    ProcPending::StatusClear { gen_valid } => {
+                        self.clear_marker(&mut s, gen_valid);
+                        s.pending[who] = ProcPending::None;
+                    }
+
+                    ProcPending::ReconcileToggle {
+                        effect,
+                        owned,
+                        gen_valid,
+                    } => {
+                        match effect {
+                            Effect::Disable => s.kernel_disabled = true,
+                            Effect::Enable => s.kernel_disabled = false,
+                            Effect::Nothing => unreachable!("completes at start"),
+                        }
+                        s.pending[who] = ProcPending::ReconcileMarker {
+                            effect,
+                            owned,
+                            gen_valid,
+                        };
+                    }
+
+                    ProcPending::ReconcileMarker {
+                        effect,
+                        owned,
+                        gen_valid,
+                    } => {
+                        match (effect, self.marker_write) {
+                            // Pre-fix: ownership recorded only when the prune
+                            // saw no marker — a concurrent release that cleared
+                            // it after the prune leaves this re-applied disable
+                            // owned by nobody.
+                            (Effect::Disable, MarkerWrite::Unconditional) => {
+                                if !owned {
+                                    s.marker = true;
+                                }
+                            }
+                            // Fixed: always re-record ownership (bumping the
+                            // generation) for the disable just re-applied.
+                            (Effect::Disable, MarkerWrite::Guarded) => {
+                                s.marker = true;
+                                invalidate_generations(&mut s);
+                            }
+                            (Effect::Enable, _) => self.clear_marker(&mut s, gen_valid),
+                            (Effect::Nothing, _) => unreachable!("completes at start"),
+                        }
+                        s.pending[who] = ProcPending::None;
+                        s.just_reconciled =
+                            !s.interfered[who] && s.pending[1 - who] == ProcPending::None;
+                    }
+                }
+                taint_other_of(&mut s, who);
+            }
+        }
+
+        Some(s)
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![Property::<Self>::always(CONVERGES, |_, s| {
+            if !s.just_reconciled {
+                return true;
+            }
+            s.kernel_disabled == (cross_live_count(s) > 0)
+        })]
+    }
+}
+
+/// The fixed cross-process protocol (guarded marker writes) must converge under
+/// every interleaving of two coordinator processes sharing the lockfile.
+#[test]
+fn cross_process_fixed_protocol_converges() {
+    let checker = CrossProcess {
+        marker_write: MarkerWrite::Guarded,
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+    checker.assert_properties();
+    eprintln!(
+        "Cross-process fixed protocol: {} states explored, no convergence violation.",
+        checker.unique_state_count()
+    );
+}
+
+/// Teeth: the pre-fix marker writes must produce a cross-process
+/// counterexample — e.g. one process's post-enable marker clear destroying the
+/// marker a concurrent first hold just set, leaving that hold's eventual
+/// release with no evidence of ownership and sleep stranded disabled with zero
+/// holders.
+#[test]
+fn cross_process_unconditional_marker_writes_are_caught() {
+    let checker = CrossProcess {
+        marker_write: MarkerWrite::Unconditional,
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+    let path = checker.discovery(CONVERGES).expect(
+        "the checker should find the cross-process marker-race counterexample in the \
+         unconditional-clear protocol",
+    );
+    eprintln!(
+        "Cross-process counterexample ({} actions):\n{:#?}",
         path.clone().into_actions().len(),
         path.into_actions()
     );

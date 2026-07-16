@@ -47,9 +47,10 @@ fn run() -> anyhow::Result<()> {
     // for any local user the admin has granted, and macOS has no portable way
     // to restrict a socket to a supplementary group here. The tradeoff is a
     // local DoS surface — any local user can open connections — which is capped
-    // by MAX_CONCURRENT_CONNECTIONS and the per-connection RPC timeouts. This
-    // grants no privilege by itself: Hold still requires passing the uid-based
-    // authorization check.
+    // by MAX_CONCURRENT_CONNECTIONS and the absolute per-connection deadline
+    // that serve_connection enforces (per-recv timeouts alone would let a
+    // byte-trickling client hold a slot indefinitely). This grants no privilege
+    // by itself: Hold still requires passing the uid-based authorization check.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
         .context("failed to set socket permissions")?;
     let coordinator = Arc::new(EntirelyCoordinator::helper_daemon(verbose));

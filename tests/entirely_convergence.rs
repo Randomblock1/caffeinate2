@@ -12,7 +12,9 @@
 //! Two injectable seams make this possible without touching real IOKit or the
 //! OS process table: `SleepDisabler` (writes the kernel bit) and
 //! `ProcessChecker` (decides which pids are alive). The lockfile is real, on a
-//! per-case temp path.
+//! per-case temp path. The disabler can also be armed to fail its next toggle
+//! (an IOKit error), composing the hold/release/reconcile rollback paths with
+//! kills, restarts, and reconciles under the same oracle.
 //!
 //! The oracle is deliberately independent of the coordinator's implementation:
 //! it tracks only the set of processes that are currently holding and alive, and
@@ -52,6 +54,9 @@ const POOL_LEN: usize = 4;
 struct World {
     kernel_disabled: Arc<AtomicBool>,
     live: Arc<Mutex<HashSet<ProcessId>>>,
+    /// When armed, the next toggle through the injected disabler fails with an
+    /// IOKit-style error (and disarms), leaving the kernel bit untouched.
+    fail_next_toggle: Arc<AtomicBool>,
 }
 
 impl World {
@@ -59,6 +64,7 @@ impl World {
         Self {
             kernel_disabled: Arc::new(AtomicBool::new(false)),
             live: Arc::new(Mutex::new(HashSet::new())),
+            fail_next_toggle: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -67,12 +73,17 @@ impl World {
     }
 }
 
-/// Build a fresh coordinator bound to `world`. Crucially, each call starts with
-/// a fresh in-memory `sleep_disabled` cache (false) — modelling a helper
-/// (re)start, where the coordinator must rediscover intent from the lockfile.
+/// Build a fresh coordinator bound to `world`. Crucially, each call constructs
+/// the coordinator with no in-memory state (the first argument is
+/// `verbose = false`) — modelling a helper (re)start, where the coordinator
+/// must rediscover intent from the lockfile's durable ownership marker.
 fn make_coord(world: &World, lock_path: &std::path::Path) -> EntirelyCoordinator {
     let kernel = world.kernel_disabled.clone();
+    let fail_next = world.fail_next_toggle.clone();
     let disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+        if fail_next.swap(false, Ordering::SeqCst) {
+            return Err(0xE000_02C1u32);
+        }
         kernel.store(state, Ordering::SeqCst);
         Ok(())
     });
@@ -116,6 +127,9 @@ enum Op {
     /// An external actor re-enables sleep (manual `pmset enablesleep`, or a
     /// sleep/wake cycle clearing the bit).
     ExternalEnable,
+    /// Arm the disabler to fail its next toggle (transient IOKit error),
+    /// driving the hold/release/reconcile rollback paths.
+    DisablerFailNext,
 }
 
 fn base_op() -> impl Strategy<Value = Op> {
@@ -125,6 +139,7 @@ fn base_op() -> impl Strategy<Value = Op> {
         (0..POOL_LEN).prop_map(Op::Kill),
         Just(Op::Reconcile),
         Just(Op::Restart),
+        Just(Op::DisablerFailNext),
     ]
 }
 
@@ -137,6 +152,7 @@ fn adversarial_op() -> impl Strategy<Value = Op> {
         Just(Op::Restart),
         Just(Op::ExternalDisable),
         Just(Op::ExternalEnable),
+        Just(Op::DisablerFailNext),
     ]
 }
 
@@ -166,33 +182,49 @@ proptest! {
             match op {
                 Op::Hold(i) => {
                     world.live.lock().unwrap().insert(p[*i]);
-                    coord.hold(p[*i]).unwrap();
-                    holders.insert(p[*i]);
-                    // A fresh live hold always leaves sleep disabled.
-                    prop_assert!(world.kernel(), "kernel must be disabled after Hold");
+                    // A failed hold (armed disable failure) is rolled back:
+                    // pool[i] is not holding, so the oracle is unchanged.
+                    if coord.hold(p[*i]).is_ok() {
+                        holders.insert(p[*i]);
+                        // A fresh live hold always leaves sleep disabled.
+                        prop_assert!(world.kernel(), "kernel must be disabled after Hold");
+                    }
                 }
                 Op::Release(i) => {
-                    coord.release(p[*i]).unwrap();
-                    holders.remove(&p[*i]);
+                    // A failed re-enable restores the holder entry, so the
+                    // oracle keeps the holder too.
+                    if coord.release(p[*i]).is_ok() {
+                        holders.remove(&p[*i]);
+                    }
                 }
                 Op::Kill(i) => {
                     world.live.lock().unwrap().remove(&p[*i]);
                     holders.remove(&p[*i]);
                 }
                 Op::Reconcile => {
-                    coord.reconcile().unwrap();
-                    prop_assert_eq!(world.kernel(), !holders.is_empty());
+                    // The invariant is promised only by a reconcile that ran to
+                    // completion; one that hit an armed toggle failure retries
+                    // on a later pass.
+                    if coord.reconcile().is_ok() {
+                        prop_assert_eq!(world.kernel(), !holders.is_empty());
+                    }
                 }
                 Op::Restart => {
                     coord = make_coord(&world, &lock_path);
-                    coord.reconcile_startup().unwrap();
-                    prop_assert_eq!(world.kernel(), !holders.is_empty());
+                    if coord.reconcile_startup().is_ok() {
+                        prop_assert_eq!(world.kernel(), !holders.is_empty());
+                    }
+                }
+                Op::DisablerFailNext => {
+                    world.fail_next_toggle.store(true, Ordering::SeqCst);
                 }
                 Op::ExternalDisable | Op::ExternalEnable => unreachable!(),
             }
         }
 
-        // A final quiescent reconcile must land on the invariant.
+        // A final quiescent reconcile — with no armed failure left — must land
+        // on the invariant.
+        world.fail_next_toggle.store(false, Ordering::SeqCst);
         coord.reconcile().unwrap();
         prop_assert_eq!(world.kernel(), !holders.is_empty());
         let _ = std::fs::remove_file(&lock_path);
@@ -216,12 +248,14 @@ proptest! {
             match op {
                 Op::Hold(i) => {
                     world.live.lock().unwrap().insert(p[*i]);
-                    coord.hold(p[*i]).unwrap();
-                    holders.insert(p[*i]);
+                    if coord.hold(p[*i]).is_ok() {
+                        holders.insert(p[*i]);
+                    }
                 }
                 Op::Release(i) => {
-                    coord.release(p[*i]).unwrap();
-                    holders.remove(&p[*i]);
+                    if coord.release(p[*i]).is_ok() {
+                        holders.remove(&p[*i]);
+                    }
                 }
                 Op::Kill(i) => {
                     world.live.lock().unwrap().remove(&p[*i]);
@@ -229,9 +263,11 @@ proptest! {
                 }
                 Op::ExternalDisable => world.kernel_disabled.store(true, Ordering::SeqCst),
                 Op::ExternalEnable => world.kernel_disabled.store(false, Ordering::SeqCst),
+                Op::DisablerFailNext => {
+                    world.fail_next_toggle.store(true, Ordering::SeqCst);
+                }
                 Op::Reconcile => {
-                    coord.reconcile().unwrap();
-                    if !holders.is_empty() {
+                    if coord.reconcile().is_ok() && !holders.is_empty() {
                         prop_assert!(
                             world.kernel(),
                             "live holders present but sleep re-enabled by external actor \
@@ -241,8 +277,7 @@ proptest! {
                 }
                 Op::Restart => {
                     coord = make_coord(&world, &lock_path);
-                    coord.reconcile_startup().unwrap();
-                    if !holders.is_empty() {
+                    if coord.reconcile_startup().is_ok() && !holders.is_empty() {
                         prop_assert!(world.kernel(), "live holders must be effective after restart");
                     }
                 }

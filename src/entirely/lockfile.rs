@@ -30,12 +30,27 @@ const MAX_LOCKFILE_BYTES: u64 = 64 * 1024;
 /// holder lines simply ignored it.
 const DISABLE_MARKER: &str = "!disabled";
 
-/// The full parsed contents of the lockfile: the live holder set plus whether
-/// caffeinate2 owns the current sleep disable (see [`DISABLE_MARKER`]).
+/// Prefix of the sentinel line persisting the ownership *generation*: a counter
+/// bumped in the same locked write every time the ownership marker is set (a
+/// first hold, or a reconcile re-recording ownership). A caller that decides to
+/// re-enable sleep clears the marker only if the generation still matches the
+/// one it captured with that decision — its kernel toggle happens outside the
+/// flock, so another process sharing the lockfile may have set a *new* marker
+/// in between, and clearing that would orphan the new disable. The counter is
+/// persisted independently of the marker so it never regresses while the
+/// lockfile exists: a stale observation can never match a recycled value. Like
+/// the marker, the line does not parse as a `ProcessId`, so older versions
+/// ignored it.
+const GENERATION_PREFIX: &str = "!generation:";
+
+/// The full parsed contents of the lockfile: the live holder set, whether
+/// caffeinate2 owns the current sleep disable (see [`DISABLE_MARKER`]), and the
+/// ownership generation (see [`GENERATION_PREFIX`]).
 #[derive(Debug, Default)]
 struct LockfileState {
     holders: HashSet<ProcessId>,
     owns_disable: bool,
+    disable_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -151,6 +166,10 @@ fn read_state(file: &mut Flock<File>) -> Result<LockfileState, std::io::Error> {
         let line = line.trim();
         if line == DISABLE_MARKER {
             state.owns_disable = true;
+        } else if let Some(generation) = line.strip_prefix(GENERATION_PREFIX) {
+            if let Ok(generation) = generation.parse::<u64>() {
+                state.disable_generation = generation;
+            }
         } else if let Ok(pid) = line.parse::<ProcessId>() {
             state.holders.insert(pid);
         }
@@ -166,6 +185,15 @@ fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std:
     if state.owns_disable {
         content.push_str(DISABLE_MARKER);
         content.push('\n');
+    }
+    // The generation outlives the marker (see [`GENERATION_PREFIX`]): keep
+    // persisting it after a clear so a later re-set can never recycle a value
+    // a stale observer captured.
+    if state.disable_generation > 0 {
+        content.push_str(&format!(
+            "{GENERATION_PREFIX}{}\n",
+            state.disable_generation
+        ));
     }
     for p in &state.holders {
         content.push_str(&format!("{p}\n"));
@@ -219,8 +247,24 @@ fn mutate_lockfile<R>(
     Ok(result)
 }
 
-/// Register `current_proc` as a holder. Returns true when this is the first
-/// holder and the caller must therefore disable sleep.
+/// Outcome of registering a holder under the exclusive lock.
+#[derive(Debug)]
+pub(crate) struct AcquireOutcome {
+    /// This is the first holder, so the caller must disable sleep.
+    pub first_holder: bool,
+    /// Whether the ownership marker was already set *before* this acquire. A
+    /// rollback of a failed disable must restore this value rather than force
+    /// the marker off: a pre-existing marker (e.g. left by an earlier failed
+    /// re-enable) records a real disable that reconcile still has to see.
+    pub prior_owns_disable: bool,
+    /// Ownership generation as of this acquire (post-bump when this is the
+    /// first holder). A rollback of a failed disable passes it to
+    /// [`clear_owns_disable_if_current`] so it can only clear the marker
+    /// instance this acquire wrote.
+    pub disable_generation: u64,
+}
+
+/// Register `current_proc` as a holder.
 ///
 /// When it is the first holder, the ownership marker is set in the *same* write
 /// that adds the holder — before the caller toggles sleep — so a crash between
@@ -231,7 +275,7 @@ pub(crate) fn acquire(
     path: &Path,
     process_checker: &ProcessChecker,
     current_proc: &ProcessId,
-) -> Result<bool, std::io::Error> {
+) -> Result<AcquireOutcome, std::io::Error> {
     mutate_lockfile(
         verbose,
         path,
@@ -239,49 +283,75 @@ pub(crate) fn acquire(
         Some(current_proc),
         |state| {
             let first_holder = state.holders.is_empty();
+            let prior_owns_disable = state.owns_disable;
             state.holders.insert(*current_proc);
             if first_holder {
                 state.owns_disable = true;
+                state.disable_generation += 1;
             }
-            Ok(first_holder)
+            Ok(AcquireOutcome {
+                first_holder,
+                prior_owns_disable,
+                disable_generation: state.disable_generation,
+            })
         },
     )
 }
 
-/// Remove `current_proc` from the holder set. Returns true when no live holders
-/// remain *and* caffeinate2 owns the disable, i.e. the caller must re-enable
-/// sleep.
+/// Outcome of removing a holder under the exclusive lock.
+pub(crate) struct ReleaseOutcome {
+    /// No live holders remain *and* caffeinate2 owns the disable, i.e. the
+    /// caller must re-enable sleep.
+    pub should_enable: bool,
+    /// Whether `current_proc` actually held (its entry was present and
+    /// removed). A rollback of a failed re-enable must only restore an entry
+    /// that existed: re-adding a stray non-holder would fabricate a hold.
+    pub removed: bool,
+    /// Ownership generation observed by this decision, passed back to
+    /// [`clear_owns_disable_if_current`] after the re-enable so a marker
+    /// (re)set by another process since this write is never clobbered.
+    pub disable_generation: u64,
+}
+
+/// Remove `current_proc` from the holder set.
 ///
 /// The ownership marker is intentionally left set here: it is cleared only once
 /// the caller confirms sleep was actually re-enabled (via
-/// [`set_owns_disable`]), so a crash between this write and the re-enable is
-/// recoverable. Signalling on "no live holders remain && we own the disable" —
-/// rather than only when this specific caller removed the last live holder —
-/// means a stale entry pruned to empty by an unrelated Release still triggers
-/// the re-enable instead of stranding sleep disabled. An empty lockfile with no
-/// marker (e.g. a manual `pmset disablesleep`) never signals a re-enable.
+/// [`clear_owns_disable_if_current`]), so a crash between this write and the
+/// re-enable is recoverable. Signalling on "no live holders remain && we own
+/// the disable" — rather than only when this specific caller removed the last
+/// live holder — means a stale entry pruned to empty by an unrelated Release
+/// still triggers the re-enable instead of stranding sleep disabled. An empty
+/// lockfile with no marker (e.g. a manual `pmset disablesleep`) never signals a
+/// re-enable.
 pub(crate) fn release(
     verbose: bool,
     path: &Path,
     process_checker: &ProcessChecker,
     current_proc: &ProcessId,
-) -> Result<bool, std::io::Error> {
+) -> Result<ReleaseOutcome, std::io::Error> {
     mutate_lockfile(
         verbose,
         path,
         process_checker,
         Some(current_proc),
         |state| {
-            state.holders.remove(current_proc);
-            Ok(state.holders.is_empty() && state.owns_disable)
+            let removed = state.holders.remove(current_proc);
+            Ok(ReleaseOutcome {
+                should_enable: state.holders.is_empty() && state.owns_disable,
+                removed,
+                disable_generation: state.disable_generation,
+            })
         },
     )
 }
 
 /// Set or clear the ownership marker without otherwise changing the holder set
-/// (dead holders are still pruned, as with every locked mutation). Used to clear
-/// the marker after a confirmed re-enable, and to record ownership when a
-/// reconcile re-applies the disable.
+/// (dead holders are still pruned, as with every locked mutation). Setting it
+/// records a *new* ownership generation, invalidating any in-flight clear that
+/// captured the previous one. Used to record ownership when a reconcile
+/// (re-)applies the disable; clearing after a confirmed re-enable goes through
+/// [`clear_owns_disable_if_current`] instead.
 pub(crate) fn set_owns_disable(
     verbose: bool,
     path: &Path,
@@ -290,6 +360,36 @@ pub(crate) fn set_owns_disable(
 ) -> Result<(), std::io::Error> {
     mutate_lockfile(verbose, path, process_checker, None, |state| {
         state.owns_disable = owns;
+        if owns {
+            state.disable_generation += 1;
+        }
+        Ok(())
+    })
+}
+
+/// Clear the ownership marker only if no live holders remain *and* the
+/// ownership generation still matches the one the caller captured with its
+/// re-enable decision — both re-checked under the same exclusive lock as the
+/// write.
+///
+/// An unconditional clear is not safe after the caller's unlocked kernel
+/// toggle: another process sharing the lockfile (the CLI fallback has no single
+/// daemon) can take a first hold — re-setting the marker — between the caller's
+/// re-enable decision and this write, and a concurrent reconcile that re-applies
+/// the disable re-records ownership without adding any holder at all. Either
+/// write bumps the generation, so this clear backs off; clobbering the fresh
+/// marker would leave the new disable with no evidence of ownership, stranding
+/// sleep disabled with zero holders.
+pub(crate) fn clear_owns_disable_if_current(
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+    observed_generation: u64,
+) -> Result<(), std::io::Error> {
+    mutate_lockfile(verbose, path, process_checker, None, |state| {
+        if state.holders.is_empty() && state.disable_generation == observed_generation {
+            state.owns_disable = false;
+        }
         Ok(())
     })
 }
@@ -307,6 +407,9 @@ pub(crate) struct PruneOutcome {
     pub had_entries: bool,
     /// Whether caffeinate2 owns the current sleep disable (the durable marker).
     pub owns_disable: bool,
+    /// Ownership generation observed by this prune; a re-enable decided from
+    /// this snapshot passes it to [`clear_owns_disable_if_current`].
+    pub disable_generation: u64,
 }
 
 /// Prune stale lockfile entries under an exclusive lock and report the live
@@ -324,11 +427,13 @@ pub(crate) fn prune_lockfile(
     prune_stale_holders(&mut state.holders, verbose, process_checker, None);
     let live = state.holders.len();
     let owns_disable = state.owns_disable;
+    let disable_generation = state.disable_generation;
     write_state(&mut file, &state)?;
     Ok(PruneOutcome {
         live,
         had_entries,
         owns_disable,
+        disable_generation,
     })
 }
 
@@ -416,9 +521,10 @@ mod tests {
         let current_proc = proc(100, 123);
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(should_toggle);
+        assert!(outcome.first_holder);
+        assert!(!outcome.prior_owns_disable);
         assert_eq!(read_entries(&lock_path), vec![current_proc]);
         // Acquiring the first holder records ownership of the disable.
         assert!(owns_disable(&lock_path));
@@ -441,14 +547,15 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.first_holder);
         assert_eq!(read_entries(&lock_path), vec![current_proc, other_proc]);
 
-        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.should_enable);
+        assert!(outcome.removed);
         assert_eq!(read_entries(&lock_path), vec![other_proc]);
 
         std::fs::remove_file(&lock_path).unwrap();
@@ -472,9 +579,9 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.first_holder);
         assert_eq!(read_entries(&lock_path), vec![current_proc, live_proc]);
 
         std::fs::remove_file(&lock_path).unwrap();
@@ -493,9 +600,10 @@ mod tests {
         }
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(should_toggle);
+        assert!(outcome.should_enable);
+        assert!(outcome.removed);
         assert!(read_entries(&lock_path).is_empty());
         // The marker is left set until the caller confirms the re-enable.
         assert!(owns_disable(&lock_path));
@@ -512,9 +620,10 @@ mod tests {
         let current_proc = proc(100, 123);
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.should_enable);
+        assert!(!outcome.removed);
         let _ = std::fs::remove_file(&lock_path);
     }
 
@@ -532,9 +641,10 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
 
-        let should_toggle = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.should_enable);
+        assert!(!outcome.removed);
         assert_eq!(read_entries(&lock_path), vec![other_proc]);
         let _ = std::fs::remove_file(&lock_path);
     }
@@ -592,9 +702,11 @@ mod tests {
         }
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle = release(false, &lock_path, &process_checker, &unrelated).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &unrelated).unwrap();
 
-        assert!(should_toggle);
+        assert!(outcome.should_enable);
+        // The unrelated caller never held; only the pruning emptied the set.
+        assert!(!outcome.removed);
         assert!(read_entries(&lock_path).is_empty());
 
         std::fs::remove_file(&lock_path).unwrap();
@@ -614,9 +726,9 @@ mod tests {
         }
         let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
 
-        let should_toggle = release(false, &lock_path, &process_checker, &unrelated).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &unrelated).unwrap();
 
-        assert!(!should_toggle);
+        assert!(!outcome.should_enable);
 
         std::fs::remove_file(&lock_path).unwrap();
     }
@@ -637,6 +749,140 @@ mod tests {
 
         assert!(!owns_disable(&lock_path));
         assert_eq!(read_entries(&lock_path), vec![holder]);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn acquire_reports_preexisting_marker() {
+        // A failed re-enable leaves the marker set with no holders; a new
+        // acquire must report that the marker pre-existed so a rollback can
+        // restore it instead of clearing it.
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        {
+            let mut file = File::create(&lock_path).unwrap();
+            writeln!(file, "{DISABLE_MARKER}").unwrap();
+        }
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        let outcome = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+
+        assert!(outcome.first_holder);
+        assert!(outcome.prior_owns_disable);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn clear_owns_disable_if_current_clears_when_generation_matches() {
+        // The normal release flow: acquire, release-to-empty, confirmed
+        // re-enable, then the clear with the generation the release observed.
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        assert!(outcome.should_enable);
+
+        clear_owns_disable_if_current(
+            false,
+            &lock_path,
+            &process_checker,
+            outcome.disable_generation,
+        )
+        .unwrap();
+
+        assert!(!owns_disable(&lock_path));
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn clear_owns_disable_if_current_keeps_marker_while_held() {
+        // Models the cross-process race: a first hold (which re-set the marker)
+        // landed between the caller's re-enable decision and this clear. The
+        // marker belongs to that holder now and must survive — the new holder
+        // fails both the empty-holders check and the generation check.
+        let lock_path = temp_lock_path();
+        let releaser = proc(100, 123);
+        let holder = proc(200, 456);
+        let process_checker =
+            |pid: i32, start_time: ProcessStartTime| pid == 200 && start_time.seconds == 456;
+
+        acquire(false, &lock_path, &process_checker, &releaser).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &releaser).unwrap();
+        assert!(outcome.should_enable);
+        // The concurrent first hold lands before the releaser's clear.
+        acquire(false, &lock_path, &process_checker, &holder).unwrap();
+
+        clear_owns_disable_if_current(
+            false,
+            &lock_path,
+            &process_checker,
+            outcome.disable_generation,
+        )
+        .unwrap();
+
+        assert!(owns_disable(&lock_path));
+        assert_eq!(read_entries(&lock_path), vec![holder]);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn clear_owns_disable_if_current_keeps_marker_on_stale_generation() {
+        // Models the holder-less cross-process race: a concurrent reconcile
+        // re-applied the disable and re-recorded ownership (bumping the
+        // generation) after the caller's re-enable decision — no holder entry
+        // involved, so only the generation check can save the marker.
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        assert!(outcome.should_enable);
+        // The concurrent reconcile's ownership re-record.
+        set_owns_disable(false, &lock_path, &process_checker, true).unwrap();
+
+        clear_owns_disable_if_current(
+            false,
+            &lock_path,
+            &process_checker,
+            outcome.disable_generation,
+        )
+        .unwrap();
+
+        assert!(owns_disable(&lock_path));
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn generation_survives_marker_clear() {
+        // The generation must be persisted past a marker clear: if it reset
+        // with the marker, a later first hold could recycle a value a stale
+        // observer captured and its clear would wrongly match (ABA).
+        let lock_path = temp_lock_path();
+        let current_proc = proc(100, 123);
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| false;
+
+        let first = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+        let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
+        clear_owns_disable_if_current(
+            false,
+            &lock_path,
+            &process_checker,
+            outcome.disable_generation,
+        )
+        .unwrap();
+        assert!(!owns_disable(&lock_path));
+
+        let second = acquire(false, &lock_path, &process_checker, &current_proc).unwrap();
+
+        assert!(second.disable_generation > first.disable_generation);
 
         std::fs::remove_file(&lock_path).unwrap();
     }
