@@ -20,9 +20,9 @@ use std::{fmt, mem::MaybeUninit};
 // `IOPMSetSystemPowerSetting` is not exposed by objc2-io-kit, so it is declared
 // here by hand. It is a stable public IOKit C entry point (it is what
 // `pmset disablesleep` ultimately drives); the signature matches the SDK
-// header (`CFStringRef`, `CFBooleanRef`, returning `IOReturn`/`i32`). The
-// `set_sleep_disabled` smoke test exercises it as an `#[ignore]`d integration
-// test, since it mutates a system-wide power setting and needs root.
+// header (`CFStringRef`, `CFBooleanRef`, returning `IOReturn`/`i32`). Toggling
+// it mutates a system-wide power setting and needs root, so it has no unit
+// coverage; `EntirelyCoordinator` owns its lifecycle in production.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> i32;
@@ -205,6 +205,11 @@ pub fn declare_user_activity(verbose: bool) -> Result<UserActivityHold, u32> {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(code) = declare_user_activity_once(&mut current, verbose) {
                         tracing::warn!("Failed to refresh user activity assertion: {code:X}");
+                        // A failed declare may have overwritten `current` (IOKit
+                        // takes the id as an in/out parameter); restore the
+                        // last-known-good id so the next refresh reuses it rather
+                        // than seeding a fresh, never-released assertion.
+                        current = thread_id.load(Ordering::SeqCst);
                     } else {
                         // Publish the (possibly updated) id so Drop releases it.
                         thread_id.store(current, Ordering::SeqCst);
@@ -220,25 +225,6 @@ pub fn declare_user_activity(verbose: bool) -> Result<UserActivityHold, u32> {
         stop_tx: Some(stop_tx),
         refresher: Some(refresher),
     })
-}
-
-pub struct SleepDisabledGuard {
-    verbose: bool,
-}
-
-impl Drop for SleepDisabledGuard {
-    fn drop(&mut self) {
-        let _ = set_sleep_disabled(false, self.verbose);
-    }
-}
-
-///
-/// # Errors
-///
-/// Returns an `IOKit` error code if sleep cannot be disabled.
-pub fn disable_sleep(verbose: bool) -> Result<SleepDisabledGuard, u32> {
-    set_sleep_disabled(true, verbose)?;
-    Ok(SleepDisabledGuard { verbose })
 }
 
 ///
@@ -421,7 +407,6 @@ fn dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use objc2_io_kit::kIOReturnNotPrivileged;
 
     #[test]
     fn test_assertion_type_names_match_iokit_names() {
@@ -471,26 +456,6 @@ mod tests {
             "Declared user activity with ID: {}",
             assertion.id.load(Ordering::SeqCst)
         );
-    }
-
-    #[test]
-    #[ignore = "changes the system SleepDisabled power setting"]
-    fn smoke_disable_sleep() {
-        match disable_sleep(true) {
-            Ok(guard) => {
-                println!("Successfully disabled sleep");
-                drop(guard);
-            }
-            Err(code) => {
-                if code == kIOReturnNotPrivileged {
-                    println!(
-                        "Insufficient privileges to disable sleep (expected in non-root tests)"
-                    );
-                } else {
-                    panic!("Failed to disable sleep with unexpected code: {code:X}");
-                }
-            }
-        }
     }
 
     #[test]

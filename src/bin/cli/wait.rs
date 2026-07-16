@@ -53,17 +53,67 @@ pub fn misquoted_duration_error(args: &Args, command_explicitly_separated: bool)
 
     const DURATION_WORDS: &[&str] = &[
         "hour", "hours", "hr", "hrs", "minute", "minutes", "min", "mins", "second", "seconds",
-        "sec", "secs", "day", "days", "week", "weeks", "month", "months", "year", "years", "and",
+        "sec", "secs", "day", "days", "week", "weeks", "month", "months", "year", "years",
     ];
 
-    let timeout_is_lone_number = timeout.parse::<u64>().is_ok();
-    let command_has_duration_words = command.iter().any(|word| {
-        let lower = word.to_lowercase();
-        DURATION_WORDS.contains(&lower.as_str())
-            || matches!(word.as_str(), "m" | "h" | "d" | "w" | "s")
-    });
+    let is_unit = |lower: &str| -> bool {
+        DURATION_WORDS.contains(&lower) || matches!(lower, "m" | "h" | "d" | "w" | "s")
+    };
 
-    if timeout_is_lone_number && command_has_duration_words {
+    // Whether a token fits a duration continuation, and if so (`Some`) whether
+    // it carries an actual unit. Unit words and the `and` connector fit as-is;
+    // a digit-led token fits only when every letter run in it is a unit (`30`,
+    // `30m`, `1h30m`). A letter run that is no unit (`7z`) marks a command
+    // name, and a bare number (`2048`) carries no unit — without a unit
+    // somewhere in the tail, the "command" is just a program with a numeric
+    // name, not a spilled duration.
+    let duration_shape = |word: &str| -> Option<bool> {
+        let lower = word.to_lowercase();
+        if is_unit(&lower) {
+            return Some(true);
+        }
+        if lower == "and" {
+            return Some(false);
+        }
+        if !lower.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut has_unit = false;
+        let mut rest = lower.as_str();
+        while !rest.is_empty() {
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(rest.len());
+            rest = &rest[digits..];
+            if rest.is_empty() {
+                break;
+            }
+            let letters = rest
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(rest.len());
+            if letters == 0 || !is_unit(&rest[..letters]) {
+                return None;
+            }
+            has_unit = true;
+            rest = &rest[letters..];
+        }
+        Some(has_unit)
+    };
+
+    // Requiring a digit somewhere keeps bare unit words from tripping the check:
+    // `caffeinate2 -t 300 w` (the w(1) tool) is duration-shaped but has no
+    // number, so it is a real command, not a botched duration.
+    let timeout_is_lone_number = timeout.parse::<u64>().is_ok();
+    let command_is_duration_continuation = command
+        .iter()
+        .map(|word| duration_shape(word))
+        .collect::<Option<Vec<bool>>>()
+        .is_some_and(|units| units.contains(&true))
+        && command
+            .iter()
+            .any(|word| word.chars().any(|c| c.is_ascii_digit()));
+
+    if timeout_is_lone_number && command_is_duration_continuation {
         let suggested = format!("{timeout} {}", command.join(" "));
         return Some(format!(
             "Error: multi-word durations must be quoted (did you mean: caffeinate2 -t \"{suggested}\")?"
@@ -222,13 +272,41 @@ mod tests {
     }
 
     #[test]
-    fn duration_word_command_after_separator_is_not_flagged() {
-        // The documented escape hatch `caffeinate2 -t 3600 -- hour` runs a
-        // command that happens to be a duration word on purpose. The `--`
-        // separator (reported via the flag) must suppress the misquote check.
-        let args = parse_args(&["caffeinate2", "-t", "3600", "--", "hour"]);
+    fn duration_continuation_after_separator_is_not_flagged() {
+        // `caffeinate2 -t 1 -- 30 minutes` runs a command that happens to look
+        // like a duration continuation on purpose. The `--` separator (reported
+        // via the flag) must suppress the misquote check.
+        let args = parse_args(&["caffeinate2", "-t", "1", "--", "30", "minutes"]);
         assert!(misquoted_duration_error(&args, true).is_none());
         // Without the separator the same tokens look like a misquoted duration.
+        assert!(misquoted_duration_error(&args, false).is_some());
+    }
+
+    #[test]
+    fn legitimate_commands_after_numeric_timeout_are_not_flagged() {
+        // A bare unit-word command (`w`, the load-average tool) is duration-shaped
+        // but carries no number, so it is not a misquoted duration.
+        let args = parse_args(&["caffeinate2", "-t", "300", "w"]);
+        assert!(misquoted_duration_error(&args, false).is_none());
+        // `echo a and b` contains a non-duration token (`echo`), so even though
+        // it has `and` it is a real command, not a botched duration.
+        let args = parse_args(&["caffeinate2", "-t", "3600", "echo", "a", "and", "b"]);
+        assert!(misquoted_duration_error(&args, false).is_none());
+    }
+
+    #[test]
+    fn digit_led_command_names_are_not_flagged() {
+        // A bare number is a plausible program name (the 2048 game), not a
+        // duration continuation: a spilled duration always carries a unit.
+        let args = parse_args(&["caffeinate2", "-t", "300", "2048"]);
+        assert!(misquoted_duration_error(&args, false).is_none());
+        // A digit-led name whose letters are no unit (`7z`) is a command.
+        let args = parse_args(&["caffeinate2", "-t", "60", "7z"]);
+        assert!(misquoted_duration_error(&args, false).is_none());
+        // ... whereas a real unit suffix still reads as a spilled duration.
+        let args = parse_args(&["caffeinate2", "-t", "1", "30m"]);
+        assert!(misquoted_duration_error(&args, false).is_some());
+        let args = parse_args(&["caffeinate2", "-t", "1", "1h30m"]);
         assert!(misquoted_duration_error(&args, false).is_some());
     }
 

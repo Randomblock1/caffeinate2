@@ -97,7 +97,7 @@ Supported units include seconds, minutes, hours, days, weeks, months, and years,
 # Correct: 90 minutes
 caffeinate2 -t "1 hour and 30 minutes"
 
-# Wrong: 1 second timeout, then runs command "hour and 30 minutes"
+# Wrong: rejected — the trailing words look like a misquoted duration
 caffeinate2 -t 1 hour and 30 minutes
 ```
 
@@ -123,14 +123,14 @@ Run `caffeinate2-tray` after installing with `--features full`.
 
 - **Left click:** toggle the selected sleep mode on/off.
 - **Right click:** open the menu:
-  - **Mode** — Display, Disk, System, System on AC, User active, or Entirely.
+  - **Mode** — Display, Disk, System, System (on AC), User active, or Entirely.
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
-  - **Until app quits** — pick one or more running apps, or **Choose application…** for any `.app`.
+  - **Wait for apps…** — pick one or more running apps, or use the **Choose application** picker (button **Choose**) for any `.app`.
   - **Upgrade other apps' sleep prevention** — see below.
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
-When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Until app quits** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active.
+When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active.
 
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 
@@ -153,7 +153,7 @@ Unsigned binaries may require running from Terminal once (right-click → Open) 
 ### Details
 
 - **Time limit countdown:** changing the time limit while sleep prevention is active restarts the countdown from that moment — it is not measured from when the session started.
-- **Until app quits matching:** the target is remembered by bundle ID (for example `Codex.app` stays matched across restarts).
+- **Wait for apps matching:** the target is remembered by bundle ID (for example `Codex.app` stays matched across restarts).
 - **Upgrade release delay:** caffeinate2 releases its Entirely hold about 20 seconds after the external assertion goes away.
 - **Upgrade menu display:** a single named app appears as one line; several collapse into an expandable **Upgrading N apps** submenu (the tooltip lists them too). When an app's name is unavailable, a generic **Upgrading external app** line is shown instead.
 - **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." Reasons cover the macOS power daemon (`powerd`, shown as _system process_) and display-only assertions from video players (_display only_). caffeinate2 never reacts to its own holds.

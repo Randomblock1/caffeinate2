@@ -256,6 +256,20 @@ fn run_command_mode(
     exit_code.store(code, Ordering::Relaxed);
 }
 
+/// Timeout to hand [`wait_for_pid`] when `-w` is combined with `-t`.
+///
+/// `None` means "wait indefinitely for the PID" (`-w` with no `-t`). `Some(dur)`
+/// bounds the wait. A zero `-t` maps to `Some(0)` — an immediate `TimedOut` from
+/// kevent — rather than `None`, so `-t 0 -w PID` times out at once instead of
+/// blocking until the PID exits.
+#[cfg(target_os = "macos")]
+fn waitfor_timeout(
+    timeout_present: bool,
+    duration: jiff::SignedDuration,
+) -> Option<jiff::SignedDuration> {
+    timeout_present.then_some(duration)
+}
+
 #[cfg(target_os = "macos")]
 fn run_timed_wait_mode(
     args: &Args,
@@ -332,16 +346,15 @@ fn run_timed_wait_mode(
     }
 
     let pid = args.waitfor.expect("PID should be present");
-    let timeout_duration = if timeout && duration > jiff::SignedDuration::ZERO {
-        match std::time::Duration::try_from(duration) {
+    let timeout_duration = match waitfor_timeout(timeout, duration) {
+        Some(d) => match std::time::Duration::try_from(d) {
             Ok(d) => Some(d),
             Err(_) => {
                 eprintln!("Error: timeout is too large");
                 release_active_and_exit(active, 1);
             }
-        }
-    } else {
-        None
+        },
+        None => None,
     };
 
     match wait_for_pid(pid, timeout_duration, args.verbose) {
@@ -708,6 +721,20 @@ mod tests {
         }
         let active = sleep_modes.enable_all(false, true).unwrap();
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn zero_timeout_with_waitfor_arms_immediate_timeout() {
+        use crate::waitfor_timeout;
+        let zero = jiff::SignedDuration::ZERO;
+        // `-t 0 -w PID`: a zero timeout must arm an immediate kevent timeout,
+        // not `None` (which would block until the PID exits).
+        assert_eq!(waitfor_timeout(true, zero), Some(zero));
+        // `-w PID` with no `-t`: wait indefinitely for the PID.
+        assert_eq!(waitfor_timeout(false, zero), None);
+        // `-t 30s -w PID`: bounded wait.
+        let thirty = jiff::SignedDuration::from_secs(30);
+        assert_eq!(waitfor_timeout(true, thirty), Some(thirty));
     }
 
     #[test]

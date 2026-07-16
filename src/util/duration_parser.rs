@@ -6,8 +6,6 @@ pub enum DurationParseError {
     Invalid,
     #[error("Error: Timeout is too large!")]
     TooLarge,
-    #[error("Error: timeout must be positive")]
-    NotPositive,
 }
 
 /// Parse a timeout duration for the CLI.
@@ -39,27 +37,18 @@ pub fn parse_duration(duration: &str) -> Result<SignedDuration, DurationParseErr
     let duration = trimmed.replace(',', "");
 
     match parse_human_duration(&duration) {
-        Ok(std_duration) => finish_parse(
-            SignedDuration::try_from(std_duration).map_err(|_| DurationParseError::TooLarge)?,
-        ),
+        Ok(std_duration) => {
+            SignedDuration::try_from(std_duration).map_err(|_| DurationParseError::TooLarge)
+        }
         Err(humantime::DurationError::NumberOverflow) => Err(DurationParseError::TooLarge),
-        Err(_) => finish_parse(
-            SignedDuration::from_secs(
-                duration
-                    .parse::<u64>()
-                    .map_err(|_| DurationParseError::Invalid)?
-                    .try_into()
-                    .map_err(|_| DurationParseError::TooLarge)?,
-            ),
-        ),
+        Err(_) => Ok(SignedDuration::from_secs(
+            duration
+                .parse::<u64>()
+                .map_err(|_| DurationParseError::Invalid)?
+                .try_into()
+                .map_err(|_| DurationParseError::TooLarge)?,
+        )),
     }
-}
-
-fn finish_parse(duration: SignedDuration) -> Result<SignedDuration, DurationParseError> {
-    if duration < SignedDuration::ZERO {
-        return Err(DurationParseError::NotPositive);
-    }
-    Ok(duration)
 }
 
 fn parse_human_duration(duration: &str) -> Result<std::time::Duration, humantime::DurationError> {
@@ -137,23 +126,35 @@ pub fn format_duration_human(duration: SignedDuration) -> String {
     parts.join(" ")
 }
 
+/// Split a remaining-seconds count into whole hours and minutes, rounding the
+/// minutes *up* so any partial minute reads as a full one. Shared by the
+/// menu-bar title and the tooltip so the two simultaneously-visible labels
+/// always agree at minute granularity (a floor in one and a ceil in the other
+/// disagree by a full minute for almost the whole countdown).
+const fn ceil_hours_minutes(secs: u64) -> (u64, u64) {
+    let total_minutes = secs.div_ceil(60);
+    (total_minutes / 60, total_minutes % 60)
+}
+
 /// Compact remaining-time label for tray tooltips (e.g. "1h 30m remaining").
+/// Minutes are rounded *up* to match the menu-bar title (see
+/// [`format_countdown_minutes`]); sub-minute values keep second granularity,
+/// which is a finer resolution than the title, not a disagreement with it.
 #[must_use]
 pub fn format_remaining_secs(secs: u64) -> String {
-    let hours = secs / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
+    if secs < 60 {
+        return format!("{secs}s remaining");
+    }
 
+    let (hours, minutes) = ceil_hours_minutes(secs);
     if hours > 0 {
         if minutes > 0 {
             format!("{hours}h {minutes}m remaining")
         } else {
             format!("{hours}h remaining")
         }
-    } else if minutes > 0 {
-        format!("{minutes}m remaining")
     } else {
-        format!("{seconds}s remaining")
+        format!("{minutes}m remaining")
     }
 }
 
@@ -168,9 +169,7 @@ pub fn format_remaining_secs(secs: u64) -> String {
 /// app controls (title set, view draw, CA commit) is provably metronomic.
 #[must_use]
 pub fn format_countdown_minutes(secs: u64) -> String {
-    let total_minutes = secs.div_ceil(60);
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
+    let (hours, minutes) = ceil_hours_minutes(secs);
 
     if hours > 0 {
         if minutes > 0 {
@@ -226,9 +225,25 @@ mod tests {
 
     #[test]
     fn format_remaining_secs_display() {
+        // Sub-minute keeps second granularity.
         assert_eq!(format_remaining_secs(45), "45s remaining");
-        assert_eq!(format_remaining_secs(90), "1m remaining");
-        assert_eq!(format_remaining_secs(3661), "1h 1m remaining");
+        // Minute granularity rounds up, matching the menu-bar title.
+        assert_eq!(format_remaining_secs(90), "2m remaining");
+        assert_eq!(format_remaining_secs(3661), "1h 2m remaining");
+    }
+
+    #[test]
+    fn title_and_tooltip_agree_at_minute_granularity() {
+        // The menu-bar title and the tooltip are visible at the same time; once
+        // past the sub-minute range they must render the identical hours/minutes
+        // (the tooltip merely appends " remaining"), never off by a minute.
+        for secs in [60, 61, 90, 1799, 1800, 3599, 3600, 3601, 3661, 5400] {
+            assert_eq!(
+                format_remaining_secs(secs),
+                format!("{} remaining", format_countdown_minutes(secs)),
+                "secs={secs}"
+            );
+        }
     }
 
     #[test]
