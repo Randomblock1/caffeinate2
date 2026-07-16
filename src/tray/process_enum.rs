@@ -30,7 +30,6 @@ fn exec_path_cache() -> &'static Mutex<Option<(Instant, Vec<String>)>> {
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub pid: i32,
-    pub ppid: i32,
     pub uid: u32,
     /// Full executable path (`proc_pidpath`); empty if it could not be read.
     pub exec_path: String,
@@ -95,7 +94,7 @@ fn cstr_field(bytes: &[i8]) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
-/// Every live process with pid/ppid/uid and its executable path. Drops PIDs
+/// Every live process with pid/uid and its executable path. Drops PIDs
 /// whose `proc_pidinfo` fails (exited mid-scan, or protected) — those are never
 /// watchable targets.
 #[must_use]
@@ -108,7 +107,6 @@ pub fn list_processes() -> Vec<ProcInfo> {
         };
         out.push(ProcInfo {
             pid,
-            ppid: info.pbi_ppid as i32,
             uid: info.pbi_uid,
             exec_path: proc_path(pid),
             comm: cstr_field(&info.pbi_name),
@@ -306,12 +304,6 @@ fn new_row(proc: &ProcInfo, bundle: Option<BundleRef>, first: ChildProc) -> Prog
         target,
         procs: vec![first],
     }
-}
-
-/// Whether a single watch target still has a live process.
-#[must_use]
-pub fn target_running(target: &WatchTarget) -> bool {
-    any_target_running(std::slice::from_ref(target))
 }
 
 /// Whether *any* of the targets is still running.

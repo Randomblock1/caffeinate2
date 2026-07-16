@@ -249,15 +249,10 @@ pub fn dispatch_command(
         }
         MenuCommand::ToggleUpgradeExternal => {
             let enable = !state.menu_snapshot().upgrade_external;
-            // Enabling installs the helper if needed (admin prompt + socket
-            // wait); surface that in the tooltip before the blocking work.
-            if enable {
-                let _ = tray.set_tooltip(Some("caffeinate2 (enabling sleep upgrade…)"));
-                state.invalidate_tooltip();
-                crate::tray::macos_activation::pump_event_loop(Some(
-                    std::time::Duration::from_millis(1),
-                ));
-            }
+            // Enabling may install the privileged helper first, but that now runs
+            // on a background thread (see `set_upgrade_external`), so this returns
+            // promptly; `set_icon` below repaints the tooltip ("installing
+            // helper…" while the install is in flight).
             match state.set_upgrade_external(enable) {
                 Ok(()) => {
                     // Poll now so an already-present external assertion is

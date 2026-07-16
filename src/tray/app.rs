@@ -4,7 +4,7 @@ use crate::tray::menu::{
     MenuAction, MenuHandles, build_menu, handle_menu_event, install_menu, sync_menu_to_snapshot,
 };
 use crate::tray::single_instance;
-use crate::tray::state::{AppState, PendingEnableOutcome};
+use crate::tray::state::{AppState, PendingEnableOutcome, PendingInstallOutcome};
 use crate::tray::tray_icons;
 use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use objc2_foundation::MainThreadMarker;
@@ -41,14 +41,46 @@ fn poll_pending_enable(state: &mut AppState, tray: &tray_icon::TrayIcon, handles
             // currently shows; re-sync the checkboxes to the committed state.
             sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
-        PendingEnableOutcome::Failed(error) => {
-            eprintln!("{error}");
+        PendingEnableOutcome::Failed {
+            error,
+            started_by_upgrade,
+        } => {
             state.set_icon(tray);
-            state.show_error_tooltip(tray, &error.to_string());
+            // Background (upgrade-watcher) failures are already logged,
+            // rate-limited, in poll_pending_enable and must not raise the
+            // user-facing error tooltip, which is reserved for explicit actions.
+            if !started_by_upgrade {
+                eprintln!("{error}");
+                state.show_error_tooltip(tray, &error.to_string());
+            }
             // A failed mode switch rolled `config.mode` back; the menu checkbox
             // was optimistically moved to the failed target when the command ran
             // (muda auto-toggles, then dispatch_command re-synced to the target),
             // so re-sync it to the rolled-back state here.
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
+        }
+    }
+}
+
+fn poll_pending_install(state: &mut AppState, tray: &tray_icon::TrayIcon, handles: &MenuHandles) {
+    match state.poll_pending_install() {
+        PendingInstallOutcome::Idle | PendingInstallOutcome::Pending => {}
+        PendingInstallOutcome::Installed => {
+            // Upgrade any already-present external assertion right away rather
+            // than waiting for the next poll interval.
+            state.poll_upgrade();
+            state.set_icon(tray);
+            // The watcher just committed `upgrade_external`; re-sync the checkbox
+            // (a menu rebuild from `menu_dirty`, if any, happens later in the
+            // loop and also reflects it).
+            sync_menu_to_snapshot(handles, &state.menu_snapshot());
+        }
+        PendingInstallOutcome::Failed(error) => {
+            eprintln!("{error}");
+            state.set_icon(tray);
+            state.show_error_tooltip(tray, &error.to_string());
+            // The install did not commit; re-sync so the optimistically-checked
+            // box (muda auto-toggle) returns to unchecked.
             sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
     }
@@ -117,10 +149,11 @@ pub fn run() -> Result<(), TrayError> {
         }
 
         poll_pending_enable(&mut state, &tray, &handles);
+        poll_pending_install(&mut state, &tray, &handles);
 
         if poll_stop_conditions(&mut state) {
             state.set_icon(&tray);
-        } else if state.is_on() || state.is_enabling() {
+        } else if state.is_on() || state.is_enabling() || state.is_installing() {
             state.update_tooltip(&tray);
         }
 

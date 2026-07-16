@@ -1,3 +1,4 @@
+use crate::entirely::error::InstallError;
 use crate::entirely::helper_ipc::HelperClient;
 use crate::entirely::install;
 use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
@@ -151,8 +152,40 @@ pub enum PendingEnableOutcome {
     Pending,
     /// The hold was acquired and a session committed.
     Started,
-    /// Acquisition failed; carries the error for the UI.
-    Failed(EnableError),
+    /// Acquisition failed; carries the error for the UI. `started_by_upgrade`
+    /// marks a background (watcher) enable, whose failures are logged
+    /// (rate-limited) in [`AppState::poll_pending_enable`] and must not raise a
+    /// user-facing error tooltip.
+    Failed {
+        error: EnableError,
+        started_by_upgrade: bool,
+    },
+}
+
+/// A privileged-helper install running on a background thread. Installing the
+/// helper prompts for an admin password (a blocking `osascript` dialog), so it
+/// must never run on the UI thread; the worker delivers the result back over
+/// `rx` and wakes the event loop, which commits it via
+/// [`AppState::poll_pending_install`].
+struct PendingInstall {
+    rx: mpsc::Receiver<Result<(), InstallError>>,
+    /// Set when the watcher was toggled off while the install was still
+    /// running. The admin dialog can't be revoked, so the worker keeps going
+    /// and its result is discarded; the entry stays tracked so re-enabling
+    /// re-attaches to it instead of stacking a second password dialog.
+    cancelled: bool,
+}
+
+/// Result of polling the in-flight helper install, consumed by the run loop.
+pub enum PendingInstallOutcome {
+    /// No install in flight.
+    Idle,
+    /// Still installing on the background thread.
+    Pending,
+    /// The helper installed and `upgrade_external` was committed.
+    Installed,
+    /// The install failed; carries the error for the UI.
+    Failed(TrayError),
 }
 
 /// Runtime state while sleep prevention is active.
@@ -202,6 +235,9 @@ pub struct AppState {
     session: Option<ActiveTraySession>,
     /// An enable acquiring its hold off the UI thread; `None` when idle.
     pending_enable: Option<PendingEnable>,
+    /// A privileged-helper install running off the UI thread; `None` when idle.
+    /// Set only while enabling the upgrade watcher with the helper missing.
+    pending_install: Option<PendingInstall>,
     /// Decoded on/off tray icons (RGBA + dimensions), cached at startup so an
     /// icon flip never re-decodes the embedded PNG. `None` only if decoding
     /// failed, in which case `show_icon_state` falls back to decoding on use.
@@ -220,6 +256,10 @@ pub struct AppState {
     /// True once an upgrade auto-start failed (e.g. helper denied the hold), so
     /// the watcher logs once and stops retrying until the trigger clears.
     upgrade_failed: bool,
+    /// Last background-enable failure message logged, latched so a helper that
+    /// keeps failing every poll logs once per distinct error rather than on
+    /// every retry. Cleared when an enable succeeds; a changed message re-logs.
+    last_upgrade_error: Option<String>,
     /// Set when the user manually clicks the tray icon: a manual click overrides
     /// the watcher for the rest of the current external-trigger episode, so the
     /// watcher won't immediately re-take a hold the user just dismissed. Reset
@@ -240,6 +280,7 @@ impl AppState {
             config: tray_mode::load_config(),
             session: None,
             pending_enable: None,
+            pending_install: None,
             icon_on_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_ON).ok(),
             icon_off_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_OFF).ok(),
             last_tooltip: None,
@@ -247,6 +288,7 @@ impl AppState {
             start_at_login: install::tray_launch_agent_installed(),
             upgrade_clear_since: None,
             upgrade_failed: false,
+            last_upgrade_error: None,
             upgrade_overridden: false,
             upgrade_ignored: Vec::new(),
             menu_dirty: false,
@@ -259,7 +301,10 @@ impl AppState {
             time_limit_secs: self.config.time_limit_secs,
             wait_for_apps: self.config.wait_for_apps.clone(),
             start_at_login: self.start_at_login,
-            upgrade_external: self.config.upgrade_external,
+            // Show the checkbox checked while a helper install is still pending
+            // (the commit is deferred until it confirms), so the toggle reads as
+            // taken; a failed or cancelled install unchecks it.
+            upgrade_external: self.config.upgrade_external || self.is_installing(),
             upgrading_apps: self
                 .session
                 .as_ref()
@@ -294,6 +339,14 @@ impl AppState {
         self.pending_enable.is_some()
     }
 
+    /// True while the privileged helper is being installed on a background
+    /// thread (enabling the upgrade watcher with the helper missing). The
+    /// tooltip reads "installing helper…" meanwhile. A cancelled install still
+    /// in flight doesn't count: the user toggled it off, so the UI reads idle.
+    pub const fn is_installing(&self) -> bool {
+        matches!(&self.pending_install, Some(pending) if !pending.cancelled)
+    }
+
     /// The mode of the in-flight enable, if any.
     const fn pending_mode(&self) -> Option<SleepMode> {
         match &self.pending_enable {
@@ -305,9 +358,10 @@ impl AppState {
     /// How long to wait before the next loop iteration, or `None` to block
     /// indefinitely until an event arrives.
     pub fn pump_timeout(&self) -> Option<Duration> {
-        // While an enable is in flight, keep cycling so the run loop polls the
-        // worker channel promptly even if its wake-up is missed.
-        if self.pending_enable.is_some() {
+        // While an enable or a helper install is in flight, keep cycling so the
+        // run loop polls the worker channel promptly even if its wake-up is
+        // missed.
+        if self.pending_enable.is_some() || self.pending_install.is_some() {
             return Some(Duration::from_millis(200));
         }
         // A timed session needs ~1s ticks to update the countdown tooltip and
@@ -425,7 +479,9 @@ impl AppState {
             tray.set_title(Some(title.as_deref().unwrap_or("")));
         }
 
-        let tooltip = if self.pending_enable.is_some() {
+        let tooltip = if self.is_installing() {
+            "caffeinate2 (installing helper…)".to_string()
+        } else if self.pending_enable.is_some() {
             if self.pending_mode() == Some(SleepMode::Entirely) {
                 "caffeinate2 (enabling Entirely mode…)".to_string()
             } else {
@@ -621,16 +677,12 @@ impl AppState {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return PendingEnableOutcome::Pending,
             Err(mpsc::TryRecvError::Disconnected) => {
-                // The worker vanished without sending (should not happen);
-                // treat it as a failure so the UI doesn't hang "enabling…".
-                // Apply the same rollback as the Err(error) path so a failed
-                // mode switch doesn't leave config.mode advanced past the hold
-                // that is actually (still) enforced.
-                let pending = self.pending_enable.take().expect("pending enable present");
-                self.rollback_pending_mode(&pending);
-                return PendingEnableOutcome::Failed(EnableError::Ipc(
+                // The worker vanished without sending (should not happen); treat
+                // it as a failure (via the common Err path below, which rolls a
+                // failed mode switch back) so the UI doesn't hang "enabling…".
+                Err(EnableError::Ipc(
                     "enable worker terminated unexpectedly".to_string(),
-                ));
+                ))
             }
         };
         let pending = self.pending_enable.take().expect("pending enable present");
@@ -666,6 +718,9 @@ impl AppState {
                     upgrade_apps: pending.upgrade_apps,
                 });
                 self.last_tooltip = None;
+                // A successful enable clears the background-failure log latch so
+                // a later distinct failure logs again.
+                self.last_upgrade_error = None;
                 if started_by_upgrade || previous_started_by_upgrade {
                     // Rebuild when entering or leaving an upgrade-started session.
                     self.menu_dirty = true;
@@ -674,13 +729,24 @@ impl AppState {
             }
             Err(error) => {
                 self.rollback_pending_mode(&pending);
-                if pending.started_by_upgrade {
+                let started_by_upgrade = pending.started_by_upgrade;
+                if started_by_upgrade {
                     if should_latch_upgrade_failure(&error) {
                         self.upgrade_failed = true;
                     }
-                    eprintln!("upgrade external wakefulness failed: {error}");
+                    // Rate-limit: a broken helper re-arms the enable every poll,
+                    // so log once per distinct error message (until an enable
+                    // succeeds or the message changes) rather than every retry.
+                    let message = error.to_string();
+                    if self.last_upgrade_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("upgrade external wakefulness failed: {error}");
+                        self.last_upgrade_error = Some(message);
+                    }
                 }
-                PendingEnableOutcome::Failed(error)
+                PendingEnableOutcome::Failed {
+                    error,
+                    started_by_upgrade,
+                }
             }
         }
     }
@@ -732,10 +798,11 @@ impl AppState {
         Ok(())
     }
 
-    /// Cancel any in-flight enable and tear down the active session. Used on
-    /// shutdown so holds are released before the process exits.
+    /// Cancel any in-flight enable or helper install and tear down the active
+    /// session. Used on shutdown so holds are released before the process exits.
     pub fn shutdown(&mut self) {
         self.cancel_pending_enable();
+        self.cancel_pending_install();
         self.stop_session();
     }
 
@@ -800,38 +867,29 @@ impl AppState {
         Ok(())
     }
 
-    /// Toggle the upgrade watcher. Enabling installs the privileged helper now
-    /// (so the admin prompt happens on the click, not mid-watch); disabling
-    /// stops any session the watcher started.
+    /// Toggle the upgrade watcher. Enabling needs the privileged helper (upgrades
+    /// use Entirely mode): if it is already installed the watcher turns on now,
+    /// otherwise the install runs on a background thread (the admin-password
+    /// dialog must never block the UI thread) and the watcher commits once the
+    /// install confirms via [`AppState::poll_pending_install`]. Disabling stops
+    /// any session the watcher started and cancels an install still in flight.
     pub fn set_upgrade_external(&mut self, enabled: bool) -> Result<(), TrayError> {
-        let previous = self.config.upgrade_external;
-        if enabled == previous {
-            return Ok(());
-        }
-        // Persist first, commit in RAM on success (see set_mode).
-        let mut new_config = self.config.clone();
-        new_config.upgrade_external = enabled;
-        tray_mode::save_config(&new_config)?;
-        self.config = new_config;
-
-        self.upgrade_clear_since = None;
-        self.upgrade_failed = false;
-        self.upgrade_overridden = false;
-        if enabled {
-            // Upgrades use Entirely mode, which needs the helper. Surface the
-            // admin prompt here rather than on the first external assertion.
-            // launchd then starts the helper asynchronously, so the socket may
-            // not be up immediately — nothing to wait for here; the watcher's
-            // periodic `poll_upgrade` retries the hold once the socket appears.
-            let client = HelperClient::new();
-            if !client.is_available()
-                && let Err(error) = install::install_helper_privileged()
-            {
-                self.config.upgrade_external = previous;
-                let _ = self.save_config();
-                return Err(error.into());
+        if !enabled {
+            // Turning off also cancels an in-flight install (the user dismissed
+            // the toggle mid-prompt); its result is discarded, nothing committed.
+            self.cancel_pending_install();
+            if !self.config.upgrade_external {
+                return Ok(());
             }
-        } else {
+            // Persist first, commit in RAM on success (see set_mode).
+            let mut new_config = self.config.clone();
+            new_config.upgrade_external = false;
+            tray_mode::save_config(&new_config)?;
+            self.config = new_config;
+
+            self.upgrade_clear_since = None;
+            self.upgrade_failed = false;
+            self.upgrade_overridden = false;
             // Drop any "Ignoring…" entries; the menu rebuild removes them.
             if !self.upgrade_ignored.is_empty() {
                 self.upgrade_ignored.clear();
@@ -845,8 +903,108 @@ impl AppState {
                 // stop_session flags the menu dirty so the entries disappear.
                 self.stop_session();
             }
+            return Ok(());
+        }
+
+        // Enabling: a no-op if already on or an install is already in flight.
+        // An install cancelled mid-flight re-attaches instead: its admin dialog
+        // is still up (it can't be revoked), so spawning another would stack a
+        // second password prompt.
+        if self.config.upgrade_external {
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_install.as_mut() {
+            pending.cancelled = false;
+            self.last_tooltip = None;
+            return Ok(());
+        }
+        // Upgrades use Entirely mode, which needs the helper. If it is already
+        // installed, turn the watcher on now; otherwise install it off the UI
+        // thread and defer the commit to `poll_pending_install`. The watcher
+        // stays off until the install confirms, so the persisted config never
+        // claims the watcher is on without the helper present. launchd then
+        // starts the helper asynchronously, so the socket may not be up
+        // immediately — the watcher's `poll_upgrade` retries the hold once it
+        // appears.
+        if HelperClient::new().is_available() {
+            self.commit_upgrade_external_on()?;
+        } else {
+            self.spawn_pending_install();
         }
         Ok(())
+    }
+
+    /// Persist and commit `upgrade_external = true`, clearing the per-episode
+    /// watcher latches. Shared by the synchronous enable (helper already present)
+    /// and the deferred commit once a background install confirms.
+    fn commit_upgrade_external_on(&mut self) -> Result<(), TrayError> {
+        // Persist first, commit in RAM on success (see set_mode).
+        let mut new_config = self.config.clone();
+        new_config.upgrade_external = true;
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
+        self.upgrade_clear_since = None;
+        self.upgrade_failed = false;
+        self.upgrade_overridden = false;
+        Ok(())
+    }
+
+    /// Install the privileged helper on a background thread. The worker reports
+    /// back over `rx` and wakes the event loop; [`AppState::poll_pending_install`]
+    /// commits `upgrade_external` on success or surfaces the error.
+    fn spawn_pending_install(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = install::install_helper_privileged();
+            let _ = tx.send(result);
+            crate::tray::macos_activation::wake_event_loop();
+        });
+        self.pending_install = Some(PendingInstall {
+            rx,
+            cancelled: false,
+        });
+        self.last_tooltip = None;
+    }
+
+    /// Cancel any in-flight helper install; its result is discarded. The worker
+    /// thread keeps running (the admin dialog can't be revoked) but nothing is
+    /// committed when it finishes, and it never blocks shutdown. The entry
+    /// stays tracked (marked cancelled) so a re-enable before the worker
+    /// finishes re-attaches to it rather than opening a second dialog.
+    fn cancel_pending_install(&mut self) {
+        if let Some(pending) = self.pending_install.as_mut() {
+            pending.cancelled = true;
+        }
+    }
+
+    /// Poll the in-flight helper install, committing `upgrade_external` or
+    /// surfacing the error. Called once per run-loop iteration. A cancelled
+    /// install is drained the same way but its result is discarded (no commit,
+    /// no error surfaced — the user already turned the watcher off).
+    pub fn poll_pending_install(&mut self) -> PendingInstallOutcome {
+        let Some(pending) = self.pending_install.as_ref() else {
+            return PendingInstallOutcome::Idle;
+        };
+        let cancelled = pending.cancelled;
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return PendingInstallOutcome::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => Err(InstallError::msg(
+                "helper install worker terminated unexpectedly",
+            )),
+        };
+        self.pending_install = None;
+        if cancelled {
+            return PendingInstallOutcome::Idle;
+        }
+        match result {
+            Ok(()) => match self.commit_upgrade_external_on() {
+                Ok(()) => PendingInstallOutcome::Installed,
+                Err(error) => PendingInstallOutcome::Failed(error),
+            },
+            Err(error) => PendingInstallOutcome::Failed(error.into()),
+        }
     }
 
     /// Poll external assertions and start/stop an upgrade session as needed.
@@ -1144,7 +1302,7 @@ mod tests {
         });
 
         let outcome = state.poll_pending_enable();
-        assert!(matches!(outcome, PendingEnableOutcome::Failed(_)));
+        assert!(matches!(outcome, PendingEnableOutcome::Failed { .. }));
         assert_eq!(state.config.mode, original_mode);
 
         // SAFETY: see the set_var note above.

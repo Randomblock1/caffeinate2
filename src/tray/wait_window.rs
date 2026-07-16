@@ -583,6 +583,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
         )
     };
     cancel.setFrame(rect(WIN_W - MARGIN - 90.0 - 8.0 - 90.0, MARGIN, 90.0, 30.0));
+    // Esc triggers Cancel: the Escape character is the button's key equivalent.
+    cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
     content.addSubview(&cancel);
     let refresh = unsafe {
         NSButton::buttonWithTitle_target_action(

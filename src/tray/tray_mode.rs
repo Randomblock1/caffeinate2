@@ -380,7 +380,7 @@ name = "Example"
         }];
         assert_eq!(
             format_active_tooltip(Some(90), &apps, false, None),
-            "caffeinate2 (1m remaining · until Example quits)"
+            "caffeinate2 (2m remaining · until Example quits)"
         );
         assert_eq!(
             format_active_tooltip(None, &apps, true, None),
