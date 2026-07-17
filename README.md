@@ -119,7 +119,11 @@ Sleep will be disabled indefinitely until you press `Ctrl+C`.
 
 ## Menu bar
 
-Run `caffeinate2-tray` after installing with `--features full`.
+Run `caffeinate2-tray` after installing with `--features full`. To run it in the background instead of occupying the terminal, use `-d` / `--detach`:
+
+`caffeinate2-tray -d`
+
+This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Logs are discarded in this mode (run it in the foreground to see them). Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
 
 - **Left click:** toggle the selected sleep mode on/off.
 - **Right click:** open the menu:
@@ -140,7 +144,7 @@ When a **time limit** is set, left-clicking to start sleep prevention turns it o
 
 Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
 
-**Start at login** writes `~/Library/LaunchAgents/com.randomblock1.caffeinate2-tray.plist` and takes effect at the next login (the tray does not start a second instance immediately). The menu toggle and these CLI flags use the same LaunchAgent:
+**Start at login** writes `~/Library/LaunchAgents/com.randomblock1.caffeinate2-tray.plist` and takes effect at the next login (the tray does not start a second instance immediately). Use `-d` for a one-off background launch right now; use the LaunchAgent to start the tray at every login. The menu toggle and these CLI flags use the same LaunchAgent:
 
 `caffeinate2-tray --install-launch-agent`
 

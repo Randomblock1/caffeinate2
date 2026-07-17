@@ -27,3 +27,5 @@ mod wait_window;
 pub use app::run;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub use error::TrayError;
+#[cfg(all(target_os = "macos", feature = "tray"))]
+pub use single_instance::{InstanceProbe, probe};

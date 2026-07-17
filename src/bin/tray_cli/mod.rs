@@ -1,3 +1,5 @@
+pub mod detach;
+
 use clap::Parser;
 
 /// One-shot LaunchAgent maintenance action selected via an exclusive flag.
@@ -26,6 +28,12 @@ pub struct Args {
     /// Cannot be combined with other options.
     #[arg(long, exclusive = true)]
     pub launch_agent_status: bool,
+
+    /// Detach from the terminal and run in the background.
+    /// Returns control to the shell immediately; the tray keeps running
+    /// after the terminal closes. Logs are discarded in this mode.
+    #[arg(short = 'd', long)]
+    pub detach: bool,
 }
 
 impl Args {
@@ -76,5 +84,31 @@ mod tests {
     fn default_runs_tray_without_maintenance_command() {
         let args = parse_args(&["caffeinate2-tray"]);
         assert_eq!(args.maintenance_command(), None);
+        assert!(!args.detach);
+    }
+
+    #[test]
+    fn detach_parses_without_maintenance_command() {
+        let args = parse_args(&["caffeinate2-tray", "-d"]);
+        assert!(args.detach);
+        assert_eq!(args.maintenance_command(), None);
+
+        let args = parse_args(&["caffeinate2-tray", "--detach"]);
+        assert!(args.detach);
+        assert_eq!(args.maintenance_command(), None);
+    }
+
+    #[test]
+    fn detach_conflicts_with_maintenance_flags() {
+        assert!(
+            Args::try_parse_from(["caffeinate2-tray", "-d", "--install-launch-agent"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from(["caffeinate2-tray", "--install-launch-agent", "-d"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from(["caffeinate2-tray", "-d", "--uninstall-launch-agent"]).is_err()
+        );
+        assert!(Args::try_parse_from(["caffeinate2-tray", "-d", "--launch-agent-status"]).is_err());
     }
 }

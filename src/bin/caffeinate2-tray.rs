@@ -54,6 +54,10 @@ fn main() {
         return;
     }
 
+    if args.detach {
+        tray_cli::detach::spawn_detached_or_exit();
+    }
+
     if let Err(e) = caffeinate2::tray::run() {
         tracing::error!("caffeinate2-tray error: {e:#}");
         std::process::exit(1);

@@ -7,10 +7,65 @@ use nix::unistd::{ftruncate, write};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static INSTANCE_LOCK: OnceLock<Flock<File>> = OnceLock::new();
+
+/// Result of a non-destructive single-instance check.
+pub enum InstanceProbe {
+    Available,
+    Running,
+    Indeterminate(String),
+}
+
+/// Opens (creating if needed) the single-instance lock file. Shared by
+/// `acquire_or_exit` and `probe` so the path and permission choices live once.
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(path)
+}
+
+/// Check whether another tray instance holds the single-instance lock, without
+/// taking ownership: the lock is released immediately, and the lock file's
+/// contents (the owner's PID) are left untouched. Used by the detaching parent
+/// before it spawns a background child whose stderr goes to /dev/null, where
+/// the child's own "already running" message would be invisible.
+pub fn probe() -> InstanceProbe {
+    let path = match lock_path() {
+        Ok(path) => path,
+        Err(error) => return InstanceProbe::Indeterminate(error.to_string()),
+    };
+    let file = match open_lock_file(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            return InstanceProbe::Indeterminate(format!(
+                "could not open lock file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(flock) => {
+            // Nobody holds the lock; release it (drop unlocks and closes) so
+            // the instance we are about to spawn can take it.
+            drop(flock);
+            InstanceProbe::Available
+        }
+        Err((_, Errno::EWOULDBLOCK)) => InstanceProbe::Running,
+        Err((_, error)) => {
+            InstanceProbe::Indeterminate(format!("could not lock {}: {error}", path.display()))
+        }
+    }
+}
 
 fn lock_path() -> Result<PathBuf, crate::tray::error::TrayError> {
     let config = tray_mode::config_path()?;
@@ -30,24 +85,7 @@ pub fn acquire_or_exit() {
             std::process::exit(1);
         }
     };
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "caffeinate2-tray: could not create {}: {error}",
-            parent.display()
-        );
-        std::process::exit(1);
-    }
-
-    let file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(&path)
-    {
+    let file = match open_lock_file(&path) {
         Ok(file) => file,
         Err(error) => {
             eprintln!(
