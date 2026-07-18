@@ -1186,7 +1186,11 @@ mod tests {
     fn silently_ignored_system_processes_are_neither_triggers_nor_listed() {
         let all = [
             assertion(1, "powerd", AssertionType::PreventUserIdleSystemSleep),
-            assertion(2, "runningboardd", AssertionType::PreventUserIdleSystemSleep),
+            assertion(
+                2,
+                "runningboardd",
+                AssertionType::PreventUserIdleSystemSleep,
+            ),
         ];
         let result = classify_external_assertions(&all);
         // These never trigger an upgrade ...
