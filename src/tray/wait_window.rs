@@ -17,11 +17,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSImage,
-    NSImageView, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSScrollView, NSSearchField,
-    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSImage, NSImageView, NSModalResponse, NSModalResponseOK,
+    NSOpenPanel, NSRunningApplication, NSScrollView, NSSearchField, NSTableColumn, NSTableView,
+    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSPoint,
@@ -75,6 +76,9 @@ struct Ivars {
     /// Set once Apply/Cancel/close has reported a result, so the window-close
     /// handler doesn't send a second message.
     decided: Cell<bool>,
+    /// The app that was frontmost before the picker stole focus, so closing
+    /// can hand activation back instead of leaving focus in limbo.
+    previous_app: RefCell<Option<Retained<NSRunningApplication>>>,
     tx: Sender<WaitWindowMsg>,
     table: RefCell<Option<Retained<NSTableView>>>,
     window: RefCell<Option<Retained<NSWindow>>>,
@@ -195,6 +199,14 @@ define_class!(
             }
             let app = NSApplication::sharedApplication(self.ivars().mtm);
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            // Hand focus back explicitly: flipping Regular -> Accessory while
+            // frontmost otherwise strands keyboard focus until the user
+            // clicks another app.
+            if let Some(prev) = self.ivars().previous_app.borrow_mut().take()
+                && !prev.isTerminated()
+            {
+                prev.activateWithOptions(NSApplicationActivationOptions::empty());
+            }
             crate::tray::macos_activation::wake_event_loop();
         }
     }
@@ -218,6 +230,7 @@ impl WaitController {
             search_pending: Cell::new(false),
             last_search_change: RefCell::new(None),
             decided: Cell::new(false),
+            previous_app: RefCell::new(None),
             tx,
             table: RefCell::new(None),
             window: RefCell::new(None),
@@ -364,6 +377,19 @@ impl WaitController {
         }
     }
 
+    /// Record the app that is about to lose focus to the picker, unless it is
+    /// us (re-raising an already-frontmost picker must not clobber the real
+    /// hand-back target).
+    fn remember_frontmost(&self) {
+        let Some(front) = NSWorkspace::sharedWorkspace().frontmostApplication() else {
+            return;
+        };
+        if front.processIdentifier() == std::process::id().cast_signed() {
+            return;
+        }
+        *self.ivars().previous_app.borrow_mut() = Some(front);
+    }
+
     /// Cached app/program icon at menu-bar size.
     fn icon_for(&self, path: &str) -> Option<Retained<NSImage>> {
         if path.is_empty() {
@@ -485,16 +511,31 @@ impl WaitWindow {
     pub fn bring_to_front(&self) {
         let mtm = self.controller.ivars().mtm;
         if let Some(window) = self.controller.ivars().window.borrow().as_ref() {
-            let app = NSApplication::sharedApplication(mtm);
-            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            app.activate();
-            window.makeKeyAndOrderFront(None);
+            self.controller.remember_frontmost();
+            activate_and_order_front(mtm, window);
         }
     }
 }
 
 const fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
+/// Flip to Regular and force the picker to the foreground. On macOS 14+
+/// `NSApplication::activate` is cooperative — honored only if the frontmost
+/// app yields — so relying on it leaves the window behind the active app.
+/// The window is ordered front before activating so activation has an
+/// on-screen window to focus; `orderFrontRegardless` then puts it visually
+/// frontmost even when activation is deferred. The forceful legacy activation
+/// grabs key focus on pre-Sonoma systems and degrades to plain `activate` on
+/// 14+.
+fn activate_and_order_front(mtm: MainThreadMarker, window: &NSWindow) {
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    window.makeKeyAndOrderFront(None);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    window.orderFrontRegardless();
 }
 
 /// Scan the full process tree for the picker's model. Any checked target that
@@ -675,6 +716,9 @@ pub fn open(
     };
     window.setTitle(&NSString::from_str("Wait for apps"));
     unsafe { window.setReleasedWhenClosed(false) };
+    // Follow the user to the active Space; without this the picker opens on
+    // a different Space — invisible — when the frontmost app is full-screen.
+    window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
     let content = window.contentView().expect("window has a content view");
 
     let toggles_y = install_wait_window_header(mtm, &content, target);
@@ -688,11 +732,9 @@ pub fn open(
 
     // An Accessory app can't focus a window; flip to Regular to show it, then
     // restore Accessory in windowWillClose:.
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    app.activate();
+    controller.remember_frontmost();
     window.center();
-    window.makeKeyAndOrderFront(None);
+    activate_and_order_front(mtm, &window);
 
     WaitWindow { controller }
 }
