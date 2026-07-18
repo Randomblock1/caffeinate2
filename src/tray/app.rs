@@ -111,6 +111,25 @@ pub fn run() -> Result<(), TrayError> {
         }
     });
 
+    // Detect a stale installed helper. The helper is a copied snapshot that
+    // launchd keeps serving across package upgrades, so a version-skewed
+    // daemon silently misses helper-side fixes until it is reinstalled. Off
+    // the main thread: it is a socket RPC.
+    thread::spawn(|| {
+        use crate::entirely::helper_ipc::{HelperClient, HelperStatus};
+        let client = HelperClient::new();
+        if client.is_available()
+            && let Ok(status) = client.status()
+            && status.is_stale()
+        {
+            tracing::warn!(
+                "installed caffeinate2 helper is version {}, this binary is {}; update it with: sudo caffeinate2 --install-helper",
+                status.version.as_deref().unwrap_or("pre-0.8.0"),
+                HelperStatus::CLIENT_VERSION,
+            );
+        }
+    });
+
     // tray-icon requires a running main-thread event loop before creating the icon.
     crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
 

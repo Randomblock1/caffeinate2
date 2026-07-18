@@ -203,9 +203,10 @@ pub enum PendingInstallOutcome {
 
 /// Runtime state while sleep prevention is active.
 struct ActiveTraySession {
-    /// Held only for its `Drop`, which releases the underlying assertion/lock;
-    /// the field is never read directly, hence the lint allowance.
-    #[allow(dead_code)]
+    /// The underlying assertion/lock. Torn down via
+    /// [`ActiveSleepHold::release_blocking`] on a background thread in
+    /// [`AppState::stop_session`]; other teardown paths (session replacement
+    /// in a two-phase mode switch, process exit) rely on `Drop`.
     hold: ActiveSleepHold,
     /// The mode this hold actually enforces. Tracked so a failed mode switch
     /// rolls `config.mode` back to what is *really* still active, rather than to
@@ -548,7 +549,14 @@ impl AppState {
         {
             self.menu_dirty = true;
         }
-        self.session = None;
+        if let Some(session) = self.session.take() {
+            // Release off the UI thread: an entirely-mode release is a helper
+            // RPC bounded by multi-second timeouts (and briefly retried when
+            // the helper is transiently unreachable); the menu bar must not
+            // stall on it. Enable already runs off-thread for the same reason.
+            let hold = session.hold;
+            thread::spawn(move || hold.release_blocking());
+        }
         self.last_tooltip = None;
     }
 
@@ -632,6 +640,14 @@ impl AppState {
     ) {
         // Never stack enables; one in-flight request already targets a session.
         if self.pending_enable.is_some() {
+            return;
+        }
+        // An in-flight helper install also blocks an Entirely enable, even a
+        // cancelled one (its admin dialog can't be revoked): the enable worker
+        // would find the helper still missing and spawn a second privileged
+        // install — two stacked password prompts for one logical action. Other
+        // modes never install, so they may proceed.
+        if mode == SleepMode::Entirely && self.pending_install.is_some() {
             return;
         }
         // Capture the current session's "seen a watched app" latch now, so a
@@ -768,6 +784,19 @@ impl AppState {
         if mode == self.config.mode {
             return Ok(());
         }
+        // A pending helper install blocks an Entirely enable (see the guard in
+        // `start_session_with`). When this switch would start a session,
+        // reject it up front — before the new mode is persisted — instead of
+        // letting that guard silently swallow the enable afterwards: the menu
+        // and config would then claim Entirely while the old hold keeps
+        // running, and no rollback would ever fire (rollback lives in
+        // `poll_pending_enable`, which never arms without a pending enable).
+        if mode == SleepMode::Entirely
+            && self.pending_install.is_some()
+            && (self.is_on() || self.pending_enable.is_some())
+        {
+            return Err(TrayError::HelperInstallPending);
+        }
         // Roll back to the mode actually being enforced, not to `config.mode`:
         // a prior in-flight switch may have already advanced `config.mode`
         // optimistically, so using it would leave the menu/config disagreeing
@@ -816,7 +845,14 @@ impl AppState {
     pub fn shutdown(&mut self) {
         self.cancel_pending_enable();
         self.cancel_pending_install();
-        self.stop_session();
+        // Release inline, not via stop_session: the process exits as soon as
+        // the caller returns, which would kill stop_session's detached
+        // release thread before its RPC completes — leaving the helper entry
+        // to the 30s reaper. One synchronous drop (a single bounded release
+        // RPC, the pre-off-thread behavior) keeps quit-time release
+        // deterministic without stalling quit on retries.
+        drop(self.session.take());
+        self.last_tooltip = None;
     }
 
     /// Set (or clear) the time limit. Deliberately restarts the countdown
@@ -1154,6 +1190,109 @@ impl AppState {
 mod tests {
     use super::*;
 
+    /// A bare `AppState` that touches neither the on-disk config nor the
+    /// launch-agent probe, for exercising pure state transitions.
+    fn bare_state() -> AppState {
+        AppState {
+            config: TrayConfig::default(),
+            session: None,
+            pending_enable: None,
+            pending_install: None,
+            icon_on_rgba: None,
+            icon_off_rgba: None,
+            last_tooltip: None,
+            last_title: None,
+            start_at_login: false,
+            upgrade_clear_since: None,
+            upgrade_failed: false,
+            last_upgrade_error: None,
+            upgrade_overridden: false,
+            upgrade_ignored: Vec::new(),
+            menu_dirty: false,
+        }
+    }
+
+    #[test]
+    fn entirely_enable_is_blocked_while_helper_install_is_pending() {
+        let mut state = bare_state();
+        let (_tx, rx) = mpsc::channel();
+        state.pending_install = Some(PendingInstall {
+            rx,
+            cancelled: false,
+        });
+        // A manual Entirely enable while the install's admin dialog may be up
+        // must not spawn a worker (which would stack a second dialog).
+        state.start_session_with(SleepMode::Entirely, false, None);
+        assert!(state.pending_enable.is_none());
+    }
+
+    /// A mode switch that the pending-install guard would silently swallow
+    /// must instead be rejected before the new mode is persisted, so config
+    /// and menu never claim Entirely while the old hold keeps running.
+    #[test]
+    fn mode_switch_to_entirely_is_rejected_while_install_is_pending() {
+        // Isolate HOME: on the pass path set_mode rejects before persisting,
+        // but a regression would reach save_config, and that must never touch
+        // the real user config from a test.
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+
+        let mut state = bare_state();
+        state.config.mode = SleepMode::System;
+        let (_tx, rx) = mpsc::channel();
+        state.pending_install = Some(PendingInstall {
+            rx,
+            cancelled: false,
+        });
+        // A pending enable stands in for "the switch would start a session"
+        // without taking a real hold.
+        let (_etx, erx) = mpsc::channel();
+        state.pending_enable = Some(PendingEnable {
+            mode: SleepMode::System,
+            started_by_upgrade: false,
+            upgrade_apps: Vec::new(),
+            rollback_mode: None,
+            app_saw_seed: false,
+            rx: erx,
+        });
+        assert!(matches!(
+            state.set_mode(SleepMode::Entirely),
+            Err(TrayError::HelperInstallPending)
+        ));
+        // The rejected switch must not have advanced the persisted mode.
+        assert_eq!(state.config.mode, SleepMode::System);
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn entirely_enable_is_blocked_even_by_a_cancelled_install() {
+        let mut state = bare_state();
+        let (_tx, rx) = mpsc::channel();
+        // A cancelled install's dialog can't be revoked, so it still blocks.
+        state.pending_install = Some(PendingInstall {
+            rx,
+            cancelled: true,
+        });
+        state.start_session_with(SleepMode::Entirely, false, None);
+        assert!(state.pending_enable.is_none());
+    }
+
     fn assertion(pid: i32, name: &str, type_: AssertionType) -> ExternalAssertion {
         ExternalAssertion {
             pid,
@@ -1284,20 +1423,25 @@ mod tests {
         )));
     }
 
+    /// Serializes the tests that repoint HOME at a throwaway dir: parallel
+    /// test threads share the process environment, so concurrent set_var
+    /// calls would race.
+    static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn mode_switch_enable_failure_restores_previous_mode() {
         // Point HOME at a throwaway dir so AppState::new() (load_config) and the
         // rollback's save_config() operate on an isolated config, never the
-        // user's real ~/Library/Application Support/caffeinate2/tray.toml. No
-        // other test reads or writes HOME-derived config, so this can't race.
+        // user's real ~/Library/Application Support/caffeinate2/tray.toml.
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_home = std::env::temp_dir().join(format!(
             "caffeinate2_state_test_{}_{}",
             std::process::id(),
             line!()
         ));
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: single-threaded with respect to HOME — no concurrent test
-        // reads or mutates it (see comment above).
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
         unsafe { std::env::set_var("HOME", &temp_home) };
 
         let mut state = AppState::new();

@@ -209,6 +209,47 @@ pub enum ActiveSleepHold {
     Entirely(EntirelyHold),
 }
 
+impl ActiveSleepHold {
+    /// Delays before each release attempt for a helper-backed entirely hold.
+    /// Sized to ride out a helper crash + launchd respawn or a reinstall's
+    /// bootout/bootstrap window, while staying well under a user's patience
+    /// for "I turned it off".
+    const RELEASE_RETRY_DELAYS: [std::time::Duration; 3] = [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(3),
+    ];
+
+    /// Release this hold, blocking until done. For a helper-backed entirely
+    /// hold this sends the Release RPC and retries briefly when the helper is
+    /// transiently unreachable: the drop path would discard the failure, and
+    /// a discarded release leaves a live-pid holder entry that the helper's
+    /// reaper never prunes — the machine then silently cannot sleep for the
+    /// life of this process. Each attempt is bounded by the RPC timeouts
+    /// (seconds, not milliseconds), so run this off the UI thread. When every
+    /// retry fails, falls back to the plain drop, which frees the in-process
+    /// count and lets the next full session cycle heal the helper-side entry.
+    pub fn release_blocking(self) {
+        let Self::Entirely(EntirelyHold::Helper(mut guard)) = self else {
+            // Assertion, user-activity, and local-lockfile holds release
+            // synchronously and reliably in their Drop impls.
+            return;
+        };
+        for delay in Self::RELEASE_RETRY_DELAYS {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            match guard.release() {
+                Ok(()) => return,
+                Err(e) => tracing::warn!("entirely-mode release failed, will retry: {e}"),
+            }
+        }
+        tracing::warn!(
+            "entirely-mode release kept failing; discarding the guard (the helper reaps the entry when this process exits, or the next session cycle releases it)"
+        );
+    }
+}
+
 /// All holds for a running CLI or tray session.
 #[derive(Default)]
 pub struct ActiveSession {

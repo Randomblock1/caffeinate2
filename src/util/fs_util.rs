@@ -31,27 +31,27 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
-///
-/// # Errors
-///
-/// Returns an I/O error if the temporary file or rename fails.
 /// Write `contents` to `path` atomically via a same-directory temp file and
 /// `rename`, so readers never see a partial file if the process crashes
 /// mid-write. The new file inherits the process umask for its mode; use
 /// [`atomic_write_with_mode`] when the destination needs an exact mode.
-pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_write_inner(path, contents, None)
-}
-
 ///
 /// # Errors
 ///
 /// Returns an I/O error if the temporary file or rename fails.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_inner(path, contents, None)
+}
+
 /// Like [`atomic_write`], but sets the destination file's permission bits to
 /// `mode` regardless of the process umask. Needed for files whose consumer
 /// rejects overly permissive modes — e.g. `launchctl` refuses a system
 /// LaunchDaemon plist that is group/world-writable, which a permissive umask
 /// would otherwise produce.
+///
+/// # Errors
+///
+/// Returns an I/O error if the temporary file or rename fails.
 pub fn atomic_write_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     atomic_write_inner(path, contents, Some(mode))
 }

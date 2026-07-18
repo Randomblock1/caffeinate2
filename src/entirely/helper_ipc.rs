@@ -39,10 +39,41 @@ pub enum HelperResponse {
     Status {
         holders: usize,
         sleep_disabled: bool,
+        /// The daemon's crate version. `default` keeps responses from
+        /// pre-versioning helpers parseable (they decode as `None`, which
+        /// [`HelperStatus::is_stale`] reports as stale); older clients in turn
+        /// ignore the unknown field, so the handshake is compatible both ways.
+        #[serde(default)]
+        version: Option<String>,
     },
     Error {
         message: String,
     },
+}
+
+/// Decoded `Status` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperStatus {
+    pub holders: usize,
+    pub sleep_disabled: bool,
+    /// The helper daemon's crate version; `None` means a pre-versioning
+    /// helper binary is still installed.
+    pub version: Option<String>,
+}
+
+impl HelperStatus {
+    /// This binary's crate version, for comparison against the daemon's.
+    pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    /// True when the installed helper daemon reports a different version than
+    /// this binary. The helper is a copied snapshot that launchd keeps
+    /// serving across package upgrades, so helper-side fixes only take effect
+    /// after a reinstall (`sudo caffeinate2 --install-helper`) — callers
+    /// should surface that.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.version.as_deref() != Some(Self::CLIENT_VERSION)
+    }
 }
 
 impl HelperResponse {
@@ -87,12 +118,17 @@ impl HelperResponse {
     /// # Errors
     ///
     /// Returns an error if the response is not `Status`.
-    pub fn into_status(self) -> Result<(usize, bool), HelperIpcError> {
+    pub fn into_status(self) -> Result<HelperStatus, HelperIpcError> {
         match self.into_result()? {
             Self::Status {
                 holders,
                 sleep_disabled,
-            } => Ok((holders, sleep_disabled)),
+                version,
+            } => Ok(HelperStatus {
+                holders,
+                sleep_disabled,
+                version,
+            }),
             other => Err(HelperIpcError::new(format!(
                 "unexpected response for status: {other:?}"
             ))),
@@ -267,11 +303,7 @@ impl HelperClient {
         }
     }
 
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the helper socket cannot be connected to.
-    pub fn try_connect(&self) -> Result<UnixStream, HelperIpcError> {
+    fn try_connect(&self) -> Result<UnixStream, HelperIpcError> {
         UnixStream::connect(&self.socket_path).map_err(HelperIpcError::connect)
     }
 
@@ -284,7 +316,7 @@ impl HelperClient {
     /// # Errors
     ///
     /// Returns an error if the status RPC fails.
-    pub fn status(&self) -> Result<(usize, bool), HelperIpcError> {
+    pub fn status(&self) -> Result<HelperStatus, HelperIpcError> {
         rpc(&self.socket_path, &HelperRequest::Status, true)?.into_status()
     }
 }
@@ -303,14 +335,6 @@ pub fn is_connect_error(message: &str) -> bool {
 #[must_use]
 pub fn is_authorization_error(message: &str) -> bool {
     message.starts_with("not authorized")
-}
-
-/// True for helper errors that represent an internal/helper-side failure rather
-/// than a policy denial or an unreachable helper. These are not authorization
-/// decisions and should not be reported to the user as "not authorized".
-#[must_use]
-pub fn is_internal_error(message: &str) -> bool {
-    message.starts_with("internal error:")
 }
 
 /// Process-wide count of live helper holds. The helper keys holds by process
@@ -364,6 +388,12 @@ impl HelperHoldGuard {
             // harmless if the Hold never actually landed. Skip it when other
             // guards are live (count > 0): they share the per-process lockfile
             // entry and releasing would yank it out from under them.
+            //
+            // This Release can even be processed *before* a still-queued Hold
+            // commits (two connections, two worker threads, unfair ops mutex);
+            // that inversion is closed server-side: `serve_connection_inner`
+            // rolls back a newly-created hold whose response write fails, so
+            // the abandoned Hold cannot strand a live-pid entry either way.
             Err(e) => {
                 if *count == 0 {
                     let _ = rpc(&client.socket_path, &HelperRequest::Release, true);
@@ -598,6 +628,15 @@ fn serve_connection_inner(
     // client can never release another process's hold, and gating it would
     // strand the holds of users whose grant was later revoked. Status is
     // read-only and open to everyone.
+    // Set when a Hold commits a *newly created* holder entry. If the final
+    // response write then fails, the client never learned the hold exists —
+    // it timed out and may even have fired a compensating Release that a
+    // second worker processed before this commit — so the entry is rolled
+    // back below. Only the creator may undo: releasing a pre-existing entry
+    // would yank it out from under the peer's other live guards, which
+    // learned of it through earlier, answered RPCs (and whose in-process
+    // count also means the peer sends no compensating Release).
+    let mut undo_hold_on_failed_write = None;
     let response = match request {
         HelperRequest::Hold => {
             let uid = peer_uid_for_audit(&stream);
@@ -615,15 +654,12 @@ fn serve_connection_inner(
                             message: e.to_string(),
                         }
                     }
-                    // Once the hold is committed, a later response-write failure
-                    // is at-least-once from the client's point of view: the
-                    // client may treat acquisition as failed while the helper
-                    // keeps the hold. The hold is keyed to the client process,
-                    // so Release remains idempotent and the reaper clears it if
-                    // the client exits.
                     Ok(peer) => match coordinator.hold(peer).map_err(|e| e.to_string()) {
-                        Ok(()) => {
+                        Ok(outcome) => {
                             audit_log("hold", uid, Some(peer.pid), Ok(()));
+                            if outcome.newly_inserted {
+                                undo_hold_on_failed_write = Some((peer, outcome.hold_epoch));
+                            }
                             HelperResponse::HoldOk
                         }
                         Err(e) => {
@@ -659,13 +695,39 @@ fn serve_connection_inner(
             Ok(status) => HelperResponse::Status {
                 holders: status.holders,
                 sleep_disabled: status.sleep_disabled,
+                version: Some(HelperStatus::CLIENT_VERSION.to_string()),
             },
             Err(e) => HelperResponse::Error {
                 message: e.to_string(),
             },
         },
     };
-    write_response(&mut stream, &response)
+    let write_result = write_response(&mut stream, &response);
+    if write_result.is_err()
+        && let Some((peer, hold_epoch)) = undo_hold_on_failed_write
+    {
+        // The client provably never saw HoldOk (AF_UNIX write to a closed
+        // peer fails), so no guard exists for this entry. Undo it rather
+        // than strand a live-pid hold that the reaper never prunes. The
+        // epoch check keeps a delayed rollback exact: if the client has
+        // meanwhile re-held successfully (new epoch), the stale rollback
+        // must not release that newer, guarded hold.
+        match coordinator.release_if_hold_epoch(peer, hold_epoch) {
+            Ok(true) => tracing::warn!(
+                "rolled back hold for pid {}: response write failed",
+                peer.pid
+            ),
+            Ok(false) => tracing::warn!(
+                "skipped hold rollback for pid {}: a newer hold superseded it",
+                peer.pid
+            ),
+            Err(e) => tracing::warn!(
+                "response write failed and hold rollback for pid {} also failed: {e}",
+                peer.pid
+            ),
+        }
+    }
+    write_result
 }
 
 #[cfg(test)]
@@ -721,11 +783,82 @@ mod tests {
             socket_path: sock_path.display().to_string(),
         };
         let mut guard = HelperHoldGuard::try_acquire(&client).unwrap();
-        assert_eq!(client.status().unwrap(), (1, true));
+        let status = client.status().unwrap();
+        assert_eq!((status.holders, status.sleep_disabled), (1, true));
         guard.release().unwrap();
         server.join().unwrap();
 
         assert_eq!(*sleep_calls.lock().unwrap(), vec![true, false]);
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// A Hold whose response write fails must be rolled back by the server.
+    /// The client that abandoned the RPC (timed out and closed the socket)
+    /// treats acquisition as failed and holds no guard; worse, its
+    /// compensating Release can be processed by a second worker *before* the
+    /// delayed Hold commits, so without the rollback a live-pid entry with no
+    /// owner would strand sleep disabled until this process exits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hold_with_lost_response_is_rolled_back() {
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("caffeinate2_lostresp_{}.sock", std::process::id()));
+        let lock_path = dir.join(format!("caffeinate2_lostresp_{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Synchronize the client's abandonment with the server's commit: the
+        // disabler runs while the hold is being committed, and parks there
+        // until the test has closed the client socket. The HoldOk write is
+        // then guaranteed to hit a closed peer — the deterministic version of
+        // "the client timed out (and maybe fired its compensating Release)
+        // while the Hold was still queued".
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let disabler: SleepDisabler = Arc::new(move |disable, _verbose| {
+            if disable {
+                let _ = reached_tx.send(());
+                let _ = go_rx.lock().unwrap().recv();
+            }
+            Ok(())
+        });
+        let coordinator = Arc::new(EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            disabler,
+            Arc::new(process_util::default_process_checker),
+        ));
+
+        let server_coordinator = Arc::clone(&coordinator);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection_inner(stream, &server_coordinator, &|_| Ok(()), &peer_process_id)
+        });
+
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        write_request(&mut stream, &HelperRequest::Hold).unwrap();
+        // Wait until the hold is mid-commit, then abandon the RPC like a
+        // timed-out client, and let the commit finish.
+        reached_rx.recv().unwrap();
+        drop(stream);
+        go_tx.send(()).unwrap();
+
+        let serve_result = server.join().unwrap();
+        assert!(
+            serve_result.is_err(),
+            "the HoldOk write must fail against the closed peer"
+        );
+
+        let status = coordinator.status().unwrap();
+        assert_eq!(
+            status.holders, 0,
+            "a hold whose response was never delivered must not survive"
+        );
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_file(&lock_path);
@@ -844,7 +977,8 @@ mod tests {
         };
         assert!(is_authorization_error(&error.to_string()), "{error}");
         // The denied hold must not have registered anything.
-        assert_eq!(client.status().unwrap(), (0, false));
+        let status = client.status().unwrap();
+        assert_eq!((status.holders, status.sleep_disabled), (0, false));
         server.join().unwrap();
 
         let _ = std::fs::remove_file(&sock_path);
@@ -879,7 +1013,8 @@ mod tests {
         let client = HelperClient {
             socket_path: sock_path.display().to_string(),
         };
-        assert_eq!(client.status().unwrap(), (0, false));
+        let status = client.status().unwrap();
+        assert_eq!((status.holders, status.sleep_disabled), (0, false));
         server.join().unwrap();
 
         let _ = std::fs::remove_file(&sock_path);
@@ -969,10 +1104,6 @@ mod tests {
         assert!(!is_authorization_error(
             "internal error: could not verify peer credentials: x"
         ));
-        assert!(is_internal_error(
-            "internal error: could not verify peer credentials: x"
-        ));
-        assert!(!is_internal_error("not authorized: nope"));
     }
 
     #[test]
@@ -992,9 +1123,28 @@ mod tests {
         let resp = HelperResponse::Status {
             holders: 2,
             sleep_disabled: true,
+            version: Some(HelperStatus::CLIENT_VERSION.to_string()),
         };
         let decoded = decode_response(&try_encode_response(&resp).unwrap()).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    /// A pre-versioning helper's Status response (no `version` field) must
+    /// still parse — and read as stale, so upgraded clients surface the
+    /// reinstall hint instead of silently talking to the old daemon.
+    #[test]
+    fn legacy_status_without_version_parses_as_stale() {
+        let legacy = r#"{"kind":"status","holders":1,"sleep_disabled":true}"#;
+        let status = decode_response(legacy).unwrap().into_status().unwrap();
+        assert_eq!(status.version, None);
+        assert!(status.is_stale());
+
+        let current = HelperResponse::Status {
+            holders: 1,
+            sleep_disabled: true,
+            version: Some(HelperStatus::CLIENT_VERSION.to_string()),
+        };
+        assert!(!current.into_status().unwrap().is_stale());
     }
 
     #[test]
@@ -1016,8 +1166,16 @@ mod tests {
         let resp = HelperResponse::Status {
             holders: 3,
             sleep_disabled: false,
+            version: None,
         };
-        assert_eq!(resp.into_status().unwrap(), (3, false));
+        assert_eq!(
+            resp.into_status().unwrap(),
+            HelperStatus {
+                holders: 3,
+                sleep_disabled: false,
+                version: None,
+            }
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ Arguments:
 
 Options:
   -v, --verbose             Verbose mode
-      --dry-run             Dry run. Don't actually sleep. Useful for testing
+      --dry-run             Dry run. Don't actually prevent sleep. Useful for testing
       --drop-root           Drop root privileges in command. You need root to disable sleep entirely, but some programs don't want to run as root
       --shell               Run COMMAND through /bin/sh -c instead of executing it directly
   -d, --display             Disable display sleep
@@ -184,8 +184,10 @@ The grant takes effect on the user's next attempt (no logout needed). Denied req
 
 Other helper commands:
 
-- Remove the helper: `sudo caffeinate2 --uninstall-helper`
-- Check helper state (running, how many holds, sleep disabled): `caffeinate2 --status`
+- Remove the helper: `sudo caffeinate2 --uninstall-helper` (refuses while entirely-mode sessions are still active)
+- Check helper state (running, how many holds, sleep disabled, version): `caffeinate2 --status`
+
+**After upgrading caffeinate2**, reinstall the helper: the installed daemon is a copied snapshot, so it keeps running the old version until you run `sudo caffeinate2 --install-helper` again. `caffeinate2 --status` shows when the installed helper's version differs from the binary (the tray also logs a warning at startup).
 
 Helper install also adds `/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf` so `/var/log/caffeinate2-helper.log` is rotated.
 

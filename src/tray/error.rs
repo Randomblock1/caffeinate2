@@ -20,4 +20,6 @@ pub enum TrayError {
     NotMainThread,
     #[error("failed to create tray icon: {0}")]
     TraySetup(String),
+    #[error("helper install still in progress; retry once it finishes")]
+    HelperInstallPending,
 }

@@ -262,6 +262,11 @@ pub(crate) struct AcquireOutcome {
     /// [`clear_owns_disable_if_current`] so it can only clear the marker
     /// instance this acquire wrote.
     pub disable_generation: u64,
+    /// Whether this acquire created the holder entry, as opposed to
+    /// re-asserting an entry the same process already had. Lets a caller that
+    /// must undo the acquire (e.g. the helper after a failed response write)
+    /// remove exactly what it added and nothing more.
+    pub newly_inserted: bool,
 }
 
 /// Register `current_proc` as a holder.
@@ -284,7 +289,7 @@ pub(crate) fn acquire(
         |state| {
             let first_holder = state.holders.is_empty();
             let prior_owns_disable = state.owns_disable;
-            state.holders.insert(*current_proc);
+            let newly_inserted = state.holders.insert(*current_proc);
             if first_holder {
                 state.owns_disable = true;
                 state.disable_generation += 1;
@@ -293,6 +298,7 @@ pub(crate) fn acquire(
                 first_holder,
                 prior_owns_disable,
                 disable_generation: state.disable_generation,
+                newly_inserted,
             })
         },
     )

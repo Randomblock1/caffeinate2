@@ -405,6 +405,35 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
         return Err(InstallError::msg("--uninstall-helper must run as root"));
     }
 
+    // Inspect the lockfile before touching anything. Live holders are not
+    // necessarily helper clients — a sudo CLI-fallback session records its
+    // hold in this same lockfile and releases it in-process, never via the
+    // helper — so re-enabling sleep and deleting the lockfile here would
+    // silently yank the disable out from under a session that keeps running
+    // believing sleep is prevented. Uninstalling with no live holders is
+    // always safe, so refuse and let the user stop them first.
+    let lock_path = Path::new(coordinator::HELPER_LOCK_PATH);
+    let lock_outcome = lock_path
+        .exists()
+        .then(|| lockfile::prune_lockfile(false, lock_path, &process_util::default_process_checker))
+        .and_then(|result| {
+            result
+                .map_err(|e| {
+                    // Unreadable/invalid lockfile: no evidence caffeinate2 disabled
+                    // sleep, so proceed but leave the setting untouched.
+                    tracing::warn!("could not read helper lockfile during uninstall: {e}");
+                })
+                .ok()
+        });
+    if let Some(outcome) = &lock_outcome
+        && outcome.live > 0
+    {
+        return Err(InstallError::msg(format!(
+            "{} live entirely-mode session(s) still hold sleep disabled; stop them and re-run --uninstall-helper",
+            outcome.live
+        )));
+    }
+
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
     let _ = fs::remove_file(HELPER_PLIST_PATH);
     let _ = fs::remove_file(NEWSYSLOG_CONF_PATH);
@@ -414,21 +443,32 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
 
     // Once the helper is removed nobody can send Release, so re-enable sleep if
     // caffeinate2 is (or was) managing the SleepDisabled setting. That evidence
-    // is the lockfile's *contents* — the durable ownership marker or live
-    // holders still recorded — never its mere existence: the helper's startup
-    // reconcile creates the file on every boot, so an existence check is always
-    // true on a helper machine and would clobber an unrelated manual
-    // `pmset disablesleep`.
-    let lock_path = Path::new(coordinator::HELPER_LOCK_PATH);
+    // is the lockfile's *contents*, never its mere existence: the helper's
+    // startup reconcile creates the file on every boot, so an existence check
+    // is always true on a helper machine and would clobber an unrelated manual
+    // `pmset disablesleep`. The evidence mirrors `reconcile_startup`: the
+    // durable ownership marker, or — for legacy pre-marker lockfiles — any
+    // recorded holder entries, even ones just pruned as dead (this is the last
+    // chance to converge; no future helper startup will run the legacy
+    // fallback for us).
+    //
+    // Read the evidence from a FRESH prune, not the pre-bootout snapshot: the
+    // helper kept serving between that snapshot and its death, so a hold could
+    // have committed in the window. Live holders seen here (unlike in the
+    // refusal above) also count as evidence — refusing is no longer possible,
+    // the helper is gone, and their releases can only fail, so leaving
+    // SleepDisabled on would strand it permanently.
     let caffeinate2_managed_sleep = lock_path.exists()
         && match lockfile::prune_lockfile(false, lock_path, &process_util::default_process_checker)
         {
-            Ok(outcome) => outcome.owns_disable || outcome.live > 0,
+            Ok(outcome) => outcome.owns_disable || outcome.had_entries,
             Err(e) => {
-                // Unreadable/invalid lockfile: no evidence caffeinate2 disabled
-                // sleep, so leave the setting untouched.
-                tracing::warn!("could not read helper lockfile during uninstall: {e}");
-                false
+                tracing::warn!("could not re-read helper lockfile during uninstall: {e}");
+                // Fall back to the pre-bootout snapshot rather than skipping
+                // the re-enable outright.
+                lock_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.owns_disable || outcome.had_entries)
             }
         };
     if caffeinate2_managed_sleep {

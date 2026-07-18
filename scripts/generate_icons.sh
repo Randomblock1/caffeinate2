@@ -4,7 +4,7 @@
 #
 # For every resources/icons/*.svg it renders a same-named .png at SIZE
 # pixels (square). Edit the SVGs, then run this to refresh the PNGs that
-# src/tray_icons.rs embeds.
+# src/tray/tray_icons.rs embeds.
 #
 # Usage:
 #   scripts/generate_icons.sh           # 128x128 (matches the embedded assets)

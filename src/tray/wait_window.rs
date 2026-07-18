@@ -17,7 +17,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSAccessibility, NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSImage, NSImageView, NSModalResponse, NSModalResponseOK,
     NSOpenPanel, NSRunningApplication, NSScrollView, NSSearchField, NSTableColumn, NSTableView,
@@ -438,6 +438,10 @@ impl WaitController {
         if let Some(image) = self.icon_for(&icon_path) {
             let image_view = NSImageView::imageViewWithImage(&image, mtm);
             image_view.setFrame(NSRect::new(NSPoint::new(4.0, 4.0), NSSize::new(16.0, 16.0)));
+            // Purely decorative: the adjacent checkbox carries the program
+            // name, so an unlabeled AXImage stop before every row would only
+            // slow VoiceOver users down.
+            image_view.setAccessibilityElement(false);
             container.addSubview(&image_view);
         }
         let target: &AnyObject = self;
@@ -614,6 +618,9 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
         )
     };
     apply.setFrame(rect(WIN_W - MARGIN - 90.0, MARGIN, 90.0, 30.0));
+    // Return triggers Apply (and renders it as the default button), matching
+    // Esc → Cancel below.
+    apply.setKeyEquivalent(&NSString::from_str("\r"));
     content.addSubview(&apply);
     let cancel = unsafe {
         NSButton::buttonWithTitle_target_action(

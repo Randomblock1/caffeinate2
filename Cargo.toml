@@ -63,6 +63,9 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSStackView",
     "NSImage",
     "NSImageView",
+    # Picker accessibility: mark the decorative row icons as non-elements so
+    # VoiceOver doesn't announce an unlabeled image before every program name.
+    "NSAccessibilityProtocols",
     "NSColor",
     "NSCell",
     "NSLayoutConstraint",

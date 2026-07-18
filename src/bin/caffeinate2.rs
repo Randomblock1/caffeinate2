@@ -292,7 +292,12 @@ fn run_timed_wait_mode(
             release_active_and_exit(active, 1);
         }
         if duration > jiff::SignedDuration::ZERO {
-            end_time += duration;
+            // main() rejects timeouts that overflow the timestamp range before
+            // any sleep prevention is enabled; saturate rather than panic (a
+            // panic here would unwind past the release of an active hold).
+            if let Ok(next) = end_time.checked_add(duration) {
+                end_time = next;
+            }
             let _ = write!(
                 sleep_str,
                 "for {}",
@@ -411,13 +416,28 @@ fn run_maintenance(command: MaintenanceCommand) {
         MaintenanceCommand::Status => {
             let client = helper_ipc::HelperClient::new();
             match client.status() {
-                Ok((holders, sleep_disabled)) => {
+                Ok(status) => {
                     println!("Helper: running");
-                    println!("Entirely-mode holders: {holders}");
+                    println!("Entirely-mode holders: {}", status.holders);
                     println!(
                         "System sleep disabled by helper: {}",
-                        if sleep_disabled { "yes" } else { "no" }
+                        if status.sleep_disabled { "yes" } else { "no" }
                     );
+                    // The installed helper is a copied snapshot: after a
+                    // package upgrade it keeps serving until reinstalled, so
+                    // a version skew is the user's cue to update it.
+                    if status.is_stale() {
+                        println!(
+                            "Helper version: {} (this binary is {}; update with: sudo caffeinate2 --install-helper)",
+                            status.version.as_deref().unwrap_or("pre-0.8.0"),
+                            helper_ipc::HelperStatus::CLIENT_VERSION
+                        );
+                    } else {
+                        println!(
+                            "Helper version: {}",
+                            helper_ipc::HelperStatus::CLIENT_VERSION
+                        );
+                    }
                 }
                 Err(e) if helper_ipc::is_connect_error(&e.to_string()) => {
                     println!(
@@ -535,6 +555,18 @@ fn main() {
         process::exit(1);
     }
 
+    // A timeout can parse fine (the parser only bounds it to SignedDuration)
+    // yet overflow `Zoned::now() + duration`, whose timestamp range is far
+    // smaller — and that add would fail only after sleep prevention was
+    // enabled. Reject it here while nothing has been toggled yet.
+    if parsed_timeout
+        .as_ref()
+        .is_some_and(timeout_overflows_datetime)
+    {
+        eprintln!("Error: timeout is too far in the future");
+        process::exit(1);
+    }
+
     let active = match sleep_modes.enable_all(args.verbose, args.dry_run) {
         Ok(active) => active,
         Err(e) => {
@@ -606,6 +638,15 @@ fn main() {
     process::exit(exit_code.load(Ordering::Relaxed));
 }
 
+/// True when adding `duration` to the current local time would leave jiff's
+/// representable `Zoned` range (which ends at year 9999 — far below what
+/// `parse_duration` accepts). Checked before enabling sleep prevention so the
+/// later display math can never fail while a hold is active.
+#[cfg(target_os = "macos")]
+fn timeout_overflows_datetime(duration: &jiff::SignedDuration) -> bool {
+    jiff::Zoned::now().checked_add(*duration).is_err()
+}
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("caffeinate2 only supports macOS.");
@@ -618,6 +659,17 @@ mod tests {
     use caffeinate2::sleep::sleep_mode::{SleepMode, SleepModeSet};
     use caffeinate2::util::duration_parser;
     use clap::Parser;
+
+    #[test]
+    fn huge_parseable_timeout_is_rejected_before_enabling() {
+        // ~3.2 million years: parses (well under SignedDuration's cap) but
+        // overflows Zoned::now() + duration. Must be caught by the pre-enable
+        // validation instead of failing mid-session.
+        let huge = duration_parser::parse_duration("100000000000000").unwrap();
+        assert!(crate::timeout_overflows_datetime(&huge));
+        let sane = duration_parser::parse_duration("1h").unwrap();
+        assert!(!crate::timeout_overflows_datetime(&sane));
+    }
 
     #[test]
     fn timeout_parses_raw_number_as_seconds() {

@@ -14,9 +14,10 @@ pub enum CoordinatorError {
 
 /// IPC / RPC error from the privileged helper client or daemon.
 ///
-/// Message prefixes are stable API for [`crate::entirely::helper_ipc::is_connect_error`],
-/// [`crate::entirely::helper_ipc::is_authorization_error`], and
-/// [`crate::entirely::helper_ipc::is_internal_error`].
+/// Message prefixes are stable API for [`crate::entirely::helper_ipc::is_connect_error`]
+/// and [`crate::entirely::helper_ipc::is_authorization_error`]; helper-side
+/// failures that are neither use the `internal error:` prefix so they can never
+/// match the authorization check.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct HelperIpcError {

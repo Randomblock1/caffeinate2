@@ -25,6 +25,21 @@ pub struct EntirelyStatus {
     pub sleep_disabled: bool,
 }
 
+/// Outcome of a committed [`EntirelyCoordinator::hold`], for callers that may
+/// need to undo it.
+#[derive(Debug, Clone, Copy)]
+pub struct HoldOutcome {
+    /// Whether this hold created the holder entry, as opposed to re-asserting
+    /// an entry the same process already had. An undo (the helper's rollback
+    /// after a failed response write) is safe only for the creator: releasing
+    /// a pre-existing entry would yank it out from under the process's other
+    /// live guards, which learned of it through earlier, answered RPCs.
+    pub newly_inserted: bool,
+    /// This hold's per-process epoch, for
+    /// [`EntirelyCoordinator::release_if_hold_epoch`].
+    pub hold_epoch: u64,
+}
+
 struct EntirelyCoordinatorInner {
     verbose: bool,
     lock_file_path: PathBuf,
@@ -38,6 +53,15 @@ struct EntirelyCoordinatorInner {
     /// under the lock on every operation. A cached flag cannot survive a helper
     /// restart, which is exactly when the intent must be recovered.
     ops: Mutex<()>,
+    /// Monotonic per-process hold epoch, bumped (under `ops`) on every
+    /// committed hold and consulted by
+    /// [`EntirelyCoordinator::release_if_hold_epoch`], so a delayed
+    /// failed-response rollback can only undo the exact hold it belongs to —
+    /// a newer re-hold from the same process bumps the epoch and invalidates
+    /// the stale rollback. Deliberately in-memory (unlike the ownership
+    /// marker): a rollback never spans a coordinator restart, and the map is
+    /// bounded by one `u64` per distinct client process served.
+    hold_epochs: Mutex<std::collections::HashMap<ProcessId, u64>>,
 }
 
 #[derive(Clone)]
@@ -59,6 +83,7 @@ impl EntirelyCoordinator {
                 sleep_disabler,
                 process_checker,
                 ops: Mutex::new(()),
+                hold_epochs: Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -120,7 +145,7 @@ impl EntirelyCoordinator {
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be updated or sleep cannot be disabled.
-    pub fn hold(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
+    pub fn hold(&self, process_id: ProcessId) -> Result<HoldOutcome, CoordinatorError> {
         let inner = &self.inner;
         let _ops = self.lock_ops();
         // `acquire` records ownership of the disable in the same write that adds
@@ -129,6 +154,7 @@ impl EntirelyCoordinator {
             first_holder: should_disable,
             prior_owns_disable,
             disable_generation,
+            newly_inserted,
         } = lockfile::acquire(
             inner.verbose,
             &inner.lock_file_path,
@@ -168,7 +194,47 @@ impl EntirelyCoordinator {
             tracing::info!("Other holders running. Sleep already disabled.");
         }
 
-        Ok(())
+        let hold_epoch = {
+            let mut epochs = inner.hold_epochs.lock().unwrap_or_else(|e| e.into_inner());
+            let epoch = epochs.entry(process_id).or_insert(0);
+            *epoch += 1;
+            *epoch
+        };
+        Ok(HoldOutcome {
+            newly_inserted,
+            hold_epoch,
+        })
+    }
+
+    /// Release `process_id`'s hold only if no newer hold from that process has
+    /// committed since `hold_epoch` was issued; returns whether the release
+    /// ran. Used by the helper's failed-response rollback: without the epoch
+    /// check, a rollback delayed past the client's compensating Release *and*
+    /// a successful re-hold would release the new hold's entry (entries are
+    /// keyed by process, so they are otherwise indistinguishable across hold
+    /// cycles).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lockfile cannot be updated or sleep cannot be re-enabled.
+    pub fn release_if_hold_epoch(
+        &self,
+        process_id: ProcessId,
+        hold_epoch: u64,
+    ) -> Result<bool, CoordinatorError> {
+        let _ops = self.lock_ops();
+        let current = self
+            .inner
+            .hold_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&process_id)
+            .copied();
+        if current != Some(hold_epoch) {
+            return Ok(false);
+        }
+        self.release_under_ops(process_id)?;
+        Ok(true)
     }
 
     ///
@@ -176,8 +242,13 @@ impl EntirelyCoordinator {
     ///
     /// Returns an error if the lockfile cannot be updated or sleep cannot be re-enabled.
     pub fn release(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
-        let inner = &self.inner;
         let _ops = self.lock_ops();
+        self.release_under_ops(process_id)
+    }
+
+    /// The body of [`Self::release`]; the caller must hold the ops mutex.
+    fn release_under_ops(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
+        let inner = &self.inner;
         // `release` removes the holder but leaves the ownership marker set; it
         // reports whether no live holders remain while we still own the disable.
         let lockfile::ReleaseOutcome {
@@ -713,6 +784,47 @@ mod tests {
 
         coordinator.reconcile().unwrap();
         assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
+
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// A failed-response rollback carries the epoch of the hold it belongs
+    /// to; once the same process has successfully re-held (newer epoch), the
+    /// stale rollback must become a no-op instead of releasing the new hold.
+    #[test]
+    fn stale_epoch_rollback_cannot_release_a_newer_hold() {
+        let lock_path = temp_lock_path();
+        let sleep_disabler: SleepDisabler = Arc::new(|_, _| Ok(()));
+        // The current (test) process is alive, so its entry is never reaped.
+        let process_checker: Arc<ProcessChecker> = Arc::new(process_util::default_process_checker);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+        let process_id =
+            process_util::process_id_from_pid(std::process::id() as i32).expect("own process id");
+
+        let first = coordinator.hold(process_id).unwrap();
+        coordinator.release(process_id).unwrap();
+        let second = coordinator.hold(process_id).unwrap();
+        assert!(second.hold_epoch > first.hold_epoch);
+
+        // The stale rollback (first epoch) must not touch the newer hold...
+        assert!(
+            !coordinator
+                .release_if_hold_epoch(process_id, first.hold_epoch)
+                .unwrap()
+        );
+        assert_eq!(holder_lines(&lock_path).len(), 1);
+        // ...while a current-epoch rollback releases it.
+        assert!(
+            coordinator
+                .release_if_hold_epoch(process_id, second.hold_epoch)
+                .unwrap()
+        );
+        assert!(holder_lines(&lock_path).is_empty());
 
         let _ = std::fs::remove_file(&lock_path);
     }
