@@ -42,7 +42,15 @@ const OBSERVED_TYPES: &[AssertionType] = &[
 /// use and releases it on its own; taking a stronger Entirely hold over it does
 /// nothing but flap the watcher, so it is treated as ignored rather than a
 /// trigger.
-const UPGRADE_IGNORE_PROCESSES: &[&str] = &["powerd"];
+const UPGRADE_IGNORE_PROCESSES: &[&str] = &["powerd", "runningboardd"];
+
+/// Ignored processes so ubiquitous that surfacing them as "Ignoring…" lines is
+/// pure noise: they hold an assertion during ordinary active use essentially
+/// always, so listing them tells the user nothing. `powerd` (the macOS power
+/// daemon) and `runningboardd` (the process/assertion lifecycle daemon) are
+/// effectively always active, so they are dropped from the menu entirely rather
+/// than shown as ignored.
+const SILENTLY_IGNORED_PROCESSES: &[&str] = &["powerd", "runningboardd"];
 
 /// Whether a failed upgrade enable should latch `upgrade_failed` (blocking
 /// retries until the external trigger clears). Transient errors (helper socket
@@ -103,9 +111,14 @@ fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassifica
     let mut ignored: Vec<IgnoredAssertion> = all
         .iter()
         .filter(|a| !is_upgradeable(a))
-        // A nameless holder can't be shown meaningfully; and never list a
-        // process under "ignored" when another of its assertions is upgraded.
-        .filter(|a| !a.process_name.is_empty() && !trigger_names.contains(a.process_name.as_str()))
+        // A nameless holder can't be shown meaningfully; never list a process
+        // under "ignored" when another of its assertions is upgraded; and drop
+        // the always-active system processes that would only add noise.
+        .filter(|a| {
+            !a.process_name.is_empty()
+                && !trigger_names.contains(a.process_name.as_str())
+                && !SILENTLY_IGNORED_PROCESSES.contains(&a.process_name.as_str())
+        })
         .map(|a| IgnoredAssertion {
             process_name: a.process_name.clone(),
             reason: ignore_reason(a).to_string(),
@@ -1170,15 +1183,16 @@ mod tests {
     }
 
     #[test]
-    fn ignore_listed_system_process_is_ignored_not_a_trigger() {
-        let all = [assertion(
-            1,
-            "powerd",
-            AssertionType::PreventUserIdleSystemSleep,
-        )];
+    fn silently_ignored_system_processes_are_neither_triggers_nor_listed() {
+        let all = [
+            assertion(1, "powerd", AssertionType::PreventUserIdleSystemSleep),
+            assertion(2, "runningboardd", AssertionType::PreventUserIdleSystemSleep),
+        ];
         let result = classify_external_assertions(&all);
+        // These never trigger an upgrade ...
         assert!(result.upgradeable.is_empty());
-        assert_eq!(result.ignored, vec![ignored("powerd", "system process")]);
+        // ... and, being always active, are dropped from the menu entirely.
+        assert!(result.ignored.is_empty());
     }
 
     #[test]
@@ -1224,7 +1238,9 @@ mod tests {
     fn ignored_list_is_sorted_and_deduped() {
         let all = [
             assertion(50, "VLC", AssertionType::PreventUserIdleDisplaySleep),
+            // powerd is silently ignored, so it never reaches the list.
             assertion(51, "powerd", AssertionType::PreventUserIdleSystemSleep),
+            assertion(53, "IINA", AssertionType::PreventUserIdleDisplaySleep),
             // Duplicate display hold from the same app collapses to one entry.
             assertion(52, "VLC", AssertionType::PreventUserIdleDisplaySleep),
         ];
@@ -1232,8 +1248,8 @@ mod tests {
         assert_eq!(
             result.ignored,
             vec![
+                ignored("IINA", "display only"),
                 ignored("VLC", "display only"),
-                ignored("powerd", "system process"),
             ]
         );
     }
