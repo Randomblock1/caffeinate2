@@ -100,18 +100,24 @@ pub fn misquoted_duration_error(args: &Args, command_explicitly_separated: bool)
         Some(has_unit)
     };
 
-    // Requiring a digit somewhere keeps bare unit words from tripping the check:
-    // `caffeinate2 -t 300 w` (the w(1) tool) is duration-shaped but has no
-    // number, so it is a real command, not a botched duration.
+    // A full unit word among the command tokens (`hour`, `minutes`) is a
+    // spilled duration on its own, so `-t 1 hour` trips the check even with no
+    // digit in the tail. A lone single-letter alias still needs a digit, so
+    // `caffeinate2 -t 300 w` (the w(1) tool) stays a real command rather than a
+    // botched duration.
     let timeout_is_lone_number = timeout.parse::<u64>().is_ok();
+    let command_has_digit = command
+        .iter()
+        .any(|word| word.chars().any(|c| c.is_ascii_digit()));
+    let command_has_unit_word = command
+        .iter()
+        .any(|word| DURATION_WORDS.contains(&word.to_lowercase().as_str()));
     let command_is_duration_continuation = command
         .iter()
         .map(|word| duration_shape(word))
         .collect::<Option<Vec<bool>>>()
         .is_some_and(|units| units.contains(&true))
-        && command
-            .iter()
-            .any(|word| word.chars().any(|c| c.is_ascii_digit()));
+        && (command_has_digit || command_has_unit_word);
 
     if timeout_is_lone_number && command_is_duration_continuation {
         let suggested = format!("{timeout} {}", command.join(" "));
@@ -262,6 +268,16 @@ mod tests {
             misquoted_duration_error(&args, false).expect("should detect misquoted duration");
         assert!(message.contains("multi-word durations must be quoted"));
         assert!(message.contains("-t \"1 hour and 30 minutes\""));
+    }
+
+    #[test]
+    fn bare_unit_word_after_numeric_timeout_is_flagged() {
+        // A full unit word spilled past a numeric timeout is a misquote even
+        // when the tail carries no digit of its own (`-t 2 hours`, `-t 1 hour`).
+        let args = parse_args(&["caffeinate2", "-t", "2", "hours"]);
+        assert!(misquoted_duration_error(&args, false).is_some());
+        let args = parse_args(&["caffeinate2", "-t", "1", "hour"]);
+        assert!(misquoted_duration_error(&args, false).is_some());
     }
 
     #[test]

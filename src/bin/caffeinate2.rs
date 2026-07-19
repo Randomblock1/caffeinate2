@@ -2,7 +2,7 @@
 mod cli;
 
 #[cfg(target_os = "macos")]
-use caffeinate2::entirely::{helper_ipc, install};
+use caffeinate2::entirely::{authz, helper_ipc, install};
 #[cfg(target_os = "macos")]
 use caffeinate2::sleep::sleep_mode;
 #[cfg(target_os = "macos")]
@@ -60,46 +60,6 @@ struct CommandCredentials {
     groups: Option<Vec<u32>>,
 }
 
-/// Resolve the target user's full supplementary group list (including the
-/// primary `gid`). Returns `None` if the lookup fails, so the caller can fall
-/// back to a conservative single-group list rather than leaking root's groups.
-#[cfg(target_os = "macos")]
-fn supplementary_groups_for(user: &str, gid: u32) -> Option<Vec<u32>> {
-    let cname = std::ffi::CString::new(user).ok()?;
-    // macOS `getgrouplist` takes/returns `int` groups (not `gid_t`); convert to
-    // `gid_t` (u32) for `setgroups`. NGROUPS_MAX is 16, but query with a larger
-    // buffer and retry once if the kernel reports it needs more.
-    let mut ngroups: libc::c_int = 64;
-    let mut buf: Vec<libc::c_int> = vec![0; ngroups as usize];
-    let mut rc = unsafe {
-        libc::getgrouplist(
-            cname.as_ptr(),
-            gid as libc::c_int,
-            buf.as_mut_ptr(),
-            &mut ngroups,
-        )
-    };
-    if rc < 0 {
-        // ngroups now holds the required size.
-        let needed = usize::try_from(ngroups).ok()?.max(1);
-        buf = vec![0; needed];
-        rc = unsafe {
-            libc::getgrouplist(
-                cname.as_ptr(),
-                gid as libc::c_int,
-                buf.as_mut_ptr(),
-                &mut ngroups,
-            )
-        };
-        if rc < 0 {
-            return None;
-        }
-    }
-    let count = usize::try_from(ngroups).ok()?.min(buf.len());
-    buf.truncate(count);
-    Some(buf.into_iter().map(|g| g as u32).collect())
-}
-
 #[cfg(target_os = "macos")]
 fn command_credentials(
     args: &Args,
@@ -146,7 +106,7 @@ fn command_credentials(
         // primary group so the child still sheds root's supplementary groups.
         let groups = std::env::var("SUDO_USER")
             .ok()
-            .and_then(|user| supplementary_groups_for(&user, gid))
+            .and_then(|user| authz::group_ids_for_user(&user, gid))
             .unwrap_or_else(|| vec![gid]);
         CommandCredentials {
             uid,
@@ -259,9 +219,8 @@ fn run_command_mode(
 /// Timeout to hand [`wait_for_pid`] when `-w` is combined with `-t`.
 ///
 /// `None` means "wait indefinitely for the PID" (`-w` with no `-t`). `Some(dur)`
-/// bounds the wait. A zero `-t` maps to `Some(0)` — an immediate `TimedOut` from
-/// kevent — rather than `None`, so `-t 0 -w PID` times out at once instead of
-/// blocking until the PID exits.
+/// bounds the wait. A non-positive `-t` is rejected before this point, so a
+/// bounded wait always carries a positive duration.
 #[cfg(target_os = "macos")]
 fn waitfor_timeout(
     timeout_present: bool,
@@ -287,32 +246,29 @@ fn run_timed_wait_mode(
     let waitfor = args.waitfor.is_some();
     if timeout {
         duration = parsed_timeout.copied().expect("Timeout should be present");
-        if duration <= jiff::SignedDuration::ZERO && !waitfor {
+        if duration <= jiff::SignedDuration::ZERO {
             eprintln!("Error: timeout must be positive");
             release_active_and_exit(active, 1);
         }
-        if duration > jiff::SignedDuration::ZERO {
-            // main() rejects timeouts that overflow the timestamp range before
-            // any sleep prevention is enabled; saturate rather than panic (a
-            // panic here would unwind past the release of an active hold).
-            if let Ok(next) = end_time.checked_add(duration) {
-                end_time = next;
-            }
-            let _ = write!(
-                sleep_str,
-                "for {}",
-                duration_parser::format_duration_human(duration)
-            );
+        // main() rejects timeouts that overflow the timestamp range before
+        // any sleep prevention is enabled; saturate rather than fail (an
+        // unwind here would skip the release of an active hold).
+        if let Ok(next) = end_time.checked_add(duration) {
+            end_time = next;
         }
+        let _ = write!(
+            sleep_str,
+            "for {}",
+            duration_parser::format_duration_human(duration)
+        );
     }
 
     print!("{sleep_str}");
 
-    // Only print the " or " separator when a "for <duration>" prefix was
-    // actually emitted above (it is skipped for a zero timeout). Otherwise
-    // `-t 0 -w PID` would print a dangling " or until PID ... finishes".
-    let printed_timeout = timeout && duration > jiff::SignedDuration::ZERO;
-    if printed_timeout && waitfor {
+    // With `-t` set the "for <duration>" prefix is always present (a
+    // non-positive timeout is rejected above), so the " or " separator is
+    // needed exactly when a timeout and a PID are both awaited.
+    if timeout && waitfor {
         print!(" or ");
     }
     if waitfor {
@@ -323,27 +279,23 @@ fn run_timed_wait_mode(
     }
     println!(".");
 
-    if timeout {
-        if !waitfor && duration > jiff::SignedDuration::ZERO {
-            println!(
-                "Resuming {}.",
-                if duration.as_secs() > (60 * 60 * 24) {
-                    end_time.strftime(LONG_TIME_FMT)
-                } else {
-                    end_time.strftime(SHORT_TIME_FMT)
-                }
-            );
-        }
-        if !waitfor && duration > jiff::SignedDuration::ZERO {
-            let std_duration = match std::time::Duration::try_from(duration) {
-                Ok(d) => d,
-                Err(_) => {
-                    eprintln!("Error: timeout is too large");
-                    release_active_and_exit(active, 1);
-                }
-            };
-            thread::sleep(std_duration);
-        }
+    if timeout && !waitfor {
+        println!(
+            "Resuming {}.",
+            if duration.as_secs() >= (60 * 60 * 24) {
+                end_time.strftime(LONG_TIME_FMT)
+            } else {
+                end_time.strftime(SHORT_TIME_FMT)
+            }
+        );
+        let std_duration = match std::time::Duration::try_from(duration) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Error: timeout is too large");
+                release_active_and_exit(active, 1);
+            }
+        };
+        thread::sleep(std_duration);
     }
 
     if !waitfor {
@@ -372,7 +324,7 @@ fn run_timed_wait_mode(
             println!("with exit code {}", exit_code.load(Ordering::Relaxed));
         }
         Ok(WaitForPidResult::TimedOut) => {
-            if timeout && duration > jiff::SignedDuration::ZERO {
+            if timeout {
                 let now = jiff::Zoned::now();
                 println!("Timeout reached {}.", now.strftime(SHORT_TIME_FMT));
             }
@@ -423,12 +375,20 @@ fn run_maintenance(command: MaintenanceCommand) {
                         "System sleep disabled by helper: {}",
                         if status.sleep_disabled { "yes" } else { "no" }
                     );
-                    // The installed helper is a copied snapshot: after a
-                    // package upgrade it keeps serving until reinstalled, so
-                    // a version skew is the user's cue to update it.
+                    // The installed helper is a copied snapshot that keeps
+                    // serving its own version until reinstalled, so a version
+                    // skew is the user's cue to realign the two. Point at
+                    // whichever side is behind: reinstalling the helper when it
+                    // is older, but updating this binary when the helper is
+                    // newer (a reinstall would otherwise downgrade the helper).
                     if status.is_stale() {
+                        let advice = if status.helper_is_newer() {
+                            "update this caffeinate2 binary to match"
+                        } else {
+                            "update with: sudo caffeinate2 --install-helper"
+                        };
                         println!(
-                            "Helper version: {} (this binary is {}; update with: sudo caffeinate2 --install-helper)",
+                            "Helper version: {} (this binary is {}; {advice})",
                             status.version.as_deref().unwrap_or("pre-0.8.0"),
                             helper_ipc::HelperStatus::CLIENT_VERSION
                         );
@@ -525,10 +485,16 @@ fn main() {
         sleep_modes.selected_labels().join(", ")
     );
 
+    let mode = wait_mode(&args);
+
     // Parse the timeout before enabling any sleep prevention: a bad -t value
     // must not toggle the system sleep setting and then exit without
     // releasing it (process::exit skips destructors, and the entirely-mode
-    // hold has system-wide effects beyond this process's lifetime).
+    // hold has system-wide effects beyond this process's lifetime). The value
+    // is validated in every mode, including Command mode where the trailing
+    // command takes priority (as warned above) and the timeout is never
+    // consumed: a `-t` that does not name a valid positive duration is an
+    // error, not something to silently ignore.
     let parsed_timeout = match args
         .timeout
         .as_deref()
@@ -542,14 +508,11 @@ fn main() {
         }
     };
 
+    // A non-positive timeout is always an error, in every mode: `-t 0 -w PID`
+    // and `-t 0 -- command` error like a bare `-t 0`.
     if parsed_timeout
         .as_ref()
         .is_some_and(|d| *d <= jiff::SignedDuration::ZERO)
-        && args.waitfor.is_none()
-        && args
-            .command
-            .as_ref()
-            .is_none_or(|command| command.is_empty())
     {
         eprintln!("Error: timeout must be positive");
         process::exit(1);
@@ -609,7 +572,7 @@ fn main() {
         }
     });
 
-    match wait_mode(&args) {
+    match mode {
         WaitMode::Command => run_command_mode(&args, &sleep_str, &active, &child_pid, &exit_code),
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
             run_timed_wait_mode(
@@ -776,16 +739,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_timeout_with_waitfor_arms_immediate_timeout() {
+    fn waitfor_timeout_bounds_only_when_timeout_present() {
         use crate::waitfor_timeout;
-        let zero = jiff::SignedDuration::ZERO;
-        // `-t 0 -w PID`: a zero timeout must arm an immediate kevent timeout,
-        // not `None` (which would block until the PID exits).
-        assert_eq!(waitfor_timeout(true, zero), Some(zero));
-        // `-w PID` with no `-t`: wait indefinitely for the PID.
-        assert_eq!(waitfor_timeout(false, zero), None);
-        // `-t 30s -w PID`: bounded wait.
         let thirty = jiff::SignedDuration::from_secs(30);
+        // `-w PID` with no `-t`: wait indefinitely for the PID.
+        assert_eq!(waitfor_timeout(false, thirty), None);
+        // `-t 30s -w PID`: bounded wait. A non-positive `-t` is rejected before
+        // this point, so waitfor_timeout only ever bounds with a positive value.
         assert_eq!(waitfor_timeout(true, thirty), Some(thirty));
     }
 
@@ -800,7 +760,18 @@ mod tests {
     #[test]
     fn zero_timeout_with_trailing_command_is_command_mode() {
         use crate::cli::wait::wait_mode;
+        // Classification only: main validates `-t` in every mode, so the zero
+        // timeout is rejected before this Command classification is acted on.
         let args = parse_args(&["caffeinate2", "-t", "0", "--", "script"]);
+        assert_eq!(wait_mode(&args), WaitMode::Command);
+    }
+
+    #[test]
+    fn invalid_timeout_with_trailing_command_is_command_mode() {
+        use crate::cli::wait::wait_mode;
+        // Classification only: main validates `-t` in every mode, so the
+        // malformed timeout is rejected before the command would run.
+        let args = parse_args(&["caffeinate2", "-t", "notaduration", "--", "echo", "hi"]);
         assert_eq!(wait_mode(&args), WaitMode::Command);
     }
 

@@ -1,6 +1,7 @@
 //! Bundle lookup and running-app checks (tray).
 
 use crate::tray::app_target::AppTarget;
+use crate::tray::process_enum::file_stem;
 use objc2_app_kit::NSRunningApplication;
 use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSURL};
 
@@ -28,10 +29,6 @@ pub fn bundle_from_app_path(path: &str) -> Option<AppTarget> {
     if bundle_id.is_empty() {
         return None;
     }
-    let name = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&bundle_id)
-        .to_string();
+    let name = file_stem(path).unwrap_or_else(|| bundle_id.clone());
     Some(AppTarget { bundle_id, name })
 }

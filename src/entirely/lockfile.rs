@@ -179,9 +179,12 @@ fn read_state(file: &mut Flock<File>) -> Result<LockfileState, std::io::Error> {
 
 fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std::io::Error> {
     let mut content = String::new();
-    // Write the ownership marker first so that even a torn write that persists
-    // only the leading bytes preserves the "we disabled sleep" fact — the
-    // conservative direction (an extra reconcile re-enable, never a missed one).
+    // The ownership marker leads the snapshot so that partial persistence of
+    // only the leading bytes (a power loss mid-writeback) still records the
+    // "we disabled sleep" fact — the conservative direction: at worst an extra
+    // reconcile re-enable. The opposite direction — a released holder's line
+    // surviving in the old tail and suppressing a re-enable — is closed by the
+    // padded overwrite below.
     if state.owns_disable {
         content.push_str(DISABLE_MARKER);
         content.push('\n');
@@ -198,11 +201,28 @@ fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std:
     for p in &state.holders {
         content.push_str(&format!("{p}\n"));
     }
-    // Write the full snapshot before truncating so a crash mid-update is less
-    // likely to leave an empty lockfile while SleepDisabled is still on.
+    // In-place overwrite: the flock is pinned to this inode (see
+    // open_validated_lockfile), so the atomic temp-file+rename idiom is not
+    // available. A shrinking snapshot is instead padded with blank lines —
+    // which read_state skips — out to the file's current length, so the single
+    // write_all covers every previously-live byte. A writer killed before the
+    // write leaves the old snapshot; killed anywhere after it leaves the
+    // padded new one (the kernel completes an issued write even if the writer
+    // dies). Neither state re-exposes a departed holder's line from an
+    // un-truncated tail, where it would suppress a re-enable for as long as
+    // that process lived. A power loss mid-writeback can persist any byte
+    // subset, but every holder pid recorded before the loss is dead after
+    // reboot and the next locked mutation prunes it.
+    let current_len = file.seek(SeekFrom::End(0))?;
+    let mut bytes = content.into_bytes();
+    if (bytes.len() as u64) < current_len {
+        // read_state has already capped the file at MAX_LOCKFILE_BYTES, so the
+        // length fits in usize.
+        bytes.resize(current_len as usize, b'\n');
+    }
     file.seek(SeekFrom::Start(0))?;
-    file.write_all(content.as_bytes())?;
-    file.set_len(content.len() as u64)?;
+    file.write_all(&bytes)?;
+    file.set_len(bytes.len() as u64)?;
     file.sync_all()?;
     Ok(())
 }
@@ -589,6 +609,42 @@ mod tests {
 
         assert!(!outcome.first_holder);
         assert_eq!(read_entries(&lock_path), vec![current_proc, live_proc]);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn shrinking_write_pads_instead_of_exposing_a_stale_tail() {
+        // Releasing one of two holders shrinks the serialized snapshot. The
+        // in-place write must pad out to the previous length rather than rely
+        // on truncation: a kill between write_all and set_len would otherwise
+        // leave the departed holder's line alive in the un-truncated tail,
+        // suppressing the eventual re-enable while that process lived.
+        let lock_path = temp_lock_path();
+        let keeper = proc(100, 123);
+        let leaver = proc(200, 456);
+        let process_checker = |pid: i32, _start_time: ProcessStartTime| pid == 100 || pid == 200;
+
+        acquire(false, &lock_path, &process_checker, &keeper).unwrap();
+        acquire(false, &lock_path, &process_checker, &leaver).unwrap();
+        let two_holder_len = std::fs::metadata(&lock_path).unwrap().len();
+
+        let outcome = release(false, &lock_path, &process_checker, &leaver).unwrap();
+
+        assert!(outcome.removed);
+        assert!(!outcome.should_enable);
+        // Exactly one holder parses back: no byte of the file resurrects the
+        // departed holder.
+        assert_eq!(read_entries(&lock_path), vec![keeper]);
+        // The file keeps its old length (blank-line padding), pinning that
+        // write_all overwrote the whole previous snapshot.
+        assert!(std::fs::metadata(&lock_path).unwrap().len() >= two_holder_len);
+
+        // A later locked mutation reads the padded file cleanly: a repeat
+        // release by the departed holder is a no-op, not an error.
+        let outcome = release(false, &lock_path, &process_checker, &leaver).unwrap();
+        assert!(!outcome.removed);
+        assert_eq!(read_entries(&lock_path), vec![keeper]);
 
         std::fs::remove_file(&lock_path).unwrap();
     }

@@ -31,7 +31,9 @@ pub struct Args {
 
     /// Detach from the terminal and run in the background.
     /// Returns control to the shell immediately; the tray keeps running
-    /// after the terminal closes. Logs are discarded in this mode.
+    /// after the terminal closes. stderr is captured, best-effort, to
+    /// ~/Library/Logs/caffeinate2-tray.log (appended, never rotated), and is
+    /// discarded only if that file cannot be opened.
     #[arg(short = 'd', long)]
     pub detach: bool,
 }

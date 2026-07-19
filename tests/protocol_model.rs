@@ -10,6 +10,15 @@
 //! marker exists to survive, and it is the one thing the operation-granularity
 //! property tests cannot reach.
 //!
+//! Both models ASSUME each flock'd lockfile write is atomic: a crash observes
+//! either the pre-write or the post-write file, never a torn intermediate.
+//! `write_state` earns that assumption with two mitigations — the ownership
+//! marker is serialized first, so partial persistence of a prefix errs toward
+//! an extra re-enable rather than a missed one, and a snapshot shorter than
+//! the file is padded out to the file's length, so no kill window re-exposes a
+//! departed holder's line from an un-truncated tail. Intra-write crash states
+//! are otherwise outside the modeled state space.
+//!
 //! Two protocol variants are modelled:
 //!
 //! * [`Variant::Fixed`] — the durable-ownership-marker design (current code).
@@ -46,9 +55,29 @@
 //! post-toggle marker race. The single-process model above leaves status out
 //! for the same reason: under a single serialized coordinator its step
 //! sequences are a strict subset of reconcile's. The cross-process model in
-//! turn omits helper crashes and the startup-only legacy `had_entries`
-//! fallback — sub-operation crash recovery is the single-process model's job,
-//! and the fallback only widens the Enable condition.
+//! turn omits the startup-only legacy `had_entries` fallback (it only widens
+//! the Enable condition). Mid-operation process death is covered by `Crash`:
+//! a CLI-fallback process SIGKILLed between the atomic steps of its operation
+//! — including while the other process is also mid-operation — abandons its
+//! remaining steps, and, being coordinator and holder in one, leaves its own
+//! lockfile entry stale until a later locked mutation prunes it. Intra-write
+//! torn states remain outside both models, per the atomic-write assumption
+//! above.
+//!
+//! Exploring that cross-term surfaces one residual window the protocol cannot
+//! close: a reconcile that re-applies the disable and is SIGKILLed before its
+//! follow-up ownership record leaves — once a concurrent generation-valid
+//! clear removes the marker its prune saw — a standing disable owned by
+//! nobody, indistinguishable from a manual `pmset disablesleep`, which
+//! reconcile deliberately refuses to override. (The reverse ordering,
+//! record-then-toggle, is no fix: it lets a concurrent release validly clear
+//! the freshly recorded marker before the toggle lands, orphaning the disable
+//! with no crash at all.) The model tracks that window exactly
+//! ([`CrossState::orphaned_disable`]), exempts it from the convergence
+//! property, and proves with a `sometimes` property that the exempted window
+//! is actually reached. Convergence is promised again as soon as ownership is
+//! re-established (any marker write) or the disable itself is undone (any
+//! enable) — in practice the next hold/release cycle heals it.
 
 use stateright::{Checker, Model, Property};
 use std::collections::BTreeSet;
@@ -494,6 +523,16 @@ struct CrossState {
     /// current operation was in flight, so i's locked-in decision may be stale
     /// and its completion is not a convergence checkpoint.
     interfered: [bool; 2],
+    /// A standing kernel disable whose ownership record died with its process:
+    /// a reconcile re-applied the disable and was SIGKILLed before the
+    /// follow-up marker write. Until a new marker write covers the disable (or
+    /// an enable undoes it), a generation-valid clear can leave the bit owned
+    /// by nobody — indistinguishable from a manual `pmset disablesleep`, which
+    /// reconcile deliberately leaves untouched — so convergence is not
+    /// promised there. Set only by that specific crash, never inferred from
+    /// state shape, so the exemption cannot mask the Unconditional
+    /// counterexamples (whose traces are crash-free).
+    orphaned_disable: bool,
     /// True in exactly the states reached by completing a *solo* reconcile:
     /// interference-free and with the other process idle. Only there is
     /// convergence promised — a reconcile finishing while the other process is
@@ -514,11 +553,19 @@ enum CrossAction {
     Status(u8),
     /// Advance process `who`'s in-flight operation by one atomic step.
     StepOp(u8),
-    /// SIGKILL the process owning `Pid`. Offered only when both processes are
-    /// quiescent, for the same reason the single-process model restricts kills:
-    /// in-flight decisions are already locked in, so a kill mid-operation is
-    /// equivalent to one just after it.
+    /// SIGKILL the process owning `Pid` while both processes are quiescent.
+    /// Mid-operation death is [`CrossAction::Crash`]; keeping the two disjoint
+    /// avoids redundant states.
     Kill(Pid),
+    /// SIGKILL process `who` while its operation is in flight: the remaining
+    /// steps (and their locked-in decision) vanish, and — a CLI-fallback
+    /// process being coordinator and holder in one — its own lockfile entry
+    /// goes stale. Offered only mid-operation: a quiescent process's death is
+    /// already `Kill` of its pid. No new restart action is needed either: the
+    /// now-quiescent slot's ordinary operations model a fresh replacement
+    /// process (pid reuse is indistinguishable at this abstraction because
+    /// `alive` is the liveness oracle).
+    Crash(u8),
 }
 
 struct CrossProcess {
@@ -571,6 +618,8 @@ impl CrossProcess {
     }
 }
 
+const ORPHANED: &str = "a crash can orphan a reconcile-applied disable";
+
 impl Model for CrossProcess {
     type State = CrossState;
     type Action = CrossAction;
@@ -583,6 +632,7 @@ impl Model for CrossProcess {
             alive: BTreeSet::new(),
             pending: [ProcPending::None; 2],
             interfered: [false; 2],
+            orphaned_disable: false,
             just_reconciled: false,
         }]
     }
@@ -596,7 +646,9 @@ impl Model for CrossProcess {
                 actions.push(CrossAction::Reconcile(who));
                 actions.push(CrossAction::Status(who));
             } else {
-                actions.push(CrossAction::StepOp(u8::try_from(who).unwrap()));
+                let who = u8::try_from(who).unwrap();
+                actions.push(CrossAction::StepOp(who));
+                actions.push(CrossAction::Crash(who));
             }
         }
         if state.pending.iter().all(|p| *p == ProcPending::None) {
@@ -631,6 +683,32 @@ impl Model for CrossProcess {
                 s.alive.remove(&p);
             }
 
+            CrossAction::Crash(who) => {
+                // Only offered while `who`'s operation is in flight. Its
+                // remaining steps die with the process (no marker set, no
+                // generation bump), and its own lockfile entry goes stale.
+                // The survivor's in-flight decision now rests on stale
+                // liveness, so it is tainted like any other concurrent move.
+                let who = usize::from(who);
+                if matches!(
+                    last.pending[who],
+                    ProcPending::ReconcileMarker {
+                        effect: Effect::Disable,
+                        ..
+                    }
+                ) && s.kernel_disabled
+                {
+                    // The disable this reconcile re-applied is still standing,
+                    // and the record that would have owned it just died with
+                    // the process (see the module docs).
+                    s.orphaned_disable = true;
+                }
+                s.pending[who] = ProcPending::None;
+                s.alive.remove(&pid_of(who));
+                s.interfered[who] = false; // no op left to be tainted
+                taint_other_of(&mut s, who);
+            }
+
             CrossAction::Hold(who) => {
                 let who = usize::from(who);
                 let p = pid_of(who);
@@ -641,9 +719,11 @@ impl Model for CrossProcess {
                 if first {
                     // Marker written (and the generation bumped) in the same
                     // flock write that adds the holder; the kernel disable is a
-                    // later step.
+                    // later step. The fresh record owns any standing disable,
+                    // ending an orphaned-disable window.
                     s.marker = true;
                     invalidate_generations(&mut s);
+                    s.orphaned_disable = false;
                     s.pending[who] = ProcPending::HoldToggle;
                     s.interfered[who] = false;
                 }
@@ -758,13 +838,17 @@ impl Model for CrossProcess {
                             (Effect::Disable, MarkerWrite::Unconditional) => {
                                 if !owned {
                                     s.marker = true;
+                                    s.orphaned_disable = false;
                                 }
                             }
                             // Fixed: always re-record ownership (bumping the
-                            // generation) for the disable just re-applied.
+                            // generation) for the disable just re-applied. The
+                            // record owns any standing disable, ending an
+                            // orphaned-disable window.
                             (Effect::Disable, MarkerWrite::Guarded) => {
                                 s.marker = true;
                                 invalidate_generations(&mut s);
+                                s.orphaned_disable = false;
                             }
                             (Effect::Enable, _) => self.clear_marker(&mut s, gen_valid),
                             (Effect::Nothing, _) => unreachable!("completes at start"),
@@ -778,21 +862,40 @@ impl Model for CrossProcess {
             }
         }
 
+        // An enable undoes the standing disable itself, ending any
+        // orphaned-disable window.
+        if !s.kernel_disabled {
+            s.orphaned_disable = false;
+        }
+
         Some(s)
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![Property::<Self>::always(CONVERGES, |_, s| {
-            if !s.just_reconciled {
-                return true;
-            }
-            s.kernel_disabled == (cross_live_count(s) > 0)
-        })]
+        vec![
+            Property::<Self>::always(CONVERGES, |_, s| {
+                // Only meaningful at solo, interference-free reconcile
+                // completions, and not inside the orphaned-disable window the
+                // protocol cannot close (see the module docs).
+                if !s.just_reconciled || s.orphaned_disable {
+                    return true;
+                }
+                s.kernel_disabled == (cross_live_count(s) > 0)
+            }),
+            // Teeth for the exemption above: the orphaned-disable window must
+            // actually be reached, or the carve-out is dead weight and the
+            // convergence check quietly weaker than it claims. (This also
+            // fails the suite if the Crash action is ever dropped, instead of
+            // silently losing the crash coverage.)
+            Property::<Self>::sometimes(ORPHANED, |_, s| s.orphaned_disable),
+        ]
     }
 }
 
 /// The fixed cross-process protocol (guarded marker writes) must converge under
-/// every interleaving of two coordinator processes sharing the lockfile.
+/// every interleaving of two coordinator processes sharing the lockfile,
+/// including mid-operation crashes — outside the documented orphaned-disable
+/// window, whose reachability the [`ORPHANED`] `sometimes` property pins down.
 #[test]
 fn cross_process_fixed_protocol_converges() {
     let checker = CrossProcess {

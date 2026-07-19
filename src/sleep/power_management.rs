@@ -280,7 +280,6 @@ const ASSERTION_PROCESS_NAME_KEY: &str = "Process Name";
 /// A sleep-preventing power assertion held by another process.
 #[derive(Debug, Clone)]
 pub struct ExternalAssertion {
-    pub pid: i32,
     pub process_name: String,
     pub assertion_type: String,
 }
@@ -360,7 +359,6 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
                 continue;
             }
             found.push(ExternalAssertion {
-                pid,
                 process_name: dict_string(dict, &name_key).unwrap_or_default(),
                 assertion_type,
             });
@@ -467,19 +465,18 @@ mod tests {
     #[test]
     #[ignore = "enumerates live IOKit assertions from other processes"]
     fn smoke_external_assertions() {
-        // Hold an assertion ourselves and confirm it is filtered out (same PID).
+        // Hold an assertion ourselves; our own PID is excluded inside
+        // `external_assertions`, so only other processes' holds come back.
         let _held = create_assertion(AssertionType::PreventUserIdleSystemSleep, false).unwrap();
         let externals = external_assertions(&[AssertionType::PreventUserIdleSystemSleep]).unwrap();
-        let self_pid = std::process::id().cast_signed();
         for assertion in &externals {
-            assert_ne!(assertion.pid, self_pid, "self PID must be excluded");
             assert_eq!(
                 assertion.assertion_type,
                 AssertionType::PreventUserIdleSystemSleep.as_str()
             );
             println!(
-                "external assertion: pid={} name={} type={}",
-                assertion.pid, assertion.process_name, assertion.assertion_type
+                "external assertion: name={} type={}",
+                assertion.process_name, assertion.assertion_type
             );
         }
     }

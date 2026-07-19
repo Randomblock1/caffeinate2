@@ -59,8 +59,10 @@ struct EntirelyCoordinatorInner {
     /// failed-response rollback can only undo the exact hold it belongs to —
     /// a newer re-hold from the same process bumps the epoch and invalidates
     /// the stale rollback. Deliberately in-memory (unlike the ownership
-    /// marker): a rollback never spans a coordinator restart, and the map is
-    /// bounded by one `u64` per distinct client process served.
+    /// marker): a rollback never spans a coordinator restart. Entries for
+    /// processes that have since died are pruned by [`Self::reconcile`] under
+    /// the same liveness check as the lockfile, so a long-lived keep-alive
+    /// daemon does not accumulate one entry per distinct client forever.
     hold_epochs: Mutex<std::collections::HashMap<ProcessId, u64>>,
 }
 
@@ -367,6 +369,15 @@ impl EntirelyCoordinator {
             &inner.lock_file_path,
             inner.process_checker.as_ref(),
         )?;
+        // Drop epoch entries for holders whose processes have died. A missing
+        // entry already means "skip rollback", which is the correct answer once
+        // the process is gone; live processes are kept so an in-flight
+        // failed-response rollback can still match its epoch. Pruning only here
+        // (never on release for a live process) preserves the epoch-reuse guard.
+        {
+            let mut epochs = inner.hold_epochs.lock().unwrap_or_else(|e| e.into_inner());
+            epochs.retain(|id, _| (inner.process_checker.as_ref())(id.pid, id.start_time));
+        }
         if holders > 0 {
             // Live holders remain: always re-apply the disable. The
             // SleepDisabler abstraction is write-only, so we can't read the
@@ -388,6 +399,17 @@ impl EntirelyCoordinator {
             // otherwise be owned by nobody, stranding sleep disabled once the
             // holders drain. (This also covers legacy lockfiles and holders
             // that appeared without us having toggled sleep yet.)
+            //
+            // A SIGKILL landing between the toggle above and this write leaves
+            // that same nobody-owns-it disable if a concurrent release's
+            // generation-valid clear then runs: an empty, unmarked lockfile
+            // with sleep still disabled, indistinguishable from a manual
+            // `pmset disablesleep` and so never overridden by reconcile. The
+            // window is inherent — the kernel toggle and the lockfile write
+            // cannot be made atomic together, and writing the marker first is
+            // worse (a concurrent valid clear would orphan the disable with no
+            // crash at all). It heals on the next hold/release cycle, and the
+            // cross-process model tracks it as `orphaned_disable`.
             lockfile::set_owns_disable(
                 inner.verbose,
                 &inner.lock_file_path,
@@ -784,6 +806,54 @@ mod tests {
 
         coordinator.reconcile().unwrap();
         assert_eq!(*sleep_calls.lock().unwrap(), vec![false]);
+
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// A dead client's epoch entry must be pruned by a reconcile pass, so the
+    /// in-memory map cannot grow without bound over a long-lived daemon.
+    #[test]
+    fn reconcile_prunes_epoch_entries_for_dead_processes() {
+        let lock_path = temp_lock_path();
+        let _ = std::fs::remove_file(&lock_path);
+        let sleep_disabler: SleepDisabler = Arc::new(|_, _| Ok(()));
+        // Every process is treated as dead, so the reconcile pass reaps the
+        // recorded epoch entry.
+        let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+        let dead = ProcessId {
+            pid: 999_998,
+            start_time: ProcessStartTime {
+                seconds: 3,
+                microseconds: 0,
+            },
+        };
+
+        coordinator.hold(dead).unwrap();
+        assert!(
+            coordinator
+                .inner
+                .hold_epochs
+                .lock()
+                .unwrap()
+                .contains_key(&dead)
+        );
+
+        coordinator.reconcile().unwrap();
+
+        assert!(
+            !coordinator
+                .inner
+                .hold_epochs
+                .lock()
+                .unwrap()
+                .contains_key(&dead)
+        );
 
         let _ = std::fs::remove_file(&lock_path);
     }

@@ -83,13 +83,15 @@ Put `--` before the command when it could be parsed as another option or argumen
 
 ### Timeout and PID
 
-Sleep is disabled for a certain amount of time, or until the program with the specified PID completes. If both are specified, it waits until one of them completes.
+Sleep is disabled for a certain amount of time, or until the program with the specified PID completes. If both are specified, it waits until one of them completes. The `-t` countdown measures awake time: if the Mac sleeps before it elapses (for example the lid is closed, which the default modes don't prevent), the countdown pauses and resumes on wake.
 
 **`-t` / `--timeout` takes one argument:**
 
 - **Bare number** → seconds (e.g. `-t 3600`)
 - **Single humantime token** → parsed duration (e.g. `-t 10m`, `-t 1.5h`)
 - **Quoted multi-word string** → parsed duration (e.g. `-t "1 hour and 30 minutes"`)
+
+The value must be a positive duration — `-t 0` (or anything that doesn't parse) is rejected in every mode, including alongside `-w` or a trailing command.
 
 Supported units include seconds, minutes, hours, days, weeks, months, and years, plus short forms like `s`, `m`, `h`, and `d`. Anything after the timeout value is treated as a trailing command, not part of the duration — there is no multi-word duration inference, so quote the duration instead:
 
@@ -123,7 +125,7 @@ Run `caffeinate2-tray` after installing with `--features full`. To run it in the
 
 `caffeinate2-tray -d`
 
-This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Logs are discarded in this mode (run it in the foreground to see them). Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
+This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Its stderr is captured, best-effort, to `~/Library/Logs/caffeinate2-tray.log` (appended, never rotated), and is discarded only if that file cannot be opened; run it in the foreground to watch the logs live. Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
 
 - **Left click:** toggle the selected sleep mode on/off.
 - **Right click:** open the menu:
@@ -134,7 +136,7 @@ This returns control to the shell immediately and keeps the menu bar icon runnin
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
-When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active.
+When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active. Time limits count awake time: if the Mac sleeps mid-session (for example the lid is closed, which no mode prevents), the countdown pauses and resumes on wake.
 
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 

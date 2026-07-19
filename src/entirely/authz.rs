@@ -17,6 +17,7 @@
 //! a root LaunchDaemon and the CLI/tray run with the invoking user's real
 //! credentials; keep them that way.
 
+use crate::util::shell_quote::sh_single_quote;
 use std::ffi::{CStr, CString};
 
 /// Dedicated group an administrator can add standard accounts to in order to
@@ -84,8 +85,14 @@ fn gid_for_group(name: &str) -> Option<libc::gid_t> {
 /// legitimate user.
 const MAX_GROUP_CAPACITY: libc::c_int = 65_536;
 
-fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
-    let cname = CString::new(user.name.as_str()).ok()?;
+/// Resolve every group `name` belongs to (its primary `primary_gid` plus all
+/// supplementary groups), following directory-services membership via
+/// `getgrouplist`. Fails closed (returns `None`) on a pathological group count
+/// or an un-encodable name. `getgrouplist` is not exposed by `nix` on Apple
+/// targets, so the libc loop is hand-rolled here and shared across binaries.
+#[must_use]
+pub fn group_ids_for_user(name: &str, primary_gid: libc::gid_t) -> Option<Vec<libc::gid_t>> {
+    let cname = CString::new(name).ok()?;
     let mut capacity: libc::c_int = 32;
     // macOS getgrouplist returns -1 when the array is too small (with
     // *ngroups set to how many fit), so grow and retry until it succeeds or we
@@ -96,7 +103,7 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
         let ret = unsafe {
             libc::getgrouplist(
                 cname.as_ptr(),
-                user.primary_gid.cast_signed(),
+                primary_gid.cast_signed(),
                 groups.as_mut_ptr(),
                 &raw mut count,
             )
@@ -107,9 +114,8 @@ fn group_ids_for_user(user: &User) -> Option<Vec<libc::gid_t>> {
         }
         if capacity >= MAX_GROUP_CAPACITY {
             tracing::warn!(
-                "user '{}' belongs to more than {MAX_GROUP_CAPACITY} groups; \
-                 denying entirely-mode authorization (fail closed)",
-                user.name
+                "user '{name}' belongs to more than {MAX_GROUP_CAPACITY} groups; \
+                 denying entirely-mode authorization (fail closed)"
             );
             return None;
         }
@@ -127,7 +133,7 @@ pub fn uid_may_hold(uid: libc::uid_t) -> bool {
     let Some(user) = user_for_uid(uid) else {
         return false;
     };
-    let Some(groups) = group_ids_for_user(&user) else {
+    let Some(groups) = group_ids_for_user(&user.name, user.primary_gid) else {
         return false;
     };
     [ADMIN_GROUP, GRANT_GROUP]
@@ -152,12 +158,6 @@ pub fn denial_message(uid: libc::uid_t) -> String {
     )
 }
 
-/// Wrap `s` in single quotes for safe inclusion in a shell command shown to the
-/// user, escaping embedded single quotes.
-fn sh_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +172,8 @@ mod tests {
         let uid = nix::unistd::getuid().as_raw();
         let user = user_for_uid(uid).expect("current user should resolve");
         assert!(!user.name.is_empty());
-        let groups = group_ids_for_user(&user).expect("groups should resolve");
+        let groups =
+            group_ids_for_user(&user.name, user.primary_gid).expect("groups should resolve");
         assert!(groups.contains(&user.primary_gid));
     }
 

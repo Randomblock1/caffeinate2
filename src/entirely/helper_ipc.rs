@@ -70,9 +70,41 @@ impl HelperStatus {
     /// serving across package upgrades, so helper-side fixes only take effect
     /// after a reinstall (`sudo caffeinate2 --install-helper`) — callers
     /// should surface that.
+    ///
+    /// Deliberately direction-blind: any mismatch (helper older *or* newer, or
+    /// pre-versioning) is stale, because a reinstall is warranted either way.
+    /// Callers that need to word the remediation by direction use
+    /// [`Self::helper_is_newer`].
     #[must_use]
     pub fn is_stale(&self) -> bool {
         self.version.as_deref() != Some(Self::CLIENT_VERSION)
+    }
+
+    /// True iff the installed helper reports a version strictly newer than this
+    /// binary, comparing dot-separated components as `u64`s. An absent or
+    /// unparsable helper version reads as false, so a caller only claims the
+    /// helper is ahead when it can prove the direction.
+    #[must_use]
+    pub fn helper_is_newer(&self) -> bool {
+        self.version
+            .as_deref()
+            .is_some_and(|version| version_is_newer(version, Self::CLIENT_VERSION))
+    }
+}
+
+/// Parse a dot-separated numeric version into its components, returning `None`
+/// if any component is not a `u64`.
+fn parse_version(version: &str) -> Option<Vec<u64>> {
+    version.split('.').map(|c| c.parse::<u64>().ok()).collect()
+}
+
+/// Whether `candidate` is a strictly newer version than `baseline` under a
+/// component-wise numeric comparison. A version that fails to parse is never
+/// treated as newer.
+fn version_is_newer(candidate: &str, baseline: &str) -> bool {
+    match (parse_version(candidate), parse_version(baseline)) {
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        _ => false,
     }
 }
 
@@ -136,27 +168,17 @@ impl HelperResponse {
     }
 }
 
-fn try_encode_request(request: &HelperRequest) -> Result<String, serde_json::Error> {
-    Ok(serde_json::to_string(request)? + "\n")
+fn try_encode<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    Ok(serde_json::to_string(value)? + "\n")
 }
 
+/// Decode one newline-framed JSON line into `T` (a [`HelperRequest`] on the
+/// server, a [`HelperResponse`] on the client).
 ///
 /// # Errors
 ///
-/// Returns an error if the line is not valid JSON for a helper request.
-pub fn decode_request(line: &str) -> Result<HelperRequest, serde_json::Error> {
-    serde_json::from_str(line.trim())
-}
-
-fn try_encode_response(response: &HelperResponse) -> Result<String, serde_json::Error> {
-    Ok(serde_json::to_string(response)? + "\n")
-}
-
-///
-/// # Errors
-///
-/// Returns an error if the line is not valid JSON for a helper response.
-pub fn decode_response(line: &str) -> Result<HelperResponse, serde_json::Error> {
+/// Returns an error if the line is not valid JSON for `T`.
+pub fn decode<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(line.trim())
 }
 
@@ -170,8 +192,8 @@ fn configure_rpc_timeouts(stream: &UnixStream) -> Result<(), HelperIpcError> {
 }
 
 fn write_request(stream: &mut UnixStream, request: &HelperRequest) -> Result<(), HelperIpcError> {
-    let encoded = try_encode_request(request)
-        .map_err(|e| HelperIpcError::new(format!("encode failed: {e}")))?;
+    let encoded =
+        try_encode(request).map_err(|e| HelperIpcError::new(format!("encode failed: {e}")))?;
     stream
         .write_all(encoded.as_bytes())
         .map_err(|e| HelperIpcError::new(format!("write failed: {e}")))?;
@@ -200,7 +222,7 @@ fn read_line(stream: &mut UnixStream) -> Result<String, HelperIpcError> {
 
 fn read_response_line(stream: &mut UnixStream) -> Result<HelperResponse, HelperIpcError> {
     let line = read_line(stream)?;
-    decode_response(&line).map_err(|e| HelperIpcError::new(format!("invalid response: {e}")))
+    decode(&line).map_err(|e| HelperIpcError::new(format!("invalid response: {e}")))
 }
 
 /// Read one newline-framed line, enforcing `deadline` across the whole read:
@@ -268,18 +290,12 @@ fn read_request_line(
     deadline: Instant,
 ) -> Result<HelperRequest, HelperIpcError> {
     let line = read_line_with_deadline(stream, deadline)?;
-    decode_request(&line).map_err(|e| HelperIpcError::new(format!("invalid request: {e}")))
+    decode(&line).map_err(|e| HelperIpcError::new(format!("invalid request: {e}")))
 }
 
-fn rpc(
-    socket_path: &str,
-    request: &HelperRequest,
-    with_timeouts: bool,
-) -> Result<HelperResponse, HelperIpcError> {
+fn rpc(socket_path: &str, request: &HelperRequest) -> Result<HelperResponse, HelperIpcError> {
     let mut stream = UnixStream::connect(socket_path).map_err(HelperIpcError::connect)?;
-    if with_timeouts {
-        configure_rpc_timeouts(&stream)?;
-    }
+    configure_rpc_timeouts(&stream)?;
     write_request(&mut stream, request)?;
     read_response_line(&mut stream)
 }
@@ -317,7 +333,7 @@ impl HelperClient {
     ///
     /// Returns an error if the status RPC fails.
     pub fn status(&self) -> Result<HelperStatus, HelperIpcError> {
-        rpc(&self.socket_path, &HelperRequest::Status, true)?.into_status()
+        rpc(&self.socket_path, &HelperRequest::Status)?.into_status()
     }
 }
 
@@ -375,7 +391,7 @@ impl HelperHoldGuard {
         // Hold the count lock across the Hold RPC so a concurrent release can't
         // slip its decrement-and-Release between this RPC and the increment.
         let mut count = HELPER_HOLD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
-        match rpc(&client.socket_path, &HelperRequest::Hold, true) {
+        match rpc(&client.socket_path, &HelperRequest::Hold) {
             // The helper answered. An explicit `Error` response means it did not
             // commit a hold, so there is nothing to release; just surface it.
             Ok(response) => response.into_hold_ok()?,
@@ -396,7 +412,7 @@ impl HelperHoldGuard {
             // the abandoned Hold cannot strand a live-pid entry either way.
             Err(e) => {
                 if *count == 0 {
-                    let _ = rpc(&client.socket_path, &HelperRequest::Release, true);
+                    let _ = rpc(&client.socket_path, &HelperRequest::Release);
                 }
                 return Err(e);
             }
@@ -449,7 +465,7 @@ impl HelperHoldGuard {
         // harmless. On failure the count stays at 1 so a later explicit retry
         // still owns the 1 -> 0 transition — unless this is the final Drop-time
         // attempt (`discarding`), after which no guard remains to retry.
-        match rpc(&self.client.socket_path, &HelperRequest::Release, true)
+        match rpc(&self.client.socket_path, &HelperRequest::Release)
             .and_then(HelperResponse::into_release_ok)
         {
             Ok(()) => {
@@ -490,7 +506,7 @@ pub fn write_response(
     stream: &mut UnixStream,
     response: &HelperResponse,
 ) -> Result<(), HelperIpcError> {
-    let encoded = try_encode_response(response).map_err(HelperIpcError::from)?;
+    let encoded = try_encode(response).map_err(HelperIpcError::from)?;
     stream
         .write_all(encoded.as_bytes())
         .map_err(|e| HelperIpcError::new(e.to_string()))?;
@@ -897,7 +913,7 @@ mod tests {
                 requests_server
                     .lock()
                     .unwrap()
-                    .push(decode_request(&line).unwrap());
+                    .push(decode::<HelperRequest>(&line).unwrap());
                 write_response(&mut stream, &response).unwrap();
             }
         });
@@ -1093,7 +1109,10 @@ mod tests {
 
         let line =
             read_line_with_deadline(&mut right, Instant::now() + Duration::from_secs(5)).unwrap();
-        assert_eq!(decode_request(&line).unwrap(), HelperRequest::Status);
+        assert_eq!(
+            decode::<HelperRequest>(&line).unwrap(),
+            HelperRequest::Status
+        );
     }
 
     #[test]
@@ -1113,7 +1132,7 @@ mod tests {
             HelperRequest::Release,
             HelperRequest::Status,
         ] {
-            let decoded = decode_request(&try_encode_request(&req).unwrap()).unwrap();
+            let decoded = decode::<HelperRequest>(&try_encode(&req).unwrap()).unwrap();
             assert_eq!(decoded, req);
         }
     }
@@ -1125,7 +1144,7 @@ mod tests {
             sleep_disabled: true,
             version: Some(HelperStatus::CLIENT_VERSION.to_string()),
         };
-        let decoded = decode_response(&try_encode_response(&resp).unwrap()).unwrap();
+        let decoded = decode::<HelperResponse>(&try_encode(&resp).unwrap()).unwrap();
         assert_eq!(decoded, resp);
     }
 
@@ -1135,7 +1154,10 @@ mod tests {
     #[test]
     fn legacy_status_without_version_parses_as_stale() {
         let legacy = r#"{"kind":"status","holders":1,"sleep_disabled":true}"#;
-        let status = decode_response(legacy).unwrap().into_status().unwrap();
+        let status = decode::<HelperResponse>(legacy)
+            .unwrap()
+            .into_status()
+            .unwrap();
         assert_eq!(status.version, None);
         assert!(status.is_stale());
 
@@ -1145,6 +1167,23 @@ mod tests {
             version: Some(HelperStatus::CLIENT_VERSION.to_string()),
         };
         assert!(!current.into_status().unwrap().is_stale());
+    }
+
+    /// `helper_is_newer` answers the direction question `is_stale` deliberately
+    /// leaves open: only a parseable, strictly-newer helper version is true.
+    #[test]
+    fn helper_is_newer_is_direction_aware() {
+        let status = |version: Option<&str>| HelperStatus {
+            holders: 0,
+            sleep_disabled: false,
+            version: version.map(str::to_string),
+        };
+
+        assert!(status(Some("999.0.0")).helper_is_newer());
+        assert!(!status(Some(HelperStatus::CLIENT_VERSION)).helper_is_newer());
+        assert!(!status(Some("0.0.0")).helper_is_newer());
+        assert!(!status(None).helper_is_newer());
+        assert!(!status(Some("not.a.version")).helper_is_newer());
     }
 
     #[test]

@@ -11,18 +11,25 @@ use crate::tray::macos_apps;
 use libproc::bsd_info::BSDInfo;
 use libproc::proc_pid::{pidinfo, pidpath};
 use libproc::processes::{ProcFilter, pids_by_type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long to reuse a process-tree scan on the main thread before refreshing.
 const PROC_SCAN_CACHE_TTL: Duration = Duration::from_secs(3);
 
-type ExecPathCache = Option<(Instant, Vec<String>)>;
+/// Cached live-process executable paths. `raw` is the cheap `proc_pidpath`
+/// scan; `canonical` is filled in lazily the first time a watch check has to
+/// fall back to comparing realpaths (see [`exec_paths_match`]).
+struct LiveExecPaths {
+    stamp: Instant,
+    raw: Vec<String>,
+    canonical: Option<Vec<String>>,
+}
 
-static EXEC_PATH_CACHE: OnceLock<Mutex<ExecPathCache>> = OnceLock::new();
+static EXEC_PATH_CACHE: OnceLock<Mutex<Option<LiveExecPaths>>> = OnceLock::new();
 
-fn exec_path_cache() -> &'static Mutex<Option<(Instant, Vec<String>)>> {
+fn exec_path_cache() -> &'static Mutex<Option<LiveExecPaths>> {
     EXEC_PATH_CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -115,25 +122,25 @@ pub fn list_processes() -> Vec<ProcInfo> {
     out
 }
 
-/// Canonicalized executable paths of all live processes — the lightweight scan
-/// the watch loop uses to test `Executable` targets (no `proc_pidinfo`, just
-/// paths). Paths are canonicalized here so the result (including the per-process
-/// `realpath` cost) is cached: repeated main-thread polls neither walk the full
-/// process tree nor re-canonicalize hundreds of paths every tick.
-fn running_executable_paths() -> Vec<String> {
+/// Raw executable paths of all live processes (`proc_pidpath`, not realpath) —
+/// the lightweight scan the watch loop uses to test `Executable` targets (no
+/// `proc_pidinfo`, just paths). The result is cached so repeated main-thread
+/// polls don't re-walk the process tree every tick; canonicalization is
+/// deferred to [`canonical_live_paths`] and only paid when a target fails to
+/// match a raw path.
+fn running_executable_paths_raw() -> Vec<String> {
     let cache = exec_path_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((stamp, paths)) = cache.as_ref()
-        && stamp.elapsed() < PROC_SCAN_CACHE_TTL
+    if let Some(entry) = cache.as_ref()
+        && entry.stamp.elapsed() < PROC_SCAN_CACHE_TTL
     {
-        return paths.clone();
+        return entry.raw.clone();
     }
     drop(cache);
 
-    let paths: Vec<String> = all_pids()
+    let raw: Vec<String> = all_pids()
         .into_iter()
         .map(proc_path)
         .filter(|path| !path.is_empty())
-        .map(|path| canonical_exec_path(&path))
         .collect();
 
     // Only cache a non-empty scan. `all_pids()` returns an empty Vec when the
@@ -142,15 +149,38 @@ fn running_executable_paths() -> Vec<String> {
     // and could prematurely end a watch session. Returning the empty result for
     // this one tick (without caching it) self-corrects on the next poll, which
     // matches the pre-caching behaviour.
-    if !paths.is_empty() {
-        *exec_path_cache().lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((Instant::now(), paths.clone()));
+    if !raw.is_empty() {
+        *exec_path_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(LiveExecPaths {
+            stamp: Instant::now(),
+            raw: raw.clone(),
+            canonical: None,
+        });
     }
-    paths
+    raw
 }
 
-/// Drop the cached process scan so the next [`running_executable_paths`] call
-/// does a fresh walk. Called when the watch set or enable state changes, where
+/// Realpath-canonicalized live executable paths, memoized on the current cache
+/// entry so a watch check that has to compare realpaths (a symlinked live
+/// process, or a not-yet-running target) canonicalizes the process table at
+/// most once per [`PROC_SCAN_CACHE_TTL`] rather than every poll. Falls back to
+/// canonicalizing `raw_live` directly when no fresh entry exists (an empty scan
+/// is never cached).
+fn canonical_live_paths(raw_live: &[String]) -> Vec<String> {
+    let mut cache = exec_path_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = cache.as_mut()
+        && entry.stamp.elapsed() < PROC_SCAN_CACHE_TTL
+    {
+        if entry.canonical.is_none() {
+            entry.canonical = Some(entry.raw.iter().map(|p| canonical_exec_path(p)).collect());
+        }
+        return entry.canonical.clone().unwrap_or_default();
+    }
+    drop(cache);
+    raw_live.iter().map(|p| canonical_exec_path(p)).collect()
+}
+
+/// Drop the cached process scan so the next [`running_executable_paths_raw`]
+/// call does a fresh walk. Called when the watch set or enable state changes, where
 /// a scan cached up to [`PROC_SCAN_CACHE_TTL`] ago could predate a just-launched
 /// target and make the first "seen running" decision miss a short-lived process.
 pub fn invalidate_exec_path_cache() {
@@ -172,8 +202,9 @@ fn outermost_app_path(exec_path: &str) -> Option<&str> {
     Some(&exec_path[..idx + ".app".len()])
 }
 
-/// File-stem label for a non-bundle executable path.
-fn file_stem(path: &str) -> Option<String> {
+/// File-stem of a filesystem path — the label shown for a non-bundle program,
+/// and the app-name fallback in [`macos_apps::bundle_from_app_path`].
+pub(crate) fn file_stem(path: &str) -> Option<String> {
     std::path::Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -199,8 +230,10 @@ fn bundle_for_app_path(
 }
 
 /// Whether a process should be hidden by the default "hide system apps" filter.
-/// Apple `.app`s (Finder, Dock, …) and OS daemons are system; Homebrew binaries
-/// under `/usr/local` or `/opt` and user apps are not.
+/// Apple `.app`s (Finder, Dock, …) and OS daemons are system, as is any
+/// root-owned process outside `/Applications` regardless of path (so a
+/// root-run Homebrew daemon counts as system). Non-root Homebrew binaries under
+/// `/usr/local` or `/opt` and user apps are not.
 fn is_system_process(exec_path: &str, uid: u32, bundle: Option<&BundleRef>) -> bool {
     if let Some(bundle) = bundle {
         return bundle.bundle_id.starts_with("com.apple.");
@@ -327,13 +360,41 @@ pub fn any_target_running(targets: &[WatchTarget]) -> bool {
     if exec_paths.is_empty() {
         return false;
     }
-    // `running_executable_paths` already returns canonical paths (cached), so
-    // only the handful of target paths need canonicalizing here.
-    let running = running_executable_paths();
-    exec_paths
+    let raw_live = running_executable_paths_raw();
+    exec_paths_match(&exec_paths, &raw_live, || canonical_live_paths(&raw_live))
+}
+
+/// Raw-first match of executable `targets` against the live process paths.
+///
+/// A target counts as running if its raw path — or its realpath, for a
+/// symlinked target — equals a live process' raw path. Only when nothing
+/// matches do we canonicalize the live paths (via `canon_live`, evaluated
+/// lazily) to also catch a live process whose own path is a symlink resolving
+/// to the target. This keeps the common case off `realpath` entirely while
+/// preserving the symlinked-target-vs-symlinked-process matching the watch loop
+/// relies on. Split out from the scan/cache so it is unit-testable.
+fn exec_paths_match(
+    targets: &[&str],
+    raw_live: &[String],
+    canon_live: impl FnOnce() -> Vec<String>,
+) -> bool {
+    let raw_set: HashSet<&str> = raw_live.iter().map(String::as_str).collect();
+    let canon_targets: Vec<String> = targets
         .iter()
         .map(|path| canonical_exec_path(path))
-        .any(|target| running.iter().any(|live| live == &target))
+        .collect();
+    let raw_hit = targets
+        .iter()
+        .zip(&canon_targets)
+        .any(|(raw, canon)| raw_set.contains(*raw) || raw_set.contains(canon.as_str()));
+    if raw_hit {
+        return true;
+    }
+    let canon_live = canon_live();
+    let canon_set: HashSet<&str> = canon_live.iter().map(String::as_str).collect();
+    canon_targets
+        .iter()
+        .any(|canon| canon_set.contains(canon.as_str()))
 }
 
 #[cfg(test)]
@@ -384,6 +445,9 @@ mod tests {
         assert!(is_system_process("/sbin/launchd", 0, None));
         assert!(!is_system_process("/usr/local/bin/node", 501, None));
         assert!(!is_system_process("/opt/homebrew/bin/python3", 501, None));
+        // A root-owned process outside /Applications is system even under a
+        // Homebrew prefix: the uid==0 clause overrides the path allowance.
+        assert!(is_system_process("/usr/local/bin/node", 0, None));
     }
 
     #[test]
@@ -393,5 +457,93 @@ mod tests {
             file_stem("/Applications/Foo.app/Contents/MacOS/Foo Helper (GPU)").as_deref(),
             Some("Foo Helper (GPU)")
         );
+    }
+
+    /// A temp real file plus a symlink to it, for the realpath-matching tests.
+    /// Removed on drop.
+    struct SymlinkEnv {
+        dir: std::path::PathBuf,
+        /// Raw (non-canonical) path of the symlink to the real file.
+        link: String,
+        /// Canonical path of the real file the symlink points at.
+        real_canon: String,
+    }
+
+    impl SymlinkEnv {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("caffeinate2_exec_{}_{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let real = dir.join("real_bin");
+            std::fs::write(&real, b"").unwrap();
+            let link = dir.join("link_bin");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let real_canon = std::fs::canonicalize(&real)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            Self {
+                dir,
+                link: link.to_string_lossy().into_owned(),
+                real_canon,
+            }
+        }
+    }
+
+    impl Drop for SymlinkEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn exec_paths_match_hits_raw_path_without_canonicalizing_live() {
+        // A target whose raw path is live matches directly; the live realpath
+        // fallback must not run (the closure would panic).
+        let raw_live = vec!["/opt/does-not-exist/daemon".to_string()];
+        assert!(exec_paths_match(
+            &["/opt/does-not-exist/daemon"],
+            &raw_live,
+            || panic!("raw match must not canonicalize the live set"),
+        ));
+    }
+
+    #[test]
+    fn exec_paths_match_misses_absent_target() {
+        let raw_live = vec!["/opt/does-not-exist/daemon".to_string()];
+        assert!(!exec_paths_match(
+            &["/opt/does-not-exist/other"],
+            &raw_live,
+            || vec!["/opt/does-not-exist/daemon".to_string()],
+        ));
+    }
+
+    #[test]
+    fn exec_paths_match_resolves_symlinked_target() {
+        let env = SymlinkEnv::new("target_symlink");
+        // The live process reports the real path; the watch target was stored
+        // as a symlink to it. Canonicalizing the handful of targets is enough
+        // to match, so the live-set fallback must not run.
+        let raw_live = vec![env.real_canon.clone()];
+        assert!(exec_paths_match(
+            &[env.link.as_str()],
+            &raw_live,
+            || panic!("canonical target match must not canonicalize the live set")
+        ));
+    }
+
+    #[test]
+    fn exec_paths_match_resolves_symlinked_live_process() {
+        let env = SymlinkEnv::new("live_symlink");
+        // The live process reports a symlink path; the target is the real path.
+        // Neither the raw path nor the canonical target matches, so the fallback
+        // must canonicalize the live set to resolve the symlink.
+        let raw_live = vec![env.link.clone()];
+        assert!(exec_paths_match(
+            &[env.real_canon.as_str()],
+            &raw_live,
+            || raw_live.iter().map(|p| canonical_exec_path(p)).collect(),
+        ));
     }
 }

@@ -2,8 +2,28 @@ use caffeinate2::util::logging;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::{process, thread};
+
+/// Elapsed time since an arbitrary fixed point, read from `CLOCK_MONOTONIC`.
+///
+/// On Darwin this clock advances while the system is asleep (unlike
+/// `std::time::Instant`, which pauses) yet is immune to wall-clock steps
+/// (unlike `SystemTime`): a system sleep during the measurement window is the
+/// only thing that widens the reading, never an NTP or manual clock adjustment.
+fn monotonic_now() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // A read against a valid timespec pointer does not fail; treat any
+    // unexpected error as zero elapsed so a bad reading never fabricates a
+    // sleep event.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return Duration::ZERO;
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
 
 /// Detects if a sleep event occurred by measuring the elapsed time of a sleep operation.
 ///
@@ -81,11 +101,11 @@ fn main() {
     // Detect sleep by measuring actual elapsed time vs expected sleep duration.
     // If the system sleeps, the elapsed time will be much longer than requested.
     loop {
-        let now = SystemTime::now();
+        let start = monotonic_now();
 
         let sleep_result = detect_sleep_event(SLEEP_DURATION, SLEEP_THRESHOLD, |duration| {
             sleep(duration);
-            now.elapsed().map_err(|_| ())
+            Ok(monotonic_now().saturating_sub(start))
         });
 
         if let Some(excess_duration) = sleep_result {

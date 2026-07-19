@@ -22,6 +22,21 @@ pub fn get_process_start_time(pid: i32) -> Option<ProcessStartTime> {
         })
 }
 
+/// Read a process's start time, retrying briefly to ride out a transient
+/// `proc_pidinfo` failure (e.g. EBUSY) on a process that is very much alive.
+/// Returns `None` only after every attempt failed.
+fn read_start_time_retrying(pid: i32) -> Option<ProcessStartTime> {
+    for attempt in 0..START_TIME_READ_ATTEMPTS {
+        if let Some(start_time) = get_process_start_time(pid) {
+            return Some(start_time);
+        }
+        if attempt + 1 < START_TIME_READ_ATTEMPTS {
+            std::thread::sleep(START_TIME_RETRY_DELAY);
+        }
+    }
+    None
+}
+
 #[must_use]
 pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
     let is_alive = !matches!(
@@ -33,28 +48,22 @@ pub fn default_process_checker(pid: i32, start_time: ProcessStartTime) -> bool {
         return false;
     }
 
-    // Retry a few times so a single transient proc_pidinfo failure doesn't
-    // force a fail-open decision. A real start-time read settles recycled-pid
-    // detection definitively; only persistent failure falls open.
-    for attempt in 0..START_TIME_READ_ATTEMPTS {
-        if let Some(actual_start_time) = get_process_start_time(pid) {
-            return actual_start_time == start_time;
-        }
-        if attempt + 1 < START_TIME_READ_ATTEMPTS {
-            std::thread::sleep(START_TIME_RETRY_DELAY);
+    // A real start-time read settles recycled-pid detection definitively.
+    match read_start_time_retrying(pid) {
+        Some(actual_start_time) => actual_start_time == start_time,
+        None => {
+            // Tradeoff: kill(pid, 0) already showed a live process, and dropping
+            // a live holder on a transient proc_pidinfo failure would incorrectly
+            // re-enable sleep. So after exhausting retries we fail open (keep the
+            // holder) and accept weaker recycled-pid detection until the next
+            // reconcile, rather than risk re-enabling sleep under an active hold.
+            tracing::warn!(
+                "could not read start time for live pid {pid} after \
+                 {START_TIME_READ_ATTEMPTS} attempts; keeping holder for now"
+            );
+            true
         }
     }
-
-    // Tradeoff: kill(pid, 0) already showed a live process, and dropping a live
-    // holder on a transient proc_pidinfo failure would incorrectly re-enable
-    // sleep. So after exhausting retries we fail open (keep the holder) and
-    // accept weaker recycled-pid detection until the next reconcile, rather
-    // than risk re-enabling sleep under an active hold.
-    tracing::warn!(
-        "could not read start time for live pid {pid} after \
-         {START_TIME_READ_ATTEMPTS} attempts; keeping holder for now"
-    );
-    true
 }
 
 ///
@@ -68,15 +77,10 @@ pub fn process_id_from_pid(
     // retry briefly before giving up — the same tolerance `default_process_checker`
     // applies. Failing on the first miss would break peer-identity reads for a
     // freshly connected helper client and hold acquisition for this process.
-    for attempt in 0..START_TIME_READ_ATTEMPTS {
-        if let Some(start_time) = get_process_start_time(pid) {
-            return Ok(crate::entirely::lockfile::ProcessId { pid, start_time });
-        }
-        if attempt + 1 < START_TIME_READ_ATTEMPTS {
-            std::thread::sleep(START_TIME_RETRY_DELAY);
-        }
+    match read_start_time_retrying(pid) {
+        Some(start_time) => Ok(crate::entirely::lockfile::ProcessId { pid, start_time }),
+        None => Err(std::io::Error::other(
+            "Failed to determine process start time",
+        )),
     }
-    Err(std::io::Error::other(
-        "Failed to determine process start time",
-    ))
 }

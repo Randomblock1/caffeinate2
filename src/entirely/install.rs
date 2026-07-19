@@ -5,6 +5,7 @@ use crate::entirely::lockfile;
 use crate::entirely::process_util;
 use crate::sleep::power_management;
 use crate::util::fs_util;
+use crate::util::shell_quote::sh_single_quote;
 use libc::{S_IFDIR, S_IFMT};
 use serde::Serialize;
 use std::fs;
@@ -569,10 +570,6 @@ pub fn tray_launch_agent_installed() -> bool {
         .unwrap_or(false)
 }
 
-fn sh_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -660,12 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn privileged_install_quoting_survives_spaces_and_quotes() {
-        assert_eq!(
-            sh_single_quote("/Users/a b/caffeinate2"),
-            "'/Users/a b/caffeinate2'"
-        );
-        assert_eq!(sh_single_quote("it's"), r"'it'\''s'");
+    fn applescript_escaping_survives_quotes_and_backslashes() {
         assert_eq!(applescript_escape(r"'it'\''s'"), r"'it'\\''s'");
         assert_eq!(applescript_escape("say \"hi\""), r#"say \"hi\""#);
     }

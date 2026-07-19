@@ -41,6 +41,9 @@ const ROW_HEIGHT: f64 = 24.0;
 const INNER_W: f64 = WIN_W - 2.0 * MARGIN;
 const COL_WIDTH: f64 = INNER_W - 4.0;
 pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Coalesce a burst of `NSWorkspace` launch/quit notifications into a single
+/// re-scan once activity settles, rather than scanning per notification.
+const WORKSPACE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_ICON_CACHE: usize = 64;
 
 /// What the picker reports back to the run loop when it closes.
@@ -73,6 +76,11 @@ struct Ivars {
     query: RefCell<String>,
     search_pending: Cell<bool>,
     last_search_change: RefCell<Option<Instant>>,
+    /// A workspace launch/quit refresh awaiting its debounce (see
+    /// [`WORKSPACE_REFRESH_DEBOUNCE`]), coalescing a notification burst into one
+    /// re-scan.
+    refresh_pending: Cell<bool>,
+    last_refresh_request: RefCell<Option<Instant>>,
     /// Set once Apply/Cancel/close has reported a result, so the window-close
     /// handler doesn't send a second message.
     decided: Cell<bool>,
@@ -140,7 +148,12 @@ define_class!(
         #[unsafe(method(applyClicked:))]
         fn apply_clicked(&self, _sender: &NSButton) {
             if !self.ivars().decided.replace(true) {
-                let targets = self.ivars().checked.borrow().values().cloned().collect();
+                let mut targets: Vec<WatchTarget> =
+                    self.ivars().checked.borrow().values().cloned().collect();
+                // The selection map has a randomized hash seed, so persist in a
+                // stable order (by each target's unique key); otherwise the saved
+                // list and the tooltip's "first 3" permute between identical edits.
+                targets.sort_by(|a, b| a.key().cmp(b.key()));
                 let _ = self.ivars().tx.send(WaitWindowMsg::Apply(targets));
             }
             self.close_window();
@@ -229,6 +242,8 @@ impl WaitController {
             query: RefCell::new(String::new()),
             search_pending: Cell::new(false),
             last_search_change: RefCell::new(None),
+            refresh_pending: Cell::new(false),
+            last_refresh_request: RefCell::new(None),
             decided: Cell::new(false),
             previous_app: RefCell::new(None),
             tx,
@@ -288,20 +303,34 @@ impl WaitController {
     }
 
     /// Re-scan the process tree and reload, preserving the current selection,
-    /// toggles, and search query. Driven by the run loop on `NSWorkspace`
-    /// launch/quit so the list stays live, and by the Refresh button (which
-    /// also catches non-app/daemon changes the workspace observer misses).
-    /// Skipped once the window is closing so we don't rebuild a dying table.
+    /// toggles, and search query. Runs immediately for the Refresh button
+    /// (which also catches non-app/daemon changes the workspace observer
+    /// misses) and for a coalesced workspace refresh once its debounce fires
+    /// (see [`Self::schedule_refresh`]). Skipped once the window is closing so
+    /// we don't rebuild a dying table.
     fn refresh(&self) {
         if self.ivars().decided.get() {
             return;
         }
+        self.ivars().refresh_pending.set(false);
         let all = {
             let checked = self.ivars().checked.borrow();
             scan_rows(&checked)
         };
         *self.ivars().all.borrow_mut() = all;
         self.rebuild();
+    }
+
+    /// Coalesce a workspace launch/quit notification into a single deferred
+    /// re-scan (see [`WORKSPACE_REFRESH_DEBOUNCE`]); `poll_debounce` runs the
+    /// scan once the burst settles. Scanning the whole process tree per
+    /// notification would hammer the main thread during app-launch storms.
+    fn schedule_refresh(&self) {
+        if self.ivars().decided.get() {
+            return;
+        }
+        self.ivars().refresh_pending.set(true);
+        *self.ivars().last_refresh_request.borrow_mut() = Some(Instant::now());
     }
 
     fn apply_chosen_app_path(&self, path: String) {
@@ -359,6 +388,11 @@ impl WaitController {
     }
 
     fn poll_debounce(&self) {
+        self.poll_search_debounce();
+        self.poll_refresh_debounce();
+    }
+
+    fn poll_search_debounce(&self) {
         if !self.ivars().search_pending.get() {
             return;
         }
@@ -368,6 +402,18 @@ impl WaitController {
         if start.elapsed() >= SEARCH_DEBOUNCE {
             self.ivars().search_pending.set(false);
             self.rebuild();
+        }
+    }
+
+    fn poll_refresh_debounce(&self) {
+        if !self.ivars().refresh_pending.get() {
+            return;
+        }
+        let Some(start) = *self.ivars().last_refresh_request.borrow() else {
+            return;
+        };
+        if start.elapsed() >= WORKSPACE_REFRESH_DEBOUNCE {
+            self.refresh();
         }
     }
 
@@ -492,23 +538,29 @@ pub struct WaitWindow {
 }
 
 impl WaitWindow {
-    /// Re-scan running programs and reload the list, keeping the current
-    /// selection, toggles, and search query. Called by the run loop whenever
-    /// an app launches or quits while the picker is open.
+    /// Schedule a coalesced re-scan of running programs, keeping the current
+    /// selection, toggles, and search query. Called by the run loop on every
+    /// `NSWorkspace` launch/quit while the picker is open; a burst of
+    /// notifications collapses into a single scan once activity settles (see
+    /// [`WaitController::schedule_refresh`]). `poll_debounce` performs the scan.
     pub fn refresh(&self) {
-        self.controller.refresh();
+        self.controller.schedule_refresh();
     }
 
-    /// Apply a debounced search filter once the user pauses typing.
+    /// Run any due debounced work: apply the search filter once the user pauses
+    /// typing, and perform a coalesced workspace refresh once launch/quit
+    /// activity settles.
     pub fn poll_debounce(&self) {
         self.controller.poll_debounce();
     }
 
-    /// Whether a typed search change is still waiting for its debounce to
-    /// elapse. The run loop uses this to keep cycling (rather than blocking
-    /// indefinitely) so `poll_debounce` actually fires after the user pauses.
+    /// Whether any debounced picker work — a typed search change or a coalesced
+    /// workspace refresh — is still waiting for its debounce to elapse. The run
+    /// loop uses this to keep cycling (rather than blocking indefinitely) so
+    /// `poll_debounce` actually fires once activity settles.
     pub fn search_pending(&self) -> bool {
-        self.controller.ivars().search_pending.get()
+        let ivars = self.controller.ivars();
+        ivars.search_pending.get() || ivars.refresh_pending.get()
     }
 
     /// Bring an already-open picker back to the front instead of opening a second copy.

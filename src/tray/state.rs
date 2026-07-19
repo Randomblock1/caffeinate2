@@ -37,20 +37,14 @@ const OBSERVED_TYPES: &[AssertionType] = &[
     AssertionType::PreventUserIdleDisplaySleep,
 ];
 
-/// Processes whose system-idle assertions never warrant an upgrade. `powerd` is
-/// the macOS power daemon that holds such an assertion during ordinary active
-/// use and releases it on its own; taking a stronger Entirely hold over it does
-/// nothing but flap the watcher, so it is treated as ignored rather than a
-/// trigger.
-const UPGRADE_IGNORE_PROCESSES: &[&str] = &["powerd", "runningboardd"];
-
-/// Ignored processes so ubiquitous that surfacing them as "Ignoring…" lines is
-/// pure noise: they hold an assertion during ordinary active use essentially
-/// always, so listing them tells the user nothing. `powerd` (the macOS power
-/// daemon) and `runningboardd` (the process/assertion lifecycle daemon) are
-/// effectively always active, so they are dropped from the menu entirely rather
-/// than shown as ignored.
-const SILENTLY_IGNORED_PROCESSES: &[&str] = &["powerd", "runningboardd"];
+/// System daemons whose system-idle assertions neither warrant an upgrade nor
+/// appear in the menu. `powerd` (the macOS power daemon) and `runningboardd`
+/// (the process/assertion lifecycle daemon) hold such an assertion during
+/// ordinary active use essentially always and release it on their own: taking
+/// a stronger Entirely hold over them does nothing but flap the watcher, and
+/// surfacing them as "Ignoring…" lines is pure noise, so they are dropped from
+/// the menu entirely rather than shown as ignored.
+const SYSTEM_DAEMONS: &[&str] = &["powerd", "runningboardd"];
 
 /// Whether a failed upgrade enable should latch `upgrade_failed` (blocking
 /// retries until the external trigger clears). Transient errors (helper socket
@@ -82,10 +76,10 @@ struct ExternalClassification {
 }
 
 /// Why an observed assertion is not upgraded. Drives the menu's reason text.
+/// Never sees a [`SYSTEM_DAEMONS`] holder — those are filtered out of the
+/// ignored list before reasons are assigned.
 fn ignore_reason(assertion: &ExternalAssertion) -> &'static str {
-    if UPGRADE_IGNORE_PROCESSES.contains(&assertion.process_name.as_str()) {
-        "system process"
-    } else if assertion.assertion_type == AssertionType::PreventUserIdleDisplaySleep.as_str() {
+    if assertion.assertion_type == AssertionType::PreventUserIdleDisplaySleep.as_str() {
         "display only"
     } else {
         "not upgradeable"
@@ -97,8 +91,7 @@ fn ignore_reason(assertion: &ExternalAssertion) -> &'static str {
 fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassification {
     let trigger_type = UPGRADE_TRIGGER_TYPE.as_str();
     let is_upgradeable = |a: &ExternalAssertion| {
-        a.assertion_type == trigger_type
-            && !UPGRADE_IGNORE_PROCESSES.contains(&a.process_name.as_str())
+        a.assertion_type == trigger_type && !SYSTEM_DAEMONS.contains(&a.process_name.as_str())
     };
 
     let upgradeable: Vec<ExternalAssertion> =
@@ -117,7 +110,7 @@ fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassifica
         .filter(|a| {
             !a.process_name.is_empty()
                 && !trigger_names.contains(a.process_name.as_str())
-                && !SILENTLY_IGNORED_PROCESSES.contains(&a.process_name.as_str())
+                && !SYSTEM_DAEMONS.contains(&a.process_name.as_str())
         })
         .map(|a| IgnoredAssertion {
             process_name: a.process_name.clone(),
@@ -154,6 +147,17 @@ struct PendingEnable {
     /// "seen running then all quit" auto-stop unreachable if the app quits
     /// during the acquire window). OR'd with a fresh scan at commit time.
     app_saw_seed: bool,
+    /// Set when this enable may install the privileged helper (Entirely mode
+    /// with the helper missing): the worker can put up an admin-password
+    /// dialog, so the anti-stacking guards must treat this enable like a
+    /// pending install.
+    installing_helper: bool,
+    /// Set when the user cancelled a helper-installing enable while its worker
+    /// was still running. The admin dialog can't be revoked, so the worker
+    /// keeps going and its result is discarded (a delivered hold is released
+    /// off the UI thread); the entry stays tracked so a re-enable re-attaches
+    /// to it instead of stacking a second password dialog.
+    cancelled: bool,
     rx: mpsc::Receiver<Result<ActiveSleepHold, EnableError>>,
 }
 
@@ -204,9 +208,9 @@ pub enum PendingInstallOutcome {
 /// Runtime state while sleep prevention is active.
 struct ActiveTraySession {
     /// The underlying assertion/lock. Torn down via
-    /// [`ActiveSleepHold::release_blocking`] on a background thread in
-    /// [`AppState::stop_session`]; other teardown paths (session replacement
-    /// in a two-phase mode switch, process exit) rely on `Drop`.
+    /// [`ActiveSleepHold::release_blocking`] on a background thread when the
+    /// session is stopped or replaced ([`AppState::stop_session`],
+    /// [`AppState::poll_pending_enable`]); process exit relies on `Drop`.
     hold: ActiveSleepHold,
     /// The mode this hold actually enforces. Tracked so a failed mode switch
     /// rolls `config.mode` back to what is *really* still active, rather than to
@@ -286,6 +290,12 @@ pub struct AppState {
     /// rebuilt — currently when the set of upgraded processes changes. The event
     /// loop reinstalls the menu and clears this via `take_menu_dirty`.
     menu_dirty: bool,
+    /// Whether any wait-for-apps target was seen running by the most recent
+    /// `check_app_watch` scan, cached so `waiting_for_app_launch` (called later
+    /// in the same tick for the tooltip) doesn't repeat the process walk.
+    /// `None` when no scan has run for the current session/selection; readers
+    /// fall back to a fresh scan.
+    app_watch_running: Option<bool>,
 }
 
 impl AppState {
@@ -306,6 +316,7 @@ impl AppState {
             upgrade_overridden: false,
             upgrade_ignored: Vec::new(),
             menu_dirty: false,
+            app_watch_running: None,
         }
     }
 
@@ -349,8 +360,10 @@ impl AppState {
 
     /// True while an enable is being acquired on a background thread. The icon
     /// shows the target on-state and the tooltip reads "enabling…" meanwhile.
+    /// A cancelled enable still in flight doesn't count: the user toggled it
+    /// off, so the UI reads idle.
     pub const fn is_enabling(&self) -> bool {
-        self.pending_enable.is_some()
+        matches!(&self.pending_enable, Some(pending) if !pending.cancelled)
     }
 
     /// True while the privileged helper is being installed on a background
@@ -411,7 +424,11 @@ impl AppState {
         !self.config.wait_for_apps.is_empty()
             && self.is_on()
             && !self.session.as_ref().is_some_and(|s| s.app_saw_running)
-            && !process_enum::any_target_running(&self.config.wait_for_apps)
+            // `check_app_watch` runs earlier in the same tick and caches its
+            // scan; fall back to a fresh one only when it hasn't run yet.
+            && !self
+                .app_watch_running
+                .unwrap_or_else(|| process_enum::any_target_running(&self.config.wait_for_apps))
     }
 
     /// Set the tray image for the given on/off state without touching the
@@ -495,7 +512,7 @@ impl AppState {
 
         let tooltip = if self.is_installing() {
             "caffeinate2 (installing helper…)".to_string()
-        } else if self.pending_enable.is_some() {
+        } else if self.is_enabling() {
             if self.pending_mode() == Some(SleepMode::Entirely) {
                 "caffeinate2 (enabling Entirely mode…)".to_string()
             } else {
@@ -582,14 +599,18 @@ impl AppState {
             .as_ref()
             .is_some_and(|session| session.started_by_upgrade)
         {
+            self.app_watch_running = None;
             return false;
         }
         if self.config.wait_for_apps.is_empty() {
+            self.app_watch_running = None;
             return false;
         }
         // Resolve before the mutable session borrow — the scan can be a
-        // process-tree walk.
+        // process-tree walk. Cache the result for `waiting_for_app_launch`,
+        // which runs later in the same tick.
         let any_running = process_enum::any_target_running(&self.config.wait_for_apps);
+        self.app_watch_running = Some(any_running);
         let Some(session) = self.session.as_mut() else {
             return false;
         };
@@ -610,7 +631,7 @@ impl AppState {
     }
 
     pub fn toggle(&mut self) {
-        if self.session.is_some() || self.pending_enable.is_some() {
+        if self.session.is_some() || self.is_enabling() {
             // A manual stop is an explicit override: the watcher must not undo it
             // by re-taking a hold while the same trigger persists. This also
             // cancels an in-flight enable the user changed their mind about.
@@ -638,8 +659,27 @@ impl AppState {
         started_by_upgrade: bool,
         rollback_mode: Option<SleepMode>,
     ) {
+        // Capture the current session's "seen a watched app" latch now, so a
+        // two-phase mode switch (which keeps the old session alive while the new
+        // hold is acquired) doesn't lose it when the new session commits.
+        let app_saw_seed = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.app_saw_running);
         // Never stack enables; one in-flight request already targets a session.
-        if self.pending_enable.is_some() {
+        // A cancelled helper-installing enable re-attaches when the mode
+        // matches: its admin dialog is still up (it can't be revoked), so
+        // spawning another worker would stack a second password prompt. For
+        // any other mode the request is dropped — the entry keeps tracking the
+        // dialog until the worker drains.
+        if let Some(pending) = self.pending_enable.as_mut() {
+            if pending.cancelled && pending.mode == mode {
+                pending.cancelled = false;
+                pending.started_by_upgrade = started_by_upgrade;
+                pending.rollback_mode = rollback_mode;
+                pending.app_saw_seed = app_saw_seed;
+                self.last_tooltip = None;
+            }
             return;
         }
         // An in-flight helper install also blocks an Entirely enable, even a
@@ -650,15 +690,14 @@ impl AppState {
         if mode == SleepMode::Entirely && self.pending_install.is_some() {
             return;
         }
-        // Capture the current session's "seen a watched app" latch now, so a
-        // two-phase mode switch (which keeps the old session alive while the new
-        // hold is acquired) doesn't lose it when the new session commits.
-        let app_saw_seed = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.app_saw_running);
         let (tx, rx) = mpsc::channel();
         let install_helper_if_missing = !started_by_upgrade;
+        // Whether the worker may put up the install's admin dialog. Recorded on
+        // the pending entry so the anti-stacking guards (here and in
+        // `set_upgrade_external`) can never open a second one over it.
+        let installing_helper = mode == SleepMode::Entirely
+            && install_helper_if_missing
+            && !HelperClient::new().is_available();
         thread::spawn(move || {
             let result = mode.enable_for_tray(install_helper_if_missing);
             // If the receiver was dropped (the user cancelled), the hold inside
@@ -672,6 +711,8 @@ impl AppState {
             upgrade_apps: Vec::new(),
             rollback_mode,
             app_saw_seed,
+            installing_helper,
+            cancelled: false,
             rx,
         });
         self.last_tooltip = None;
@@ -679,9 +720,16 @@ impl AppState {
 
     /// Cancel any in-flight enable. The worker thread keeps running but its
     /// result is discarded; if it already acquired a hold, dropping the
-    /// receiver causes the worker to drop (and release) it.
+    /// receiver causes the worker to drop (and release) it. A helper-installing
+    /// enable stays tracked instead (marked cancelled, mirroring
+    /// [`AppState::cancel_pending_install`]): its admin dialog can't be
+    /// revoked, so a re-enable must re-attach to it rather than stack a
+    /// second password prompt.
     fn cancel_pending_enable(&mut self) {
-        self.pending_enable = None;
+        match self.pending_enable.as_mut() {
+            Some(pending) if pending.installing_helper => pending.cancelled = true,
+            _ => self.pending_enable = None,
+        }
     }
 
     /// Restore `config.mode` to the value captured before an enable that has
@@ -697,11 +745,15 @@ impl AppState {
     }
 
     /// Poll the in-flight enable, committing the session or surfacing the error.
-    /// Called once per run-loop iteration.
+    /// Called once per run-loop iteration. A cancelled enable is drained the
+    /// same way but its result is discarded (no commit, no rollback, no error
+    /// surfaced — the user already turned it off); a hold it delivered anyway
+    /// is released off the UI thread.
     pub fn poll_pending_enable(&mut self) -> PendingEnableOutcome {
         let Some(pending) = self.pending_enable.as_ref() else {
             return PendingEnableOutcome::Idle;
         };
+        let cancelled = pending.cancelled;
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return PendingEnableOutcome::Pending,
@@ -715,6 +767,14 @@ impl AppState {
             }
         };
         let pending = self.pending_enable.take().expect("pending enable present");
+        if cancelled {
+            if let Ok(hold) = result {
+                // Release off the UI thread: an entirely-mode release is a
+                // blocking helper RPC (see `stop_session`).
+                thread::spawn(move || hold.release_blocking());
+            }
+            return PendingEnableOutcome::Idle;
+        }
         match result {
             Ok(hold) => {
                 let started_by_upgrade = pending.started_by_upgrade;
@@ -722,6 +782,14 @@ impl AppState {
                     .session
                     .as_ref()
                     .is_some_and(|session| session.started_by_upgrade);
+                // A two-phase mode switch keeps the old session alive until the
+                // new hold commits; release its hold off the UI thread exactly
+                // like `stop_session` (an entirely-mode release is a blocking
+                // helper RPC and must not stall the menu bar).
+                if let Some(previous) = self.session.take() {
+                    let previous_hold = previous.hold;
+                    thread::spawn(move || previous_hold.release_blocking());
+                }
                 self.session = Some(ActiveTraySession {
                     hold,
                     mode: pending.mode,
@@ -793,7 +861,7 @@ impl AppState {
         // `poll_pending_enable`, which never arms without a pending enable).
         if mode == SleepMode::Entirely
             && self.pending_install.is_some()
-            && (self.is_on() || self.pending_enable.is_some())
+            && (self.is_on() || self.is_enabling())
         {
             return Err(TrayError::HelperInstallPending);
         }
@@ -815,7 +883,7 @@ impl AppState {
         tray_mode::save_config(&new_config)?;
         self.config = new_config;
 
-        if self.is_on() || self.pending_enable.is_some() {
+        if self.is_on() || self.is_enabling() {
             let was_upgrade = self
                 .session
                 .as_ref()
@@ -897,10 +965,14 @@ impl AppState {
             // before the change.
             process_enum::invalidate_exec_path_cache();
             let seen = process_enum::any_target_running(&self.config.wait_for_apps);
+            self.app_watch_running = Some(seen);
             if let Some(session) = self.session.as_mut() {
                 session.app_saw_running = seen;
                 self.last_tooltip = None;
             }
+        } else {
+            // Any cached scan reflects the old selection.
+            self.app_watch_running = None;
         }
         Ok(())
     }
@@ -966,6 +1038,19 @@ impl AppState {
             pending.cancelled = false;
             self.last_tooltip = None;
             return Ok(());
+        }
+        // An enable that is itself installing the helper (Entirely mode with
+        // the helper missing) may have the admin dialog up right now — even a
+        // cancelled one, since the dialog can't be revoked. Spawning an
+        // install would stack a second password prompt, so commit the watcher
+        // directly: the helper that enable installs serves the watcher too,
+        // and `poll_upgrade` retries the hold until the socket is up.
+        if self
+            .pending_enable
+            .as_ref()
+            .is_some_and(|pending| pending.installing_helper)
+        {
+            return self.commit_upgrade_external_on();
         }
         // Upgrades use Entirely mode, which needs the helper. If it is already
         // installed, turn the watcher on now; otherwise install it off the UI
@@ -1209,6 +1294,7 @@ mod tests {
             upgrade_overridden: false,
             upgrade_ignored: Vec::new(),
             menu_dirty: false,
+            app_watch_running: None,
         }
     }
 
@@ -1261,6 +1347,8 @@ mod tests {
             upgrade_apps: Vec::new(),
             rollback_mode: None,
             app_saw_seed: false,
+            installing_helper: false,
+            cancelled: false,
             rx: erx,
         });
         assert!(matches!(
@@ -1293,9 +1381,113 @@ mod tests {
         assert!(state.pending_enable.is_none());
     }
 
-    fn assertion(pid: i32, name: &str, type_: AssertionType) -> ExternalAssertion {
+    /// A pending helper-installing enable, as spawned by a manual Entirely
+    /// start with the helper missing.
+    fn installing_pending_enable(
+        rx: mpsc::Receiver<Result<ActiveSleepHold, EnableError>>,
+    ) -> PendingEnable {
+        PendingEnable {
+            mode: SleepMode::Entirely,
+            started_by_upgrade: false,
+            upgrade_apps: Vec::new(),
+            rollback_mode: None,
+            app_saw_seed: false,
+            installing_helper: true,
+            cancelled: false,
+            rx,
+        }
+    }
+
+    /// Enabling the upgrade watcher while a helper-installing enable is in
+    /// flight (its admin dialog may be up) must not spawn a second install:
+    /// the watcher commits directly and reuses the helper that enable installs.
+    #[test]
+    fn upgrade_toggle_during_installing_enable_spawns_no_second_install() {
+        // Isolate HOME: committing the watcher persists the config, and that
+        // must never touch the real user config from a test.
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+
+        let mut state = bare_state();
+        state.config.mode = SleepMode::Entirely;
+        let (_tx, rx) = mpsc::channel();
+        state.pending_enable = Some(installing_pending_enable(rx));
+        state.set_upgrade_external(true).unwrap();
+        // The watcher turned on without stacking an install over the enable's
+        // admin dialog.
+        assert!(state.config.upgrade_external);
+        assert!(state.pending_install.is_none());
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    /// Left-click cancel, then left-click again, while a helper-installing
+    /// enable's worker (and its admin dialog) is still running: the second
+    /// enable must re-attach to that worker, never spawn a second one.
+    #[test]
+    fn cancelled_installing_enable_reattaches_instead_of_respawning() {
+        let mut state = bare_state();
+        state.config.mode = SleepMode::Entirely;
+        let (tx, rx) = mpsc::channel();
+        state.pending_enable = Some(installing_pending_enable(rx));
+
+        // Cancel: the dialog can't be revoked, so the entry stays tracked
+        // (cancelled) while the UI reads idle.
+        state.toggle();
+        assert!(state.pending_enable.as_ref().is_some_and(|p| p.cancelled));
+        assert!(!state.is_enabling());
+
+        // Re-enable: must re-attach to the in-flight worker, not spawn a new
+        // one (which would stack a second password dialog).
+        state.toggle();
+        assert!(state.is_enabling());
+
+        // Still the original worker's channel: its result is the one consumed.
+        tx.send(Err(EnableError::Ipc("mock install failure".into())))
+            .unwrap();
+        assert!(matches!(
+            state.poll_pending_enable(),
+            PendingEnableOutcome::Failed { .. }
+        ));
+        assert!(state.pending_enable.is_none());
+    }
+
+    /// A cancelled enable that completes must not commit a session, surface an
+    /// error, or roll the mode back — its result is simply discarded.
+    #[test]
+    fn cancelled_enable_result_is_discarded() {
+        let mut state = bare_state();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(EnableError::Ipc("mock enable failure".into())))
+            .unwrap();
+        let mut pending = installing_pending_enable(rx);
+        pending.cancelled = true;
+        state.pending_enable = Some(pending);
+        assert!(matches!(
+            state.poll_pending_enable(),
+            PendingEnableOutcome::Idle
+        ));
+        assert!(state.pending_enable.is_none());
+        assert!(!state.is_on());
+    }
+
+    fn assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
         ExternalAssertion {
-            pid,
             process_name: name.to_string(),
             assertion_type: type_.as_str().to_string(),
         }
@@ -1311,7 +1503,6 @@ mod tests {
     #[test]
     fn system_idle_holder_is_upgradeable_not_ignored() {
         let all = [assertion(
-            10,
             "Claude Code",
             AssertionType::PreventUserIdleSystemSleep,
         )];
@@ -1324,12 +1515,8 @@ mod tests {
     #[test]
     fn silently_ignored_system_processes_are_neither_triggers_nor_listed() {
         let all = [
-            assertion(1, "powerd", AssertionType::PreventUserIdleSystemSleep),
-            assertion(
-                2,
-                "runningboardd",
-                AssertionType::PreventUserIdleSystemSleep,
-            ),
+            assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
+            assertion("runningboardd", AssertionType::PreventUserIdleSystemSleep),
         ];
         let result = classify_external_assertions(&all);
         // These never trigger an upgrade ...
@@ -1341,7 +1528,6 @@ mod tests {
     #[test]
     fn display_only_holder_is_ignored() {
         let all = [assertion(
-            20,
             "Safari",
             AssertionType::PreventUserIdleDisplaySleep,
         )];
@@ -1353,8 +1539,8 @@ mod tests {
     #[test]
     fn nameless_holder_is_dropped_from_ignored_but_still_a_trigger() {
         let all = [
-            assertion(30, "", AssertionType::PreventUserIdleSystemSleep),
-            assertion(31, "", AssertionType::PreventUserIdleDisplaySleep),
+            assertion("", AssertionType::PreventUserIdleSystemSleep),
+            assertion("", AssertionType::PreventUserIdleDisplaySleep),
         ];
         let result = classify_external_assertions(&all);
         // The nameless system-idle hold still counts as upgradeable (presence is
@@ -1369,8 +1555,8 @@ mod tests {
         // One process holds both a system-idle (upgraded) and a display hold;
         // it must not also appear under "ignored".
         let all = [
-            assertion(40, "Zoom", AssertionType::PreventUserIdleSystemSleep),
-            assertion(40, "Zoom", AssertionType::PreventUserIdleDisplaySleep),
+            assertion("Zoom", AssertionType::PreventUserIdleSystemSleep),
+            assertion("Zoom", AssertionType::PreventUserIdleDisplaySleep),
         ];
         let result = classify_external_assertions(&all);
         assert_eq!(result.upgradeable.len(), 1);
@@ -1380,12 +1566,12 @@ mod tests {
     #[test]
     fn ignored_list_is_sorted_and_deduped() {
         let all = [
-            assertion(50, "VLC", AssertionType::PreventUserIdleDisplaySleep),
+            assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
             // powerd is silently ignored, so it never reaches the list.
-            assertion(51, "powerd", AssertionType::PreventUserIdleSystemSleep),
-            assertion(53, "IINA", AssertionType::PreventUserIdleDisplaySleep),
+            assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
+            assertion("IINA", AssertionType::PreventUserIdleDisplaySleep),
             // Duplicate display hold from the same app collapses to one entry.
-            assertion(52, "VLC", AssertionType::PreventUserIdleDisplaySleep),
+            assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
         ];
         let result = classify_external_assertions(&all);
         assert_eq!(
@@ -1462,6 +1648,8 @@ mod tests {
             upgrade_apps: Vec::new(),
             rollback_mode: Some(original_mode),
             app_saw_seed: false,
+            installing_helper: false,
+            cancelled: false,
             rx,
         });
 
