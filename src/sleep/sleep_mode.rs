@@ -207,6 +207,11 @@ pub enum ActiveSleepHold {
     Assertion(PowerAssertion),
     UserActivity(UserActivityHold),
     Entirely(EntirelyHold),
+    /// Test-only stand-in with no underlying assertion, so tray state tests
+    /// can construct and tear down sessions without touching IOKit or the
+    /// helper. Releasing it is a no-op.
+    #[cfg(test)]
+    Noop,
 }
 
 impl ActiveSleepHold {

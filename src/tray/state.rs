@@ -46,6 +46,31 @@ const OBSERVED_TYPES: &[AssertionType] = &[
 /// the menu entirely rather than shown as ignored.
 const SYSTEM_DAEMONS: &[&str] = &["powerd", "runningboardd"];
 
+/// Now on a clock that keeps advancing while the system is asleep, as an
+/// opaque offset from an arbitrary epoch. Timed sessions must expire on
+/// elapsed wall time *including* any system sleep (a one-hour limit set at
+/// 9:00 ends at 10:00 even if the machine slept in between, which Display
+/// mode permits) — `std::time::Instant` freezes during sleep on macOS and
+/// would stretch the limit by however long the machine slept. macOS's
+/// `CLOCK_MONOTONIC` does advance across sleep (unlike Linux's), so session
+/// deadlines use it. The menu-bar countdown recomputes from this clock each
+/// tick, so after a wake it simply jumps forward to the true remaining time.
+fn sleep_aware_now() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    // Cannot fail for a valid clock id and pointer; a zero fallback would
+    // instantly expire every deadline, so treat failure as the bug it is.
+    assert_eq!(rc, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+    Duration::new(
+        u64::try_from(ts.tv_sec).unwrap_or(0),
+        u32::try_from(ts.tv_nsec).unwrap_or(0),
+    )
+}
+
 /// Whether a failed upgrade enable should latch `upgrade_failed` (blocking
 /// retries until the external trigger clears). Transient errors (helper socket
 /// not up yet, IOKit flakes) are retried on the next poll; permanent denials
@@ -216,7 +241,10 @@ struct ActiveTraySession {
     /// rolls `config.mode` back to what is *really* still active, rather than to
     /// an optimistic `config.mode` a prior in-flight switch already advanced.
     mode: SleepMode,
-    until: Option<Instant>,
+    /// Deadline for a timed session, as a [`sleep_aware_now`] timestamp so the
+    /// limit keeps counting down while the system itself sleeps. `None` for
+    /// untimed and upgrade-watcher sessions.
+    until: Option<Duration>,
     app_saw_running: bool,
     /// True when the upgrade watcher started this session (vs. a manual
     /// left-click or menu action). The watcher only ever auto-stops sessions
@@ -396,7 +424,7 @@ impl AppState {
         // wake phase doesn't matter).
         let countdown = self.session.as_ref().and_then(|s| s.until).map(|until| {
             until
-                .saturating_duration_since(Instant::now())
+                .saturating_sub(sleep_aware_now())
                 .min(Duration::from_secs(1))
         });
 
@@ -422,8 +450,13 @@ impl AppState {
 
     pub fn waiting_for_app_launch(&self) -> bool {
         !self.config.wait_for_apps.is_empty()
-            && self.is_on()
-            && !self.session.as_ref().is_some_and(|s| s.app_saw_running)
+            // Upgrade sessions suspend the app watch (their latch is never
+            // armed), so they are never "waiting" — and skipping them here
+            // avoids a wasted process scan on every tooltip tick.
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| !s.started_by_upgrade && !s.app_saw_running)
             // `check_app_watch` runs earlier in the same tick and caches its
             // scan; fall back to a fresh one only when it hasn't run yet.
             && !self
@@ -481,7 +514,7 @@ impl AppState {
         self.session.as_ref().and_then(|session| {
             session
                 .until
-                .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+                .map(|until| until.saturating_sub(sleep_aware_now()).as_secs())
         })
     }
 
@@ -578,11 +611,11 @@ impl AppState {
     }
 
     pub fn check_timeout(&mut self) -> bool {
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.until.is_some_and(|until| Instant::now() >= until))
-        {
+        if self.session.as_ref().is_some_and(|session| {
+            session
+                .until
+                .is_some_and(|until| sleep_aware_now() >= until)
+        }) {
             self.stop_session();
             return true;
         }
@@ -662,10 +695,16 @@ impl AppState {
         // Capture the current session's "seen a watched app" latch now, so a
         // two-phase mode switch (which keeps the old session alive while the new
         // hold is acquired) doesn't lose it when the new session commits.
+        // Upgrade-watcher sessions are excluded: their app watch is suspended
+        // (`check_app_watch` never runs for them), so their latch reflects a
+        // moment when nobody was watching — carrying it into a manual session
+        // would stop that session on its first tick if the watched app quit at
+        // any point while the watcher held custody. The manual session re-arms
+        // from a fresh scan at commit instead.
         let app_saw_seed = self
             .session
             .as_ref()
-            .is_some_and(|session| session.app_saw_running);
+            .is_some_and(|session| !session.started_by_upgrade && session.app_saw_running);
         // Never stack enables; one in-flight request already targets a session.
         // A cancelled helper-installing enable re-attaches when the mode
         // matches: its admin dialog is still up (it can't be revoked), so
@@ -798,7 +837,7 @@ impl AppState {
                     } else {
                         self.config
                             .time_limit_secs
-                            .map(|secs| Instant::now() + Duration::from_secs(secs))
+                            .map(|secs| sleep_aware_now() + Duration::from_secs(secs))
                     },
                     // Preserve the prior session's "seen running" latch across a
                     // two-phase switch (OR'd with a fresh scan) so a watched app
@@ -806,11 +845,15 @@ impl AppState {
                     // Invalidate the scan cache first: this seed is the session's
                     // first "seen running" decision and must reflect processes
                     // launched during the (possibly slow) acquire, not a scan
-                    // cached before the enable began.
-                    app_saw_running: pending.app_saw_seed || {
-                        process_enum::invalidate_exec_path_cache();
-                        process_enum::any_target_running(&self.config.wait_for_apps)
-                    },
+                    // cached before the enable began. Upgrade sessions skip the
+                    // latch entirely: their app watch is suspended, so a latch
+                    // would only leak stale state (and the scan would be a
+                    // wasted process walk).
+                    app_saw_running: !started_by_upgrade
+                        && (pending.app_saw_seed || {
+                            process_enum::invalidate_exec_path_cache();
+                            process_enum::any_target_running(&self.config.wait_for_apps)
+                        }),
                     started_by_upgrade,
                     upgrade_apps: pending.upgrade_apps,
                 });
@@ -865,6 +908,23 @@ impl AppState {
         {
             return Err(TrayError::HelperInstallPending);
         }
+        // The sibling hazard: a helper-installing Entirely *enable* in flight
+        // (its admin dialog may be up — even a cancelled one, since the dialog
+        // can't be revoked). Switching to another mode would persist the new
+        // mode while `start_session_with` drops the request on the occupied
+        // pending slot: config and menu would claim the new mode with no
+        // session (or with the old hold still enforced), no rollback would
+        // ever arm, and manual enables would be silently swallowed until the
+        // dialog resolves. Reject up front; the switch works once it does.
+        // A switch *to* Entirely instead re-attaches to the pending enable.
+        if mode != SleepMode::Entirely
+            && self
+                .pending_enable
+                .as_ref()
+                .is_some_and(|pending| pending.installing_helper)
+        {
+            return Err(TrayError::HelperInstallPending);
+        }
         // Roll back to the mode actually being enforced, not to `config.mode`:
         // a prior in-flight switch may have already advanced `config.mode`
         // optimistically, so using it would leave the menu/config disagreeing
@@ -913,6 +973,15 @@ impl AppState {
     pub fn shutdown(&mut self) {
         self.cancel_pending_enable();
         self.cancel_pending_install();
+        // A cancelled helper-installing enable keeps its receiver (its admin
+        // dialog can't be revoked); if its worker already delivered a hold,
+        // release it inline now — after this returns the process exits and
+        // nothing else would ever drain the channel.
+        if let Some(pending) = self.pending_enable.take()
+            && let Ok(Ok(hold)) = pending.rx.try_recv()
+        {
+            drop(hold);
+        }
         // Release inline, not via stop_session: the process exits as soon as
         // the caller returns, which would kill stop_session's detached
         // release thread before its RPC completes — leaving the helper entry
@@ -938,7 +1007,7 @@ impl AppState {
         if let Some(session) = self.session.as_mut() {
             if !session.started_by_upgrade {
                 session.until =
-                    time_limit_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+                    time_limit_secs.map(|secs| sleep_aware_now() + Duration::from_secs(secs));
             }
             self.last_tooltip = None;
         }
@@ -1014,6 +1083,23 @@ impl AppState {
             // Drop any "Ignoring…" entries; the menu rebuild removes them.
             if !self.upgrade_ignored.is_empty() {
                 self.upgrade_ignored.clear();
+                self.menu_dirty = true;
+            }
+            // An upgrade enable still acquiring its hold must be cancelled too,
+            // not just a committed session: left alone it would commit into a
+            // session with no time limit that every automatic stop path skips
+            // (`check_timeout` needs `until`, `check_app_watch` ignores upgrade
+            // sessions, and `poll_upgrade` returns before its stop logic while
+            // the watcher is off) — an unbounded hold behind an unchecked box.
+            // Upgrade enables never install the helper, so this always drops
+            // the entry outright and the worker releases any hold it delivers.
+            if self
+                .pending_enable
+                .as_ref()
+                .is_some_and(|pending| pending.started_by_upgrade)
+            {
+                self.cancel_pending_enable();
+                self.last_tooltip = None;
                 self.menu_dirty = true;
             }
             if self
@@ -1483,6 +1569,181 @@ mod tests {
             PendingEnableOutcome::Idle
         ));
         assert!(state.pending_enable.is_none());
+        assert!(!state.is_on());
+    }
+
+    /// Turning the watcher off must also cancel an upgrade enable still
+    /// acquiring its hold: left alone it would commit into a session with no
+    /// time limit that every automatic stop path skips (the watcher is off,
+    /// the app watch ignores upgrade sessions, and there is no deadline).
+    #[test]
+    fn disabling_watcher_cancels_inflight_upgrade_enable() {
+        // Isolate HOME: disabling the watcher persists the config, and that
+        // must never touch the real user config from a test.
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        let (_tx, rx) = mpsc::channel();
+        state.pending_enable = Some(PendingEnable {
+            mode: SleepMode::Entirely,
+            started_by_upgrade: true,
+            upgrade_apps: vec!["Claude".to_string()],
+            rollback_mode: None,
+            app_saw_seed: false,
+            installing_helper: false,
+            cancelled: false,
+            rx,
+        });
+        assert!(state.set_upgrade_external(false).is_ok());
+        // Upgrade enables never install the helper, so the cancel drops the
+        // entry outright; a hold the worker delivers later is released by its
+        // failed send.
+        assert!(state.pending_enable.is_none());
+        assert!(!state.config.upgrade_external);
+        assert!(!state.is_on());
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    /// Switching to a non-Entirely mode while a helper-installing enable is in
+    /// flight (its admin dialog may be up) must be rejected up front: the
+    /// occupied pending slot would swallow the new session start with no
+    /// rollback armed, leaving config claiming a mode nothing enforces.
+    #[test]
+    fn mode_switch_away_is_rejected_while_installing_enable_is_in_flight() {
+        // Isolate HOME: on the pass path set_mode rejects before persisting,
+        // but a regression would reach save_config, and that must never touch
+        // the real user config from a test.
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+
+        let mut state = bare_state();
+        state.config.mode = SleepMode::Entirely;
+        let (_tx, rx) = mpsc::channel();
+        state.pending_enable = Some(installing_pending_enable(rx));
+        assert!(matches!(
+            state.set_mode(SleepMode::System),
+            Err(TrayError::HelperInstallPending)
+        ));
+        assert_eq!(state.config.mode, SleepMode::Entirely);
+
+        // A cancelled installing enable still tracks the dialog and still
+        // occupies the slot, so it blocks the switch just the same.
+        state.pending_enable.as_mut().unwrap().cancelled = true;
+        assert!(matches!(
+            state.set_mode(SleepMode::Display),
+            Err(TrayError::HelperInstallPending)
+        ));
+        assert_eq!(state.config.mode, SleepMode::Entirely);
+
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    /// An upgrade session's app-watch latch must not leak into the next
+    /// session: the watch is suspended while the watcher holds custody, so
+    /// the latch may reflect an app that quit while nobody was watching —
+    /// carrying it over would stop the new manual session on its first tick.
+    #[test]
+    fn upgrade_session_latch_is_not_carried_into_next_session() {
+        let mut state = bare_state();
+        state.session = Some(ActiveTraySession {
+            hold: ActiveSleepHold::Noop,
+            mode: SleepMode::Entirely,
+            until: None,
+            app_saw_running: true,
+            started_by_upgrade: true,
+            upgrade_apps: Vec::new(),
+        });
+        // Re-attach to a cancelled installing enable: this captures the seed
+        // without spawning a real enable worker.
+        let (_tx, rx) = mpsc::channel();
+        let mut pending = installing_pending_enable(rx);
+        pending.cancelled = true;
+        state.pending_enable = Some(pending);
+        state.start_session_with(SleepMode::Entirely, false, None);
+        assert!(!state.pending_enable.as_ref().unwrap().app_saw_seed);
+
+        // The same latch on a manual session is carried: a two-phase mode
+        // switch must not lose it.
+        state.session.as_mut().unwrap().started_by_upgrade = false;
+        state.pending_enable.as_mut().unwrap().cancelled = true;
+        state.start_session_with(SleepMode::Entirely, false, None);
+        assert!(state.pending_enable.as_ref().unwrap().app_saw_seed);
+    }
+
+    /// An upgrade session commits with no deadline and no app-watch latch:
+    /// its lifecycle belongs to the watcher alone, and a seed left on the
+    /// pending entry must not arm the latch either.
+    #[test]
+    fn upgrade_commit_arms_neither_timer_nor_app_watch_latch() {
+        let mut state = bare_state();
+        state.config.time_limit_secs = Some(60);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(ActiveSleepHold::Noop)).unwrap();
+        let mut pending = installing_pending_enable(rx);
+        pending.started_by_upgrade = true;
+        pending.installing_helper = false;
+        pending.app_saw_seed = true;
+        state.pending_enable = Some(pending);
+        assert!(matches!(
+            state.poll_pending_enable(),
+            PendingEnableOutcome::Started
+        ));
+        let session = state.session.as_ref().unwrap();
+        assert!(session.started_by_upgrade);
+        assert!(session.until.is_none());
+        assert!(!session.app_saw_running);
+    }
+
+    /// Timed sessions expire on the sleep-aware clock: not before the
+    /// deadline, and immediately once it has passed.
+    #[test]
+    fn check_timeout_fires_only_past_the_deadline() {
+        let mut state = bare_state();
+        state.session = Some(ActiveTraySession {
+            hold: ActiveSleepHold::Noop,
+            mode: SleepMode::System,
+            until: Some(sleep_aware_now() + Duration::from_secs(3600)),
+            app_saw_running: false,
+            started_by_upgrade: false,
+            upgrade_apps: Vec::new(),
+        });
+        assert!(!state.check_timeout());
+        state.session.as_mut().unwrap().until =
+            Some(sleep_aware_now().saturating_sub(Duration::from_secs(1)));
+        assert!(state.check_timeout());
         assert!(!state.is_on());
     }
 
