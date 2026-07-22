@@ -54,11 +54,15 @@ pub enum WaitWindowMsg {
     Cancel,
 }
 
-/// One rendered line: a selectable program, or an informational helper child.
+/// One rendered line: a selectable program, an informational helper child, or a
+/// non-interactive notice (e.g. the process scan failed). A `Notice` carries no
+/// program index and renders no checkbox, so it can never be checked or persist
+/// as a [`WatchTarget`].
 #[derive(Clone)]
 enum DisplayRow {
     Program { all_index: usize },
     Child { name: String, pid: i32 },
+    Notice { text: String },
 }
 
 struct Ivars {
@@ -84,6 +88,10 @@ struct Ivars {
     /// Set once Apply/Cancel/close has reported a result, so the window-close
     /// handler doesn't send a second message.
     decided: Cell<bool>,
+    /// Set when the most recent process scan failed and left us without a good
+    /// list to show, so [`WaitController::rebuild`] renders a retry notice
+    /// instead of an empty picker.
+    scan_failed: Cell<bool>,
     /// The app that was frontmost before the picker stole focus, so closing
     /// can hand activation back instead of leaving focus in limbo.
     previous_app: RefCell<Option<Retained<NSRunningApplication>>>,
@@ -197,6 +205,7 @@ define_class!(
             match display {
                 Some(DisplayRow::Program { all_index }) => Some(self.program_cell(all_index)),
                 Some(DisplayRow::Child { name, pid }) => Some(self.child_cell(&name, pid)),
+                Some(DisplayRow::Notice { text }) => Some(self.notice_cell(&text)),
                 None => None,
             }
         }
@@ -245,6 +254,7 @@ impl WaitController {
             refresh_pending: Cell::new(false),
             last_refresh_request: RefCell::new(None),
             decided: Cell::new(false),
+            scan_failed: Cell::new(false),
             previous_app: RefCell::new(None),
             tx,
             table: RefCell::new(None),
@@ -264,6 +274,12 @@ impl WaitController {
         let all = self.ivars().all.borrow();
         let checked = self.ivars().checked.borrow();
         let mut rows = Vec::new();
+        if self.ivars().scan_failed.get() {
+            rows.push(DisplayRow::Notice {
+                text: "Couldn't read the running programs — press Refresh to try again."
+                    .to_string(),
+            });
+        }
         for (idx, prog) in all.iter().enumerate() {
             if !checked.contains_key(prog.target.key()) {
                 if apps_only && prog.bundle.is_none() {
@@ -313,12 +329,35 @@ impl WaitController {
             return;
         }
         self.ivars().refresh_pending.set(false);
-        let all = {
+        let scanned = {
             let checked = self.ivars().checked.borrow();
             scan_rows(&checked)
         };
-        *self.ivars().all.borrow_mut() = all;
-        self.rebuild();
+        match scanned {
+            Ok(all) => {
+                self.ivars().scan_failed.set(false);
+                *self.ivars().all.borrow_mut() = all;
+                self.rebuild();
+            }
+            Err(err) => {
+                // Don't clobber a good list with an error result: if a prior scan
+                // succeeded, keep those rows so a transient failure doesn't blank
+                // the picker. Only when we have nothing good to show do we mark
+                // the scan failed and let rebuild render the retry notice.
+                let have_good_list =
+                    !self.ivars().scan_failed.get() && !self.ivars().all.borrow().is_empty();
+                if have_good_list {
+                    tracing::warn!(error = %err, "wait picker: refresh scan failed; keeping current list");
+                    return;
+                }
+                tracing::warn!(error = %err, "wait picker: refresh scan failed; showing retry notice");
+                self.ivars().scan_failed.set(true);
+                let mut all = Vec::new();
+                append_checked_rows(&mut all, &self.ivars().checked.borrow());
+                *self.ivars().all.borrow_mut() = all;
+                self.rebuild();
+            }
+        }
     }
 
     /// Coalesce a workspace launch/quit notification into a single deferred
@@ -529,6 +568,25 @@ impl WaitController {
         container.addSubview(&label);
         container
     }
+
+    /// A non-interactive informational row (no checkbox), used for the
+    /// process-scan-failed notice. Carries no `WatchTarget`, so it can never be
+    /// checked or persisted.
+    fn notice_cell(&self, text: &str) -> Retained<NSView> {
+        let mtm = self.ivars().mtm;
+        let container = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(COL_WIDTH, ROW_HEIGHT)),
+        );
+        let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        label.setFrame(NSRect::new(
+            NSPoint::new(8.0, 3.0),
+            NSSize::new(COL_WIDTH - 12.0, 18.0),
+        ));
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        container.addSubview(&label);
+        container
+    }
 }
 
 /// Live handle the run loop keeps so the window/controller stay alive. Dropping
@@ -565,6 +623,10 @@ impl WaitWindow {
 
     /// Bring an already-open picker back to the front instead of opening a second copy.
     pub fn bring_to_front(&self) {
+        // Window operations after a decision (Apply/Cancel/close) are no-ops.
+        if self.controller.ivars().decided.get() {
+            return;
+        }
         let mtm = self.controller.ivars().mtm;
         if let Some(window) = self.controller.ivars().window.borrow().as_ref() {
             self.controller.remember_frontmost();
@@ -594,19 +656,28 @@ fn activate_and_order_front(mtm: MainThreadMarker, window: &NSWindow) {
     window.orderFrontRegardless();
 }
 
-/// Scan the full process tree for the picker's model. Any checked target that
-/// is not currently running is re-appended as a "(not running)" row so a live
-/// selection is never silently dropped when its program quits while the window
-/// is open. Used both at open time and on every [`WaitWindow::refresh`].
-fn scan_rows(checked: &HashMap<String, WatchTarget>) -> Vec<ProgramRow> {
-    let mut all = process_enum::program_rows(false, true);
+/// Scan the full process tree for the picker's model, or return the enumeration
+/// error so the caller can surface it instead of showing an empty list. Any
+/// checked target that is not currently running is re-appended as a
+/// "(not running)" row so a live selection is never silently dropped when its
+/// program quits while the window is open. Used both at open time and on every
+/// [`WaitWindow::refresh`].
+fn scan_rows(checked: &HashMap<String, WatchTarget>) -> std::io::Result<Vec<ProgramRow>> {
+    let mut all = process_enum::program_rows(false, true)?;
+    append_checked_rows(&mut all, checked);
+    Ok(all)
+}
+
+/// Append a "(not running)" row for every checked target not already present in
+/// `all`, so the persisted selection is always shown even when its program isn't
+/// running (or the live scan failed and `all` holds only these rows).
+fn append_checked_rows(all: &mut Vec<ProgramRow>, checked: &HashMap<String, WatchTarget>) {
     let present: HashSet<String> = all.iter().map(|p| p.target.key().to_string()).collect();
     for (key, target) in checked {
         if !present.contains(key) {
             all.push(not_running_row(target.clone(), String::new()));
         }
     }
-    all
 }
 
 fn not_running_row(target: WatchTarget, icon_path: String) -> ProgramRow {
@@ -758,9 +829,21 @@ pub fn open(
         .collect();
     // One process-tree scan; the toggles/search filter it in memory afterwards.
     // Re-scanned on workspace launch/quit while open (see `WaitWindow::refresh`).
-    let all = scan_rows(&checked);
+    // On a transient enumeration failure, still surface the persisted selection
+    // and flag the scan as failed so the picker shows a retry notice rather than
+    // an empty list.
+    let (all, scan_failed) = match scan_rows(&checked) {
+        Ok(all) => (all, false),
+        Err(err) => {
+            tracing::warn!(error = %err, "wait picker: initial process scan failed");
+            let mut all = Vec::new();
+            append_checked_rows(&mut all, &checked);
+            (all, true)
+        }
+    };
 
     let controller = WaitController::new(mtm, all, checked, tx);
+    controller.ivars().scan_failed.set(scan_failed);
     let target: &AnyObject = &controller;
 
     let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;

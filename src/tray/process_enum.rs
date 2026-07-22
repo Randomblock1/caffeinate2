@@ -76,16 +76,24 @@ pub struct ProgramRow {
     pub procs: Vec<ChildProc>,
 }
 
-/// All readable PIDs.
+/// All readable PIDs, or the enumeration error when the underlying
+/// `pids_by_type` syscall fails. The picker path uses this so it can tell a
+/// genuine "nothing running" from a failed scan.
+fn all_pids_checked() -> std::io::Result<Vec<i32>> {
+    pids_by_type(ProcFilter::All).map(|pids| {
+        pids.into_iter()
+            .filter(|&pid| pid > 0)
+            .map(|pid| pid as i32)
+            .collect()
+    })
+}
+
+/// All readable PIDs, empty on a transient enumeration failure. The watch-loop
+/// path uses this and tolerates the empty result by refusing to cache it (see
+/// [`running_executable_paths_raw`]); the picker path instead goes through
+/// [`all_pids_checked`] so the failure stays observable.
 fn all_pids() -> Vec<i32> {
-    pids_by_type(ProcFilter::All)
-        .map(|pids| {
-            pids.into_iter()
-                .filter(|&pid| pid > 0)
-                .map(|pid| pid as i32)
-                .collect()
-        })
-        .unwrap_or_default()
+    all_pids_checked().unwrap_or_default()
 }
 
 /// Executable path for `pid`, or empty if `proc_pidpath` fails (kernel/protected
@@ -101,13 +109,14 @@ fn cstr_field(bytes: &[i8]) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
-/// Every live process with pid/uid and its executable path. Drops PIDs
-/// whose `proc_pidinfo` fails (exited mid-scan, or protected) — those are never
-/// watchable targets.
-#[must_use]
-pub fn list_processes() -> Vec<ProcInfo> {
+/// Every live process with pid/uid and its executable path, or the enumeration
+/// error when the process list can't be read — so the picker can distinguish a
+/// genuine empty result from a failed scan instead of silently rendering an
+/// empty list. Drops PIDs whose `proc_pidinfo` fails (exited mid-scan, or
+/// protected) — those are never watchable targets.
+pub fn list_processes() -> std::io::Result<Vec<ProcInfo>> {
     let mut out = Vec::new();
-    for pid in all_pids() {
+    for pid in all_pids_checked()? {
         let info = match pidinfo::<BSDInfo>(pid, 0) {
             Ok(info) => info,
             Err(_) => continue,
@@ -119,7 +128,7 @@ pub fn list_processes() -> Vec<ProcInfo> {
             comm: cstr_field(&info.pbi_name),
         });
     }
-    out
+    Ok(out)
 }
 
 /// Raw executable paths of all live processes (`proc_pidpath`, not realpath) —
@@ -249,14 +258,15 @@ fn is_system_process(exec_path: &str, uid: u32, bundle: Option<&BundleRef>) -> b
 
 /// Build the picker's program rows, grouping helper PIDs under their parent
 /// `.app`. `app_only` keeps only `.app`-backed programs; `include_system`
-/// reveals system processes (off by default).
-#[must_use]
-pub fn program_rows(app_only: bool, include_system: bool) -> Vec<ProgramRow> {
+/// reveals system processes (off by default). Returns the enumeration error
+/// rather than an empty list when the process scan fails, so the picker can tell
+/// the user to retry instead of silently showing nothing.
+pub fn program_rows(app_only: bool, include_system: bool) -> std::io::Result<Vec<ProgramRow>> {
     let mut bundle_cache: HashMap<String, Option<BundleRef>> = HashMap::new();
     let mut groups: HashMap<String, ProgramRow> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
-    for proc in list_processes() {
+    for proc in list_processes()? {
         let bundle = outermost_app_path(&proc.exec_path)
             .and_then(|app_path| bundle_for_app_path(app_path, &mut bundle_cache));
 
@@ -288,7 +298,7 @@ pub fn program_rows(app_only: bool, include_system: bool) -> Vec<ProgramRow> {
         .filter(|row| (!app_only || row.bundle.is_some()) && (include_system || !row.is_system))
         .collect();
     rows.sort_by_key(|row| row.name.to_lowercase());
-    rows
+    Ok(rows)
 }
 
 /// Per-process label for a helper child row.
