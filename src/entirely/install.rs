@@ -366,11 +366,109 @@ fn install_newsyslog_conf() {
 /// Best-effort removal of the pre-migration helper binary (and the caffeinate2
 /// directory that existed only to hold it). Errors are ignored: the path may be
 /// absent, or the directory non-empty because something else was placed there.
+///
+/// Invariant: this runs as root, so it must never follow a symlink while
+/// removing. The parent chain is opened component-by-component with
+/// `O_DIRECTORY|O_NOFOLLOW` and the leaf file/directory are removed with
+/// `unlinkat` relative to those dirfds, so a symlink swapped in for any
+/// intermediate component — or for the leaf itself — cannot redirect a
+/// privileged unlink outside the intended tree (the same discipline as
+/// `ensure_secure_install_dir` and the `O_NOFOLLOW|O_EXCL` binary/plist writes).
+/// A no-op when the path does not exist.
 fn remove_legacy_helper() {
+    use std::os::fd::AsFd;
+
     let legacy = Path::new(LEGACY_HELPER_INSTALL_PATH);
-    let _ = fs::remove_file(legacy);
-    if let Some(parent) = legacy.parent() {
-        let _ = fs::remove_dir(parent);
+    // Remove the file relative to a dirfd on its parent directory, opened
+    // without ever traversing a symlink.
+    if let (Some(dir), Some(file_name)) = (legacy.parent(), legacy.file_name())
+        && let Some(dir_fd) = open_dir_chain_nofollow(dir)
+    {
+        let _ = unlinkat_name(dir_fd.as_fd(), file_name, 0);
+        // Then remove the now-empty directory relative to a dirfd on *its*
+        // parent, again symlink-free. rmdir no-ops if the directory is missing
+        // or non-empty.
+        if let (Some(grandparent), Some(dir_name)) = (dir.parent(), dir.file_name())
+            && let Some(parent_fd) = open_dir_chain_nofollow(grandparent)
+        {
+            let _ = unlinkat_name(parent_fd.as_fd(), dir_name, libc::AT_REMOVEDIR);
+        }
+    }
+}
+
+/// Open `dir` as a directory fd by walking its absolute path from the
+/// filesystem root, opening each component with `O_DIRECTORY|O_NOFOLLOW` so no
+/// intermediate symlink is ever traversed. Best effort: returns `None` if `dir`
+/// is not absolute/normalized, or any component is missing, not a directory, or
+/// a symlink.
+fn open_dir_chain_nofollow(dir: &Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd;
+    use std::path::Component;
+
+    if !dir.is_absolute() {
+        return None;
+    }
+    // Anchor the walk at "/": it is never a symlink, so O_NOFOLLOW opens it
+    // safely and it becomes the dirfd for the first component.
+    let root = std::ffi::CString::new("/").ok()?;
+    let mut current = open_dir_at_nofollow(None, &root)?;
+    for component in dir.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                use std::os::unix::ffi::OsStrExt;
+                let c_name = std::ffi::CString::new(name.as_bytes()).ok()?;
+                current = open_dir_at_nofollow(Some(current.as_fd()), &c_name)?;
+            }
+            // A normalized absolute path has no `.`/`..`/prefix components;
+            // refuse to traverse them rather than walk outside the chain.
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// `openat` a directory named `name` relative to `dirfd` (or the absolute path
+/// `name` when `dirfd` is `None`), with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`.
+/// `None` on any failure.
+fn open_dir_at_nofollow(
+    dirfd: Option<std::os::fd::BorrowedFd<'_>>,
+    name: &std::ffi::CStr,
+) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let raw_dirfd = dirfd.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY;
+    // SAFETY: `name` is a valid NUL-terminated C string and `raw_dirfd` is
+    // either AT_FDCWD or a live borrowed fd. The returned fd is wrapped in an
+    // OwnedFd so it is closed exactly once.
+    let fd = unsafe { libc::openat(raw_dirfd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh, valid, owned descriptor returned by openat.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `unlinkat(dirfd, name, flags)` — `flags` is `0` to remove a file or
+/// `AT_REMOVEDIR` to remove a directory. Errors are returned for the caller to
+/// ignore (best-effort legacy cleanup).
+fn unlinkat_name(
+    dirfd: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `dirfd` is a live directory fd and `c_name` is NUL-terminated.
+    let rc = unsafe { libc::unlinkat(dirfd.as_raw_fd(), c_name.as_ptr(), flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

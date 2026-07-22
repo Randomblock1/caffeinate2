@@ -599,6 +599,19 @@ fn audit_log(op: &str, uid: Option<u32>, pid: Option<i32>, result: Result<(), &s
     }
 }
 
+/// A Hold the coordinator committed, carried past the response write so its
+/// always-on audit entry reflects what durably happened rather than what was
+/// intended. `rollback_epoch` is `Some` only when this RPC *created* the holder
+/// entry — the sole case a failed write may roll back. A hold that merely
+/// re-asserted a pre-existing entry stays owned by the peer's other guards, so
+/// it is never undone (and its `rollback_epoch` is `None`).
+#[cfg(target_os = "macos")]
+struct CommittedHold {
+    uid: Option<u32>,
+    peer: crate::entirely::lockfile::ProcessId,
+    rollback_epoch: Option<u64>,
+}
+
 #[cfg(target_os = "macos")]
 ///
 /// # Errors
@@ -644,15 +657,13 @@ fn serve_connection_inner(
     // client can never release another process's hold, and gating it would
     // strand the holds of users whose grant was later revoked. Status is
     // read-only and open to everyone.
-    // Set when a Hold commits a *newly created* holder entry. If the final
-    // response write then fails, the client never learned the hold exists —
-    // it timed out and may even have fired a compensating Release that a
-    // second worker processed before this commit — so the entry is rolled
-    // back below. Only the creator may undo: releasing a pre-existing entry
-    // would yank it out from under the peer's other live guards, which
-    // learned of it through earlier, answered RPCs (and whose in-process
-    // count also means the peer sends no compensating Release).
-    let mut undo_hold_on_failed_write = None;
+    //
+    // Set when the coordinator commits a Hold. The always-on audit entry for a
+    // committed Hold is deferred until after the response write resolves (see
+    // the post-write block below): auditing success up here would record a
+    // durable privileged hold that a failed write then rolls back, so the trail
+    // must reflect what actually persisted, not what was intended.
+    let mut committed_hold: Option<CommittedHold> = None;
     let response = match request {
         HelperRequest::Hold => {
             let uid = peer_uid_for_audit(&stream);
@@ -672,10 +683,20 @@ fn serve_connection_inner(
                     }
                     Ok(peer) => match coordinator.hold(peer).map_err(|e| e.to_string()) {
                         Ok(outcome) => {
-                            audit_log("hold", uid, Some(peer.pid), Ok(()));
-                            if outcome.newly_inserted {
-                                undo_hold_on_failed_write = Some((peer, outcome.hold_epoch));
-                            }
+                            // Defer the audit until the response write resolves.
+                            // Only a *newly created* entry may be rolled back on
+                            // a failed write: releasing a pre-existing entry
+                            // would yank it out from under the peer's other live
+                            // guards, which learned of it through earlier,
+                            // answered RPCs (and whose in-process count also
+                            // means the peer sends no compensating Release).
+                            committed_hold = Some(CommittedHold {
+                                uid,
+                                peer,
+                                rollback_epoch: outcome
+                                    .newly_inserted
+                                    .then_some(outcome.hold_epoch),
+                            });
                             HelperResponse::HoldOk
                         }
                         Err(e) => {
@@ -719,28 +740,54 @@ fn serve_connection_inner(
         },
     };
     let write_result = write_response(&mut stream, &response);
-    if write_result.is_err()
-        && let Some((peer, hold_epoch)) = undo_hold_on_failed_write
+    // Emit the deferred audit for a committed Hold exactly once, reflecting what
+    // durably persisted rather than what the coordinator committed. Non-Hold
+    // requests and Hold failures already audited inline and leave this `None`.
+    if let Some(CommittedHold {
+        uid,
+        peer,
+        rollback_epoch,
+    }) = committed_hold
     {
-        // The client provably never saw HoldOk (AF_UNIX write to a closed
-        // peer fails), so no guard exists for this entry. Undo it rather
-        // than strand a live-pid hold that the reaper never prunes. The
-        // epoch check keeps a delayed rollback exact: if the client has
-        // meanwhile re-held successfully (new epoch), the stale rollback
-        // must not release that newer, guarded hold.
-        match coordinator.release_if_hold_epoch(peer, hold_epoch) {
-            Ok(true) => tracing::warn!(
-                "rolled back hold for pid {}: response write failed",
-                peer.pid
-            ),
-            Ok(false) => tracing::warn!(
-                "skipped hold rollback for pid {}: a newer hold superseded it",
-                peer.pid
-            ),
-            Err(e) => tracing::warn!(
-                "response write failed and hold rollback for pid {} also failed: {e}",
-                peer.pid
-            ),
+        match (&write_result, rollback_epoch) {
+            // The client received HoldOk: the hold durably holds.
+            (Ok(()), _) => audit_log("hold", uid, Some(peer.pid), Ok(())),
+            // The write failed, but this RPC only re-asserted an entry the peer
+            // already had. That pre-existing entry stays owned by the peer's
+            // other live guards, so a hold remains in force despite the lost
+            // ack — the durable outcome is still a successful hold.
+            (Err(_), None) => audit_log("hold", uid, Some(peer.pid), Ok(())),
+            // The write failed and this RPC created the entry. The client
+            // provably never saw HoldOk (an AF_UNIX write to a closed peer
+            // fails), so no guard exists for it; roll it back rather than strand
+            // a live-pid hold the reaper never prunes. The epoch check keeps a
+            // delayed rollback exact: if the client has meanwhile re-held
+            // successfully (new epoch), the stale rollback must not release that
+            // newer, guarded hold. Audit the true fate so the trail never shows
+            // a durable hold that was actually undone.
+            (Err(_), Some(hold_epoch)) => match coordinator.release_if_hold_epoch(peer, hold_epoch)
+            {
+                Ok(true) => audit_log(
+                    "hold-rollback",
+                    uid,
+                    Some(peer.pid),
+                    Err("response write failed; hold rolled back"),
+                ),
+                Ok(false) => audit_log(
+                    "hold-rollback",
+                    uid,
+                    Some(peer.pid),
+                    Err("response write failed; rollback skipped: a newer hold superseded it"),
+                ),
+                Err(e) => audit_log(
+                    "hold-rollback",
+                    uid,
+                    Some(peer.pid),
+                    Err(&format!(
+                        "response write failed and hold rollback also failed: {e}"
+                    )),
+                ),
+            },
         }
     }
     write_result
