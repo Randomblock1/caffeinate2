@@ -18,8 +18,11 @@
 //!
 //! The oracle is deliberately independent of the coordinator's implementation:
 //! it tracks only the set of processes that are currently holding and alive, and
-//! asserts the kernel bit converges to `holders > 0` after a reconcile. If the
-//! oracle and the code ever disagree, one of them is wrong — that is the signal.
+//! asserts the kernel bit converges to `holders > 0` after a reconcile — and,
+//! in the interference-free property, immediately after every successful
+//! release, so a release-side regression cannot hide behind the reaper healing
+//! it. If the oracle and the code ever disagree, one of them is wrong — that is
+//! the signal.
 
 #![cfg(target_os = "macos")]
 
@@ -164,6 +167,19 @@ proptest! {
     /// This exercises crash recovery, lazy pruning of SIGKILLed holders, and the
     /// hold/release ref-counting all at once.
     ///
+    /// The same equality is also asserted immediately after every *successful*
+    /// Release — not only at reconcile/restart checkpoints. This pins the
+    /// release-side half of the lost-disable-intent fix directly: a release
+    /// that prunes the holder set to empty while caffeinate2 owns the disable
+    /// must re-enable sleep right then, not lean on a later reconcile to heal
+    /// the stranding (a reconcile-only oracle lets a release-side regression
+    /// hide behind the reaper). The checkpoint has no false positives because
+    /// the deferral cases never reach it: a re-enable that hits an armed
+    /// `DisablerFailNext` failure makes `release` return `Err` (skipped by the
+    /// `is_ok` guard, and legitimately left to reconcile), and a SIGKILLed
+    /// holder's stale entry is pruned *by the release itself* under the same
+    /// flock, so it cannot linger past a successful release.
+    ///
     /// This originally exposed the lost-disable-intent-across-restart bug; it
     /// now passes thanks to the durable ownership marker. See
     /// `lost_disable_intent_across_restart_is_fixed` for the minimal case.
@@ -195,6 +211,19 @@ proptest! {
                     // oracle keeps the holder too.
                     if coord.release(p[*i]).is_ok() {
                         holders.remove(&p[*i]);
+                        // Release-immediate checkpoint (see the property docs):
+                        // a successful release leaves the kernel bit equal to
+                        // live-holder existence *now*. In particular, a stray
+                        // release that pruned a killed holder's stale entry to
+                        // empty must have re-enabled sleep via the durable
+                        // ownership marker instead of stranding it for the
+                        // reaper.
+                        prop_assert_eq!(
+                            world.kernel(),
+                            !holders.is_empty(),
+                            "successful release must immediately converge the kernel bit \
+                             (release-side lost-disable-intent contract)"
+                        );
                     }
                 }
                 Op::Kill(i) => {
