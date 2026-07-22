@@ -432,8 +432,14 @@ fn run_maintenance(command: MaintenanceCommand) {
 
 #[cfg(target_os = "macos")]
 fn main() {
-    caffeinate2::util::logging::init_cli_tracing();
+    // Parse first so tracing verbosity comes from clap's own `-v`/`--verbose`
+    // value: this handles bundled short flags (`-vt 3600`, `-vi`) and ignores a
+    // `-v` that belongs to a wrapped command after `--`. clap parse errors print
+    // to stderr and exit on their own (they don't use tracing). The exclusive
+    // `--install-helper-internal` / `--status` paths still get tracing
+    // initialized here, before `run_maintenance` does any real work.
     let args = Args::parse();
+    caffeinate2::util::logging::init_cli_tracing(args.verbose);
     if let Some(command) = args.maintenance_command() {
         run_maintenance(command);
         return;

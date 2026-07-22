@@ -44,7 +44,9 @@ fn run_maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
 fn main() {
-    logging::init_cli_tracing();
+    // The tray CLI has no verbose flag, so tracing uses the default filter
+    // (RUST_LOG still overrides it).
+    logging::init_cli_tracing(false);
     let args = Args::parse();
     if let Some(command) = args.maintenance_command() {
         if let Err(error) = run_maintenance(command) {

@@ -2,14 +2,14 @@ use tracing_subscriber::EnvFilter;
 
 /// Initialize tracing for CLI binaries (`caffeinate2`, `sleepdetect`, `caffeinate2-tray`).
 ///
-/// Respects `RUST_LOG`; an explicit `RUST_LOG` always wins. Otherwise the
-/// default filter is `warn,caffeinate2=info`, promoted to `warn,caffeinate2=debug`
-/// when `-v`/`--verbose` is on the command line — the flag is parsed here,
-/// before clap runs, so the assertion-lifecycle `debug!` output is actually
-/// emitted under `-v` rather than being filtered out.
-pub fn init_cli_tracing() {
+/// An explicit `RUST_LOG` always wins. Otherwise the default filter is
+/// `warn,caffeinate2=info`, promoted to `warn,caffeinate2=debug` when `verbose`
+/// is set, so the assertion-lifecycle `debug!` output is actually emitted rather
+/// than being filtered out. Callers pass their own clap-parsed `-v`/`--verbose`
+/// value: this correctly handles bundled short flags (`-vt`, `-vi`) and does not
+/// misread a `-v` belonging to a wrapped command after `--`.
+pub fn init_cli_tracing(verbose: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let verbose = std::env::args().any(|a| a == "--verbose" || a == "-v");
         EnvFilter::new(if verbose {
             "warn,caffeinate2=debug"
         } else {
@@ -50,5 +50,5 @@ pub fn init_helper_tracing() {
 
 #[cfg(not(target_os = "macos"))]
 pub fn init_helper_tracing() {
-    init_cli_tracing();
+    init_cli_tracing(false);
 }

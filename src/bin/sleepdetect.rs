@@ -69,7 +69,9 @@ fn format_sleep_duration(duration: Duration) -> String {
 }
 
 fn main() {
-    logging::init_cli_tracing();
+    // sleepdetect has no CLI flags, so tracing uses the default filter
+    // (RUST_LOG still overrides it).
+    logging::init_cli_tracing(false);
     const SLEEP_TIME: u64 = 5;
     const SLEEP_DURATION: Duration = Duration::from_secs(SLEEP_TIME);
     const SLEEP_THRESHOLD: Duration = Duration::from_secs(SLEEP_TIME * 2);
