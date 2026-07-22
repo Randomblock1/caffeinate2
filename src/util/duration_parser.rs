@@ -20,17 +20,20 @@ pub enum DurationParseError {
 pub fn parse_duration(duration: &str) -> Result<SignedDuration, DurationParseError> {
     let trimmed = duration.trim();
 
-    // A comma wedged between two digits is ambiguous (decimal comma like "0,5h",
-    // or a thousands separator). Silently deleting it would produce a wildly
-    // wrong timeout ("0,5h" -> "05h" = 5 hours, not 30 minutes), so reject it
-    // rather than guess. Connector commas (e.g. "1 hour, 30 minutes") are not
-    // between digits and are still stripped below.
+    // A comma adjacent to a digit on the side facing a number is ambiguous
+    // (decimal comma like "0,5h", a thousands separator like "1,000", or a
+    // truncated/malformed value like ",5" or "5,"). Silently deleting it
+    // could produce a wildly wrong timeout ("0,5h" -> "05h" = 5 hours, not 30
+    // minutes) or hide a typo, so reject it rather than guess. A side counts
+    // as facing a digit when the neighboring char is a digit, or when there
+    // is no neighboring char because the comma sits at the string edge.
+    // Connector commas (e.g. "1 hour, 30 minutes") sit between a letter and a
+    // space on both sides and are still stripped below.
     let bytes = trimmed.as_bytes();
     if bytes.iter().enumerate().any(|(i, &b)| {
         b == b','
-            && i > 0
-            && bytes[i - 1].is_ascii_digit()
-            && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && (i == 0 || bytes[i - 1].is_ascii_digit())
+            && bytes.get(i + 1).is_none_or(u8::is_ascii_digit)
     }) {
         return Err(DurationParseError::Invalid);
     }
@@ -283,8 +286,13 @@ mod tests {
         let result = parse_duration(duration).unwrap();
         assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
 
-        // Connector commas (not between digits) are stripped, not rejected.
+        // Connector commas (not adjacent to a digit on both relevant sides)
+        // are stripped, not rejected.
         let duration = "1 hour, 30 minutes";
+        let result = parse_duration(duration).unwrap();
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
+
+        let duration = "1h,30m";
         let result = parse_duration(duration).unwrap();
         assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
     }
@@ -293,7 +301,10 @@ mod tests {
     fn test_parse_duration_rejects_ambiguous_comma() {
         // A comma between digits (decimal comma / thousands separator) must not
         // be silently deleted: "0,5h" must not become "05h" (5 hours).
-        for duration in ["0,5h", "2,5m", "1,5h", "1,000"] {
+        // A comma at the string edge next to a digit is equally ambiguous
+        // (truncated/malformed input) and must not be silently stripped:
+        // ",5" and "5," must not become "5". A lone "," must also be rejected.
+        for duration in ["0,5h", "2,5m", "1,5h", "1,000", ",5", "5,", ","] {
             assert_eq!(
                 parse_duration(duration).unwrap_err(),
                 DurationParseError::Invalid,
