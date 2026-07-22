@@ -143,6 +143,13 @@ impl EntirelyCoordinator {
         self.inner.ops.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Register a hold: add the holder (and, first holder, the durable
+    /// ownership marker) in one lockfile write, then disable sleep.
+    ///
+    /// Modeled by `tests/protocol_model.rs` (`Action::Hold` +
+    /// `Pending::HoldToggle`, cross-process `CrossAction::Hold`), which checks
+    /// every crash point between the write and the toggle; keep the model in
+    /// sync with this sequence.
     ///
     /// # Errors
     ///
@@ -249,6 +256,12 @@ impl EntirelyCoordinator {
     }
 
     /// The body of [`Self::release`]; the caller must hold the ops mutex.
+    ///
+    /// Modeled by `tests/protocol_model.rs` (`Action::Release` +
+    /// `Pending::ReleaseToggle`/`ReleaseClear`, cross-process
+    /// `CrossAction::Release`), including the release-immediate property that a
+    /// completed release never leaves sleep disabled with zero live holders;
+    /// keep the model in sync with this sequence.
     fn release_under_ops(&self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
         // `release` removes the holder but leaves the ownership marker set; it
@@ -326,7 +339,7 @@ impl EntirelyCoordinator {
         // disabled sleep. `treat_pruned_as_intent` additionally treats "the
         // lockfile still had holders we just pruned to zero" as intent — a
         // legacy fallback for lockfiles written before the marker existed.
-        self.reconcile_locked(true).map(|_| ())
+        self.reconcile_locked(true)
     }
 
     /// Periodic reaper: prune holders whose processes have died and converge
@@ -344,11 +357,11 @@ impl EntirelyCoordinator {
     /// Returns an error if the lockfile cannot be pruned or sleep cannot be reconciled.
     pub fn reconcile(&self) -> Result<(), CoordinatorError> {
         let _ops = self.lock_ops();
-        self.reconcile_locked(false).map(|_| ())
+        self.reconcile_locked(false)
     }
 
-    /// Prune dead holders and converge the system sleep setting, returning the
-    /// live holder count. The caller must already hold the ops lock.
+    /// Prune dead holders and converge the system sleep setting. The caller
+    /// must already hold the ops lock.
     ///
     /// The durable ownership marker (`owns_disable`) is the source of truth for
     /// whether caffeinate2 disabled sleep, so it survives a helper restart.
@@ -357,7 +370,13 @@ impl EntirelyCoordinator {
     /// for lockfiles written before the marker existed. Neither path
     /// force-enables an empty, unmarked lockfile, so a manual `pmset
     /// disablesleep` is left untouched.
-    fn reconcile_locked(&self, treat_pruned_as_intent: bool) -> Result<usize, CoordinatorError> {
+    ///
+    /// Modeled by `tests/protocol_model.rs` (`StartReconcile`/`StartStartup` +
+    /// `Pending::ReconcileToggle`/`ReconcileMarker`, cross-process
+    /// `CrossAction::Reconcile`): the prune+decide runs as one atomic step, the
+    /// toggle and the follow-up marker write as separate crash-interruptible
+    /// steps; keep the model in sync with this decision and sequence.
+    fn reconcile_locked(&self, treat_pruned_as_intent: bool) -> Result<(), CoordinatorError> {
         let inner = &self.inner;
         let lockfile::PruneOutcome {
             live: holders,
@@ -410,11 +429,10 @@ impl EntirelyCoordinator {
             // worse (a concurrent valid clear would orphan the disable with no
             // crash at all). It heals on the next hold/release cycle, and the
             // cross-process model tracks it as `orphaned_disable`.
-            lockfile::set_owns_disable(
+            lockfile::record_owns_disable(
                 inner.verbose,
                 &inner.lock_file_path,
                 inner.process_checker.as_ref(),
-                true,
             )?;
         } else if owns_disable || (treat_pruned_as_intent && had_entries) {
             // No live holders, but caffeinate2 owns the disable (durable marker),
@@ -442,9 +460,17 @@ impl EntirelyCoordinator {
                 )?;
             }
         }
-        Ok(holders)
+        Ok(())
     }
 
+    /// Report the live holder count and whether sleep is disabled, converging
+    /// immediately (re-enable + guarded marker clear) when the prune just
+    /// dropped the last holder we owned the disable for.
+    ///
+    /// Modeled by `tests/protocol_model.rs` cross-process `CrossAction::Status`
+    /// and `ProcPending::StatusToggle`/`StatusClear` (the single-process model
+    /// omits status; its steps are a subset of reconcile's there); keep the
+    /// model in sync with this sequence.
     ///
     /// # Errors
     ///
@@ -755,7 +781,7 @@ mod tests {
         let _ = std::fs::remove_file(&lock_path);
         let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
         // Create the marker-only state (no holders).
-        lockfile::set_owns_disable(false, &lock_path, process_checker.as_ref(), true).unwrap();
+        lockfile::record_owns_disable(false, &lock_path, process_checker.as_ref()).unwrap();
 
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
         let sleep_calls_clone = sleep_calls.clone();
@@ -789,7 +815,7 @@ mod tests {
         let lock_path = temp_lock_path();
         let _ = std::fs::remove_file(&lock_path);
         let process_checker: Arc<ProcessChecker> = Arc::new(|_, _| false);
-        lockfile::set_owns_disable(false, &lock_path, process_checker.as_ref(), true).unwrap();
+        lockfile::record_owns_disable(false, &lock_path, process_checker.as_ref()).unwrap();
 
         let sleep_calls = Arc::new(Mutex::new(Vec::new()));
         let sleep_calls_clone = sleep_calls.clone();

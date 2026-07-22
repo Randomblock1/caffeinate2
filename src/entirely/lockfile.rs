@@ -227,6 +227,9 @@ fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std:
     Ok(())
 }
 
+/// Drop holder entries whose process is no longer alive (`pin` survives
+/// regardless). Runs at the start of every locked mutation. Modeled by
+/// `tests/protocol_model.rs` `prune`/`cross_prune`; keep the model in sync.
 fn prune_stale_holders(
     pids: &mut HashSet<ProcessId>,
     verbose: bool,
@@ -295,6 +298,10 @@ pub(crate) struct AcquireOutcome {
 /// that adds the holder — before the caller toggles sleep — so a crash between
 /// this write and the actual disable still leaves durable evidence to reconcile
 /// against (the safe direction).
+///
+/// Modeled by `tests/protocol_model.rs` (`Action::Hold` / `CrossAction::Hold`:
+/// prune + insert + first-holder marker set and generation bump as one atomic
+/// step); keep the model in sync with this write.
 pub(crate) fn acquire(
     verbose: bool,
     path: &Path,
@@ -350,6 +357,11 @@ pub(crate) struct ReleaseOutcome {
 /// still triggers the re-enable instead of stranding sleep disabled. An empty
 /// lockfile with no marker (e.g. a manual `pmset disablesleep`) never signals a
 /// re-enable.
+///
+/// Modeled by `tests/protocol_model.rs` (`Action::Release` /
+/// `CrossAction::Release`: the `holders.is_empty() && owns_disable` decision,
+/// with `Variant::Buggy` keeping the pre-fix `removed && empty` shape); keep
+/// the model in sync with this decision.
 pub(crate) fn release(
     verbose: bool,
     path: &Path,
@@ -372,23 +384,45 @@ pub(crate) fn release(
     )
 }
 
-/// Set or clear the ownership marker without otherwise changing the holder set
-/// (dead holders are still pruned, as with every locked mutation). Setting it
-/// records a *new* ownership generation, invalidating any in-flight clear that
-/// captured the previous one. Used to record ownership when a reconcile
-/// (re-)applies the disable; clearing after a confirmed re-enable goes through
+/// Record the ownership marker without otherwise changing the holder set (dead
+/// holders are still pruned, as with every locked mutation). Recording it stamps
+/// a *new* ownership generation, invalidating any in-flight clear that captured
+/// the previous one. Used to record ownership when a reconcile (re-)applies the
+/// disable; clearing after a confirmed re-enable goes through
 /// [`clear_owns_disable_if_current`] instead.
-pub(crate) fn set_owns_disable(
+///
+/// Modeled by `tests/protocol_model.rs` (the `ReconcileMarker`
+/// `Effect::Disable` step; in the cross-process model the generation bump is
+/// `invalidate_generations`); keep the model in sync.
+pub(crate) fn record_owns_disable(
     verbose: bool,
     path: &Path,
     process_checker: &ProcessChecker,
-    owns: bool,
 ) -> Result<(), std::io::Error> {
     mutate_lockfile(verbose, path, process_checker, None, |state| {
-        state.owns_disable = owns;
-        if owns {
-            state.disable_generation += 1;
-        }
+        state.owns_disable = true;
+        state.disable_generation += 1;
+        Ok(())
+    })
+}
+
+/// Clear the ownership marker **without** the generation guard that
+/// [`clear_owns_disable_if_current`] enforces. This bypass is unsound in
+/// production: after the caller's unlocked kernel re-enable, another process can
+/// take a first hold or a reconcile can re-record ownership, and an
+/// unconditional clear would strand that fresh disable with zero holders and no
+/// marker. It exists only to construct marker-cleared lockfile states in tests,
+/// so it is `#[cfg(test)]`-gated and must never become production code.
+/// `tests/protocol_model.rs` model-checks exactly this unsoundness as
+/// `MarkerWrite::Unconditional` in `CrossProcess::clear_marker`.
+#[cfg(test)]
+pub(crate) fn clear_owns_disable_unguarded(
+    verbose: bool,
+    path: &Path,
+    process_checker: &ProcessChecker,
+) -> Result<(), std::io::Error> {
+    mutate_lockfile(verbose, path, process_checker, None, |state| {
+        state.owns_disable = false;
         Ok(())
     })
 }
@@ -406,6 +440,10 @@ pub(crate) fn set_owns_disable(
 /// write bumps the generation, so this clear backs off; clobbering the fresh
 /// marker would leave the new disable with no evidence of ownership, stranding
 /// sleep disabled with zero holders.
+///
+/// Modeled by `tests/protocol_model.rs` `CrossProcess::clear_marker`
+/// (`MarkerWrite::Guarded`; the generation comparison is the `gen_valid`
+/// token); keep the model in sync with this guard.
 pub(crate) fn clear_owns_disable_if_current(
     verbose: bool,
     path: &Path,
@@ -441,6 +479,10 @@ pub(crate) struct PruneOutcome {
 /// Prune stale lockfile entries under an exclusive lock and report the live
 /// holder count, whether the file had any holders beforehand, and whether
 /// caffeinate2 owns the current sleep disable.
+///
+/// Modeled by `tests/protocol_model.rs` as the atomic prune+decide start of
+/// `StartReconcile`/`StartStartup` (and `CrossAction::Reconcile`/`Status`);
+/// keep the model in sync.
 #[cfg(target_os = "macos")]
 pub(crate) fn prune_lockfile(
     verbose: bool,
@@ -796,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn set_owns_disable_toggles_marker_without_touching_live_holders() {
+    fn clear_owns_disable_unguarded_clears_marker_without_touching_live_holders() {
         let lock_path = temp_lock_path();
         let holder = proc(100, 123);
         {
@@ -807,7 +849,7 @@ mod tests {
         let process_checker =
             |pid: i32, start_time: ProcessStartTime| pid == 100 && start_time.seconds == 123;
 
-        set_owns_disable(false, &lock_path, &process_checker, false).unwrap();
+        clear_owns_disable_unguarded(false, &lock_path, &process_checker).unwrap();
 
         assert!(!owns_disable(&lock_path));
         assert_eq!(read_entries(&lock_path), vec![holder]);
@@ -907,7 +949,7 @@ mod tests {
         let outcome = release(false, &lock_path, &process_checker, &current_proc).unwrap();
         assert!(outcome.should_enable);
         // The concurrent reconcile's ownership re-record.
-        set_owns_disable(false, &lock_path, &process_checker, true).unwrap();
+        record_owns_disable(false, &lock_path, &process_checker).unwrap();
 
         clear_owns_disable_if_current(
             false,
