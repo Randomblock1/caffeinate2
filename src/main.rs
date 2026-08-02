@@ -285,8 +285,8 @@ fn main() {
             exit_code.store(code, Ordering::Relaxed);
         }
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
-            let mut duration = chrono::Duration::try_seconds(0).unwrap();
-            let mut end_time = chrono::Local::now();
+            let mut duration = jiff::SignedDuration::ZERO;
+            let mut end_time = jiff::Zoned::now();
 
             let timeout = args.timeout.is_some();
             let waitfor = args.waitfor.is_some();
@@ -315,14 +315,14 @@ fn main() {
             if timeout {
                 println!(
                     "Resuming {}.",
-                    if duration.num_seconds() > (60 * 60 * 24) {
-                        end_time.format(LONG_FMT)
+                    if duration.as_secs() > (60 * 60 * 24) {
+                        end_time.strftime(LONG_FMT)
                     } else {
-                        end_time.format(SHORT_FMT)
+                        end_time.strftime(SHORT_FMT)
                     }
                 );
                 if !waitfor {
-                    thread::sleep(duration.to_std().expect("Duration should be valid"));
+                    thread::sleep(duration.try_into().expect("Duration should be valid"));
                 }
             }
 
@@ -330,7 +330,7 @@ fn main() {
                 let pid = args.waitfor.expect("PID should be present");
 
                 let timeout_duration = if timeout {
-                    Some(duration.to_std().expect("Duration should be valid"))
+                    Some(duration.try_into().expect("Duration should be valid"))
                 } else {
                     None
                 };
@@ -340,8 +340,8 @@ fn main() {
                         exit_code.store(pid_exit_code, Ordering::Relaxed);
 
                         print!("PID {pid} finished ");
-                        let now = chrono::Local::now();
-                        print!("{} ", now.format(SHORT_FMT));
+                        let now = jiff::Zoned::now();
+                        print!("{} ", now.strftime(SHORT_FMT));
                         println!("with exit code {}", exit_code.load(Ordering::Relaxed));
                     }
                     Ok(WaitForPidResult::TimedOut) => {}

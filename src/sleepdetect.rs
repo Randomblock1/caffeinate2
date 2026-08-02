@@ -76,11 +76,11 @@ fn main() {
         if let Some(excess_duration) = sleep_result {
             let elapsed_secs = excess_duration.as_secs();
             sleep_arr.lock().unwrap().push(elapsed_secs);
-            let now = chrono::Local::now();
+            let now = jiff::Zoned::now();
             println!(
                 "Sleep detected! Slept for {} seconds, woke at {}",
                 elapsed_secs,
-                now.format("%Y-%m-%d %-I:%M:%S %p")
+                now.strftime("%Y-%m-%d %-I:%M:%S %p")
             );
         }
     }
