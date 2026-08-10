@@ -1,8 +1,10 @@
-pub fn parse_duration(duration: &str) -> Result<chrono::Duration, String> {
+use jiff::SignedDuration;
+
+pub fn parse_duration(duration: &str) -> Result<SignedDuration, String> {
     let duration = duration.trim();
 
     match parse_human_duration(duration) {
-        Ok(std_duration) => chrono::Duration::from_std(std_duration)
+        Ok(std_duration) => SignedDuration::try_from(std_duration)
             .map_err(|_| "Error: Timeout is too large!".to_string()),
         Err(humantime::DurationError::NumberOverflow) => {
             Err("Error: Timeout is too large!".to_string())
@@ -12,12 +14,11 @@ pub fn parse_duration(duration: &str) -> Result<chrono::Duration, String> {
                 .parse::<u64>()
                 .map_err(|_| "Error: Timeout isn't a valid duration or number!".to_string())?;
 
-            chrono::Duration::try_seconds(
+            Ok(SignedDuration::from_secs(
                 seconds
                     .try_into()
                     .map_err(|_| "Error: Timeout is too large!".to_string())?,
-            )
-            .ok_or_else(|| "Error: Timeout is too large!".to_string())
+            ))
         }
     }
 }
@@ -50,11 +51,11 @@ fn duration_without_connectors(duration: &str) -> Option<String> {
 }
 
 /// Human-readable duration for CLI messages (e.g. "1 hour 30 minutes").
-pub fn format_duration_human(duration: chrono::Duration) -> String {
-    let seconds = duration.num_seconds() % 60;
-    let minutes = duration.num_minutes() % 60;
-    let hours = duration.num_hours() % 24;
-    let days = duration.num_days();
+pub fn format_duration_human(duration: SignedDuration) -> String {
+    let seconds = duration.as_secs() % 60;
+    let minutes = duration.as_mins() % 60;
+    let hours = duration.as_hours() % 24;
+    let days = duration.as_hours() / 24;
     let mut parts = Vec::new();
 
     if days > 0 {
@@ -116,19 +117,19 @@ mod tests {
     #[test]
     fn format_duration_human_omits_zero_components() {
         assert_eq!(
-            format_duration_human(chrono::Duration::try_seconds(0).unwrap()),
+            format_duration_human(SignedDuration::from_secs(0)),
             "0 seconds"
         );
         assert_eq!(
-            format_duration_human(chrono::Duration::try_seconds(60).unwrap()),
+            format_duration_human(SignedDuration::from_secs(60)),
             "1 minute"
         );
         assert_eq!(
-            format_duration_human(chrono::Duration::try_seconds(3661).unwrap()),
+            format_duration_human(SignedDuration::from_secs(3661)),
             "1 hour 1 minute 1 second"
         );
         assert_eq!(
-            format_duration_human(chrono::Duration::try_seconds(90_061).unwrap()),
+            format_duration_human(SignedDuration::from_secs(90_061)),
             "1 day 1 hour 1 minute 1 second"
         );
     }
@@ -144,60 +145,57 @@ mod tests {
     fn test_parse_duration_valid_strings() {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(
-            result.num_seconds(),
-            DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND
-        );
+        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND);
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), DAY + 2 * HOUR + 3 * MINUTE);
+        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE);
 
         let duration = "3min 17h 2s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
+        assert_eq!(result.as_secs(), 17 * HOUR + 3 * MINUTE + 2 * SECOND);
 
         let duration = "1 hour and 30 minutes";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
     }
 
     #[test]
     fn test_parse_duration_valid_numbers() {
         let duration = "45323";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 45323);
+        assert_eq!(result.as_secs(), 45323);
 
         let duration = "0";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 0);
+        assert_eq!(result.as_secs(), 0);
 
         let duration = "60";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 60 * SECOND);
+        assert_eq!(result.as_secs(), 60 * SECOND);
     }
 
     #[test]
     fn test_parse_duration_edge_cases() {
         let duration = "0s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 0);
+        assert_eq!(result.as_secs(), 0);
 
         let duration = "1000000s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 1000000);
+        assert_eq!(result.as_secs(), 1000000);
 
         let duration = "  15m  ";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), 15 * MINUTE);
+        assert_eq!(result.as_secs(), 15 * MINUTE);
 
         let duration = "1.5h";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_seconds(), HOUR + 30 * MINUTE);
+        assert_eq!(result.as_secs(), HOUR + 30 * MINUTE);
 
         let duration = "250ms";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(result.num_milliseconds(), 250);
+        assert_eq!(result.as_millis(), 250);
     }
 
     #[test]
