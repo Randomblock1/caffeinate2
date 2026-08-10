@@ -40,7 +40,9 @@ const MARGIN: f64 = 12.0;
 const ROW_HEIGHT: f64 = 24.0;
 const INNER_W: f64 = WIN_W - 2.0 * MARGIN;
 const COL_WIDTH: f64 = INNER_W - 4.0;
-pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Coalesce a burst of keystrokes into a single filtered rebuild once typing
+/// settles, rather than rebuilding per character.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Coalesce a burst of `NSWorkspace` launch/quit notifications into a single
 /// re-scan once activity settles, rather than scanning per notification.
 const WORKSPACE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -612,13 +614,26 @@ impl WaitWindow {
         self.controller.poll_debounce();
     }
 
-    /// Whether any debounced picker work — a typed search change or a coalesced
-    /// workspace refresh — is still waiting for its debounce to elapse. The run
-    /// loop uses this to keep cycling (rather than blocking indefinitely) so
-    /// `poll_debounce` actually fires once activity settles.
-    pub fn search_pending(&self) -> bool {
+    /// How long the run loop may block before `poll_debounce` must run again, or
+    /// `None` when no debounced picker work is pending. The run loop caps its
+    /// pump timeout with this so `poll_debounce` actually fires once activity
+    /// settles, instead of blocking until some unrelated event arrives.
+    ///
+    /// Each kind of pending work reports its own debounce window. Capping a
+    /// refresh-only wait with the shorter search window would wake the loop at
+    /// 150 ms, find the 200 ms refresh boundary unmet, and re-arm — burning a
+    /// wakeup and landing the refresh at 300 ms instead of 200 ms.
+    pub fn pending_timeout(&self) -> Option<Duration> {
         let ivars = self.controller.ivars();
-        ivars.search_pending.get() || ivars.refresh_pending.get()
+        let search = ivars.search_pending.get().then_some(SEARCH_DEBOUNCE);
+        let refresh = ivars
+            .refresh_pending
+            .get()
+            .then_some(WORKSPACE_REFRESH_DEBOUNCE);
+        match (search, refresh) {
+            (Some(search), Some(refresh)) => Some(search.min(refresh)),
+            (search, refresh) => search.or(refresh),
+        }
     }
 
     /// Bring an already-open picker back to the front instead of opening a second copy.
@@ -673,11 +688,16 @@ fn scan_rows(checked: &HashMap<String, WatchTarget>) -> std::io::Result<Vec<Prog
 /// running (or the live scan failed and `all` holds only these rows).
 fn append_checked_rows(all: &mut Vec<ProgramRow>, checked: &HashMap<String, WatchTarget>) {
     let present: HashSet<String> = all.iter().map(|p| p.target.key().to_string()).collect();
+    let start = all.len();
     for (key, target) in checked {
         if !present.contains(key) {
             all.push(not_running_row(target.clone(), String::new()));
         }
     }
+    // `checked` is a HashMap, so this tail lands in hash order while
+    // `program_rows` sorted everything before it. `rebuild` renders `all` as-is,
+    // so sort the tail by the same key to keep the list alphabetical throughout.
+    all[start..].sort_by_key(|row| row.name.to_lowercase());
 }
 
 fn not_running_row(target: WatchTarget, icon_path: String) -> ProgramRow {

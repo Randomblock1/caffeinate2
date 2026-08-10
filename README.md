@@ -128,7 +128,7 @@ Run `caffeinate2-tray` after installing with `--features full`. To run it in the
 This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Its stderr is captured, best-effort, to `~/Library/Logs/caffeinate2-tray.log` (appended, never rotated), and is discarded only if that file cannot be opened; run it in the foreground to watch the logs live. Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
 
 - **Left click:** toggle the selected sleep mode on/off.
-- **Right click:** open the menu:
+- **Right-click:** open the menu:
   - **Mode** — Display, Disk, System, System (on AC), User active, or Entirely.
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
   - **Wait for apps…** — pick one or more running apps, or use the **Choose application** picker (button **Choose**) for any `.app`.

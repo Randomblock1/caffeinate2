@@ -263,17 +263,13 @@ pub fn run() -> Result<(), TrayError> {
             handles = install_menu(&tray, &state.menu_snapshot());
         }
 
-        // A pending picker search must wake the loop within the debounce window
+        // Pending picker work must wake the loop within its own debounce window
         // so `poll_debounce` can fire; otherwise an idle `pump_timeout()` (None)
-        // would block until some unrelated event arrives and the filtered list
-        // would never update after the user stops typing.
+        // would block until some unrelated event arrives and the list would
+        // never update after the user stops typing (or after a launch burst).
         let mut pump_timeout = state.pump_timeout();
-        if wait_window.as_ref().is_some_and(WaitWindow::search_pending) {
-            pump_timeout = Some(
-                pump_timeout.map_or(wait_window::SEARCH_DEBOUNCE, |timeout| {
-                    timeout.min(wait_window::SEARCH_DEBOUNCE)
-                }),
-            );
+        if let Some(pending) = wait_window.as_ref().and_then(WaitWindow::pending_timeout) {
+            pump_timeout = Some(pump_timeout.map_or(pending, |timeout| timeout.min(pending)));
         }
         // Never block the pump indefinitely. The SIGINT/SIGTERM handler runs off
         // the main thread, where `wake_event_loop` can only nudge the run loop
