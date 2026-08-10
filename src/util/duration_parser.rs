@@ -269,10 +269,7 @@ mod tests {
     fn test_parse_duration_valid_strings() {
         let duration = "1d 2h 3m 4s";
         let result = parse_duration(duration).unwrap();
-        assert_eq!(
-            result.as_secs(),
-            DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND
-        );
+        assert_eq!(result.as_secs(), DAY + 2 * HOUR + 3 * MINUTE + 4 * SECOND);
 
         let duration = "1day 2h 3m";
         let result = parse_duration(duration).unwrap();

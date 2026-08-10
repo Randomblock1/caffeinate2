@@ -643,15 +643,11 @@ mod tests {
     #[test]
     fn timeout_parses_raw_number_as_seconds() {
         assert_eq!(
-            duration_parser::parse_duration("3600")
-                .unwrap()
-                .as_secs(),
+            duration_parser::parse_duration("3600").unwrap().as_secs(),
             3600
         );
         assert_eq!(
-            duration_parser::parse_duration("45323")
-                .unwrap()
-                .as_secs(),
+            duration_parser::parse_duration("45323").unwrap().as_secs(),
             45323
         );
     }
