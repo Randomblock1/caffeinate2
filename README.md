@@ -133,6 +133,7 @@ This returns control to the shell immediately and keeps the menu bar icon runnin
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
   - **Wait for apps…** — pick one or more running apps, or use the **Choose application** picker (button **Choose**) for any `.app`.
   - **Upgrade other apps' sleep prevention** — see below.
+  - **Ignored apps** — the programs that are never upgraded; click one to stop ignoring it (shown only when the list is non-empty).
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
@@ -163,8 +164,9 @@ Unsigned binaries may require running from Terminal once (right-click → Open) 
 - **Wait for apps matching:** the target is remembered by bundle ID (for example `Codex.app` stays matched across restarts).
 - **Upgrade release delay:** caffeinate2 releases its Entirely hold about 20 seconds after the external assertion goes away.
 - **Upgrade menu display:** a single named app appears as one line; several collapse into an expandable **Upgrading N apps** submenu (the tooltip lists them too). When an app's name is unavailable, a generic **Upgrading external app** line is shown instead.
-- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason shown is _display only_ for the display-only assertions video players hold. caffeinate2 never reacts to its own holds.
+- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason is _display only_ for the display-only assertions video players hold, and _you ignore this app_ for the persistent ignore list. caffeinate2 never reacts to its own holds.
 - **What counts as a system program:** anything running as another user (root daemons and service accounts like `coreaudiod`), any Apple `.app`, anything launched from `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin` or `/Library/Apple` — macOS's daemons and per-user agents — and any process whose executable can't be read. These are silently dropped: never upgraded, never listed. Everything else you run is upgradeable, including Homebrew binaries and Apple's own command-line tools: `caffeinate -i` from `/usr/bin` is you asking to stay awake, not the OS doing housekeeping.
+- **Ignored apps list:** stored as `ignored_apps` in `tray.toml` (a list of process names as IOKit reports them, matched case-insensitively) and editable by hand as well as from the menu.
 - **Any matching assertion counts:** a desktop app that holds an idle-system-sleep assertion while open (some Electron apps do) will keep the upgrade active until it quits.
 
 ## Entirely mode

@@ -39,6 +39,7 @@ const OBSERVED_TYPES: &[AssertionType] = &[
 ];
 
 /// Reason text for the menu's "Ignoring…" lines, one per non-upgraded verdict.
+const REASON_USER_IGNORED: &str = "you ignore this app";
 const REASON_DISPLAY_ONLY: &str = "display only";
 
 /// Now on a clock that keeps advancing while the system is asleep, as an
@@ -112,13 +113,24 @@ enum Verdict {
 /// The watcher's decision for a single assertion. `is_system` answers "does this
 /// PID belong to the operating system rather than to the user?" — injected so
 /// the rules can be unit-tested without live PIDs.
-fn verdict_for(assertion: &ExternalAssertion, is_system: &impl Fn(i32) -> bool) -> Verdict {
+fn verdict_for(
+    assertion: &ExternalAssertion,
+    ignores_app: &impl Fn(&str) -> bool,
+    is_system: &impl Fn(i32) -> bool,
+) -> Verdict {
     if is_system(assertion.pid) {
         return Verdict::DropSilently;
     }
+    // Type before the ignore list: a display-only hold was never upgradeable in
+    // the first place, so blaming an ignore rule for it would misattribute the
+    // reason shown in the menu (VLC on the ignore list still reads
+    // "display only", because that is why it isn't upgraded).
     if assertion.assertion_type != UPGRADE_TRIGGER_TYPE.as_str() {
         // The only other observed type (see `OBSERVED_TYPES`).
         return Verdict::Ignore(REASON_DISPLAY_ONLY);
+    }
+    if ignores_app(&assertion.process_name) {
+        return Verdict::Ignore(REASON_USER_IGNORED);
     }
     Verdict::Upgrade
 }
@@ -127,12 +139,13 @@ fn verdict_for(assertion: &ExternalAssertion, is_system: &impl Fn(i32) -> bool) 
 /// ones to report as ignored. Pure (no `IOKit`) so it can be unit-tested.
 fn classify_external_assertions(
     all: &[ExternalAssertion],
+    ignores_app: &impl Fn(&str) -> bool,
     is_system: &impl Fn(i32) -> bool,
 ) -> ExternalClassification {
     let mut upgradeable = Vec::new();
     let mut listed = Vec::new();
     for assertion in all {
-        match verdict_for(assertion, is_system) {
+        match verdict_for(assertion, ignores_app, is_system) {
             Verdict::Upgrade => upgradeable.push(assertion.clone()),
             Verdict::DropSilently => {}
             Verdict::Ignore(reason) => listed.push((assertion, reason)),
@@ -301,6 +314,10 @@ pub struct MenuSnapshot {
     /// the watcher is off. Independent of any session, so it explains a blank
     /// menu even when nothing is being upgraded.
     pub ignored_assertions: Vec<IgnoredAssertion>,
+    /// The user's persistent ignore list, whether or not those programs are
+    /// currently holding an assertion. Drives the editable **Ignored apps**
+    /// submenu (each entry removes itself when clicked).
+    pub ignored_apps: Vec<String>,
 }
 
 #[allow(clippy::struct_excessive_bools)] // session/watch flags are independent toggles
@@ -399,6 +416,15 @@ impl AppState {
                 .map(|session| session.upgrade_apps.clone()),
             ignored_assertions: if self.config.upgrade_external {
                 self.upgrade_ignored.clone()
+            } else {
+                Vec::new()
+            },
+            // Gated on the watcher like `ignored_assertions`: with it off the
+            // list governs nothing, so offering it as an editable submenu would
+            // imply an effect it doesn't have. The entries stay in `tray.toml`
+            // and reappear when the watcher is turned back on.
+            ignored_apps: if self.config.upgrade_external {
+                self.config.ignored_apps.clone()
             } else {
                 Vec::new()
             },
@@ -1261,11 +1287,41 @@ impl AppState {
         }
     }
 
-    /// Classify one poll's external assertions, telling the operating system's
-    /// own holders from the user's programs.
+    /// Remove `name` from the persistent ignore list (the **Ignored apps**
+    /// submenu). A live assertion from it is upgraded again on the next poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be written.
+    pub fn unignore_app(&mut self, name: &str) -> Result<(), TrayError> {
+        if !self.config.ignores_app(name) {
+            return Ok(());
+        }
+        let mut new_config = self.config.clone();
+        new_config
+            .ignored_apps
+            .retain(|ignored| !ignored.eq_ignore_ascii_case(name));
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
+        // Drop the stale "Ignoring _name_ (you ignore this app)" line now rather
+        // than leaving it in the menu this rebuild puts up, to be corrected a
+        // poll later. The upgrade itself still waits for that poll.
+        self.upgrade_ignored
+            .retain(|entry| !entry.process_name.eq_ignore_ascii_case(name));
+        self.menu_dirty = true;
+        Ok(())
+    }
+
+    /// Classify one poll's external assertions against the live ignore rules:
+    /// the operating system's own holders and the user's ignore list.
     fn classify(&self, all: &[ExternalAssertion]) -> ExternalClassification {
         let is_system_pid = self.is_system_pid;
-        classify_external_assertions(all, &is_system_pid)
+        classify_external_assertions(
+            all,
+            &|name: &str| self.config.ignores_app(name),
+            &is_system_pid,
+        )
     }
 
     /// Poll external assertions and start/stop an upgrade session as needed.
@@ -1810,10 +1866,17 @@ mod tests {
         }
     }
 
-    /// Classify with the system check driven through the PID rather than live
-    /// processes.
+    /// Classify with no ignore rules beyond the system check, which the tests
+    /// drive through the PID rather than live processes.
     fn classify(all: &[ExternalAssertion]) -> ExternalClassification {
-        classify_external_assertions(all, &|pid| pid == SYSTEM_PID)
+        classify_with(all, &|_| false)
+    }
+
+    fn classify_with(
+        all: &[ExternalAssertion],
+        ignores_app: &impl Fn(&str) -> bool,
+    ) -> ExternalClassification {
+        classify_external_assertions(all, ignores_app, &|pid| pid == SYSTEM_PID)
     }
 
     #[test]
@@ -1854,6 +1917,25 @@ mod tests {
         let result = classify(&all);
         assert!(result.upgradeable.is_empty());
         assert_eq!(result.ignored, vec![ignored("Safari", REASON_DISPLAY_ONLY)]);
+    }
+
+    #[test]
+    fn user_ignored_app_is_listed_with_its_own_reason() {
+        let all = [assertion("Zoom", AssertionType::PreventUserIdleSystemSleep)];
+        let result = classify_with(&all, &|name| name == "Zoom");
+        assert!(result.upgradeable.is_empty());
+        assert_eq!(result.ignored, vec![ignored("Zoom", REASON_USER_IGNORED)]);
+    }
+
+    /// A display-only hold was never upgradeable, so an ignore rule is not the
+    /// reason it isn't upgraded and must not be shown as one.
+    #[test]
+    fn display_only_reason_wins_over_the_ignore_list() {
+        let all = [assertion("VLC", AssertionType::PreventUserIdleDisplaySleep)];
+        assert_eq!(
+            classify_with(&all, &|name| name == "VLC").ignored,
+            vec![ignored("VLC", REASON_DISPLAY_ONLY)]
+        );
     }
 
     #[test]
