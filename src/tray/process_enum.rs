@@ -221,7 +221,9 @@ pub(crate) fn file_stem(path: &str) -> Option<String> {
 }
 
 /// Resolve (and cache) the bundle for an `.app` path. `NSBundle` does disk I/O,
-/// so each unique `.app` is read at most once per scan.
+/// so each unique `.app` is read at most once per `cache` — one scan for the
+/// picker, the whole process lifetime for the watcher's
+/// [`HOLDER_BUNDLE_CACHE`].
 fn bundle_for_app_path(
     app_path: &str,
     cache: &mut HashMap<String, Option<BundleRef>>,
@@ -254,6 +256,86 @@ fn is_system_process(exec_path: &str, uid: u32, bundle: Option<&BundleRef>) -> b
         || (exec_path.starts_with("/usr/") && !exec_path.starts_with("/usr/local/"))
         || exec_path.starts_with("/Library/Apple/")
         || (uid == 0 && !exec_path.starts_with("/Applications/"))
+}
+
+/// Bundles resolved for the upgrade watcher's per-PID system check, keyed by
+/// `.app` path. `NSBundle` does disk I/O and the watcher re-checks the same
+/// holders every poll, so each `.app` is read at most once per process
+/// lifetime. Bounded by the number of distinct `.app`s that ever hold a sleep
+/// assertion (a handful in practice).
+static HOLDER_BUNDLE_CACHE: OnceLock<Mutex<HashMap<String, Option<BundleRef>>>> = OnceLock::new();
+
+fn holder_bundle_cache() -> &'static Mutex<HashMap<String, Option<BundleRef>>> {
+    HOLDER_BUNDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether the program behind `pid` belongs to the operating system rather than
+/// to the user — the test the upgrade watcher applies to every sleep-assertion
+/// holder, so it upgrades only programs the user runs.
+///
+/// A PID that can't be inspected (exited mid-poll, or a protected process whose
+/// `proc_pidinfo` returns EPERM) counts as system: an assertion we cannot
+/// attribute to one of the user's own programs is not one to take a stronger
+/// hold for.
+#[must_use]
+pub fn is_system_pid(pid: i32) -> bool {
+    let Ok(info) = pidinfo::<BSDInfo>(pid, 0) else {
+        return true;
+    };
+    let exec_path = proc_path(pid);
+    let bundle = outermost_app_path(&exec_path).and_then(|app_path| {
+        let mut cache = holder_bundle_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        bundle_for_app_path(app_path, &mut cache)
+    });
+    is_system_holder(&exec_path, info.pbi_uid, current_uid(), bundle.as_ref())
+}
+
+/// Effective uid of this process — the "user" whose programs the watcher upgrades.
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Where macOS keeps its own daemons and per-user agents — the background
+/// processes that hold sleep assertions on the OS's behalf.
+///
+/// `/usr/bin` and `/bin` are deliberately absent, which is where this rule parts
+/// company with [`is_system_process`]: the picker hides Apple's command-line
+/// tools as noise, but a `caffeinate -i` (or `rsync`, or `ssh`) holding an
+/// assertion from `/usr/bin` is the user asking for the Mac to stay awake, and
+/// upgrading that is the whole point of the watcher. The list is exactly the one
+/// the README documents under "What counts as a system program".
+const SYSTEM_PROGRAM_DIRS: &[&str] = &[
+    "/System/",
+    "/usr/libexec/",
+    "/usr/sbin/",
+    "/sbin/",
+    "/Library/Apple/",
+];
+
+/// The pure decision behind [`is_system_pid`]. A holder is the operating
+/// system's rather than the user's when it runs as somebody else (daemons run as
+/// root or as a service account), when it is one of Apple's own apps or agents,
+/// or when its executable can't be read at all. Split out so it can be
+/// unit-tested without live PIDs.
+fn is_system_holder(
+    exec_path: &str,
+    uid: u32,
+    current_uid: u32,
+    bundle: Option<&BundleRef>,
+) -> bool {
+    if uid != current_uid {
+        return true;
+    }
+    if let Some(bundle) = bundle {
+        return bundle.bundle_id.starts_with("com.apple.");
+    }
+    exec_path.is_empty()
+        || SYSTEM_PROGRAM_DIRS
+            .iter()
+            .any(|dir| exec_path.starts_with(dir))
 }
 
 /// Build the picker's program rows, grouping helper PIDs under their parent
@@ -458,6 +540,61 @@ mod tests {
         // A root-owned process outside /Applications is system even under a
         // Homebrew prefix: the uid==0 clause overrides the path allowance.
         assert!(is_system_process("/usr/local/bin/node", 0, None));
+    }
+
+    #[test]
+    fn is_system_holder_keeps_only_the_current_users_programs() {
+        let user = 501;
+        let third_party = BundleRef {
+            bundle_id: "com.tinyspeck.slackmacgap".into(),
+            name: "Slack".into(),
+            app_path: "/Applications/Slack.app".into(),
+        };
+        let apple = BundleRef {
+            bundle_id: "com.apple.Music".into(),
+            name: "Music".into(),
+            app_path: "/System/Applications/Music.app".into(),
+        };
+        // The user's own app or CLI tool is the only thing worth upgrading.
+        assert!(!is_system_holder(
+            "/Applications/Slack.app/Contents/MacOS/Slack",
+            user,
+            user,
+            Some(&third_party)
+        ));
+        assert!(!is_system_holder(
+            "/opt/homebrew/bin/node",
+            user,
+            user,
+            None
+        ));
+        // Apple ships it, but the user ran it: `caffeinate -i` is exactly the
+        // kind of hold the watcher exists to upgrade.
+        assert!(!is_system_holder("/usr/bin/caffeinate", user, user, None));
+        assert!(!is_system_holder("/usr/local/bin/agent", user, user, None));
+        // Apple's own apps are system even when the user launched them.
+        assert!(is_system_holder(
+            "/System/Applications/Music.app/Contents/MacOS/Music",
+            user,
+            user,
+            Some(&apple)
+        ));
+        // Daemons: root, or a service account, or a daemon/agent path even when
+        // the agent runs as the user.
+        assert!(is_system_holder("/usr/libexec/powerd", 0, user, None));
+        assert!(is_system_holder("/usr/sbin/coreaudiod", 202, user, None));
+        assert!(is_system_holder("/usr/libexec/rapportd", user, user, None));
+        assert!(is_system_holder(
+            "/System/Library/CoreServices/ReportCrash",
+            user,
+            user,
+            None
+        ));
+        // Another human user's process is not this user's program either, even
+        // from a path that would otherwise pass.
+        assert!(is_system_holder("/opt/homebrew/bin/node", 502, user, None));
+        // An unreadable executable path (protected process) is system.
+        assert!(is_system_holder("", user, user, None));
     }
 
     #[test]
