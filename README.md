@@ -141,6 +141,7 @@ When a **time limit** is set, left-clicking to start sleep prevention turns it o
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 
 - Requires the privileged helper. Enabling the toggle installs it if necessary (prompting once).
+- Only *your* programs are upgraded. macOS's own processes hold sleep assertions during ordinary use all the time (the power daemon, `runningboardd`, audio and media daemons, Apple's apps); they release them on their own, so caffeinate2 ignores every one of them and never mentions them in the menu.
 - The menu shows which app triggered the upgrade, and lists assertions it deliberately ignores.
 - A manual left-click-off overrides the watcher until the next new assertion.
 
@@ -162,7 +163,8 @@ Unsigned binaries may require running from Terminal once (right-click → Open) 
 - **Wait for apps matching:** the target is remembered by bundle ID (for example `Codex.app` stays matched across restarts).
 - **Upgrade release delay:** caffeinate2 releases its Entirely hold about 20 seconds after the external assertion goes away.
 - **Upgrade menu display:** a single named app appears as one line; several collapse into an expandable **Upgrading N apps** submenu (the tooltip lists them too). When an app's name is unavailable, a generic **Upgrading external app** line is shown instead.
-- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason shown is _display only_ for the display-only assertions video players hold. System daemons like the macOS power daemon (`powerd`) and `runningboardd` hold an idle-system-sleep assertion during ordinary active use essentially always, so they are silently dropped from the menu rather than listed. caffeinate2 never reacts to its own holds.
+- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason shown is _display only_ for the display-only assertions video players hold. caffeinate2 never reacts to its own holds.
+- **What counts as a system program:** anything running as another user (root daemons and service accounts like `coreaudiod`), any Apple `.app`, anything launched from `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin` or `/Library/Apple` — macOS's daemons and per-user agents — and any process whose executable can't be read. These are silently dropped: never upgraded, never listed. Everything else you run is upgradeable, including Homebrew binaries and Apple's own command-line tools: `caffeinate -i` from `/usr/bin` is you asking to stay awake, not the OS doing housekeeping.
 - **Any matching assertion counts:** a desktop app that holds an idle-system-sleep assertion while open (some Electron apps do) will keep the upgrade active until it quits.
 
 ## Entirely mode

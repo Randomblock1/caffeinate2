@@ -8,6 +8,7 @@ use crate::tray::error::TrayError;
 use crate::tray::process_enum;
 use crate::tray::tray_icons;
 use crate::tray::tray_mode::{self, TrayConfig};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,14 +38,8 @@ const OBSERVED_TYPES: &[AssertionType] = &[
     AssertionType::PreventUserIdleDisplaySleep,
 ];
 
-/// System daemons whose system-idle assertions neither warrant an upgrade nor
-/// appear in the menu. `powerd` (the macOS power daemon) and `runningboardd`
-/// (the process/assertion lifecycle daemon) hold such an assertion during
-/// ordinary active use essentially always and release it on their own: taking
-/// a stronger Entirely hold over them does nothing but flap the watcher, and
-/// surfacing them as "Ignoring…" lines is pure noise, so they are dropped from
-/// the menu entirely rather than shown as ignored.
-const SYSTEM_DAEMONS: &[&str] = &["powerd", "runningboardd"];
+/// Reason text for the menu's "Ignoring…" lines, one per non-upgraded verdict.
+const REASON_DISPLAY_ONLY: &str = "display only";
 
 /// Now on a clock that keeps advancing while the system is asleep, as an
 /// opaque offset from an arbitrary epoch. Timed sessions must expire on
@@ -93,53 +88,71 @@ pub struct IgnoredAssertion {
 
 /// The watcher's verdict on the external assertions found in one poll.
 struct ExternalClassification {
-    /// System-idle holders worth upgrading (not in the ignore list). Nameless
-    /// holders are kept so presence is detected even without a process name.
+    /// System-idle holders worth upgrading. Nameless holders are kept so
+    /// presence is detected even without a process name.
     upgradeable: Vec<ExternalAssertion>,
     /// Holders deliberately not upgraded, with a reason, for display.
     ignored: Vec<IgnoredAssertion>,
 }
 
-/// Why an observed assertion is not upgraded. Drives the menu's reason text.
-/// Never sees a [`SYSTEM_DAEMONS`] holder — those are filtered out of the
-/// ignored list before reasons are assigned.
-fn ignore_reason(assertion: &ExternalAssertion) -> &'static str {
-    if assertion.assertion_type == AssertionType::PreventUserIdleDisplaySleep.as_str() {
-        "display only"
-    } else {
-        "not upgradeable"
+/// What the watcher does with one observed assertion.
+enum Verdict {
+    /// Take a stronger hold while this assertion lasts.
+    Upgrade,
+    /// Neither upgrade nor mention it. Reserved for the operating system's own
+    /// holders: macOS daemons (`powerd`, `runningboardd`, `coreaudiod`, …) hold
+    /// sleep assertions during ordinary use essentially always and release them
+    /// on their own, so upgrading them only flaps the watcher and listing them is
+    /// pure noise. Only the user's programs are ever upgraded.
+    DropSilently,
+    /// Don't upgrade, but say so in the menu, with this reason.
+    Ignore(&'static str),
+}
+
+/// The watcher's decision for a single assertion. `is_system` answers "does this
+/// PID belong to the operating system rather than to the user?" — injected so
+/// the rules can be unit-tested without live PIDs.
+fn verdict_for(assertion: &ExternalAssertion, is_system: &impl Fn(i32) -> bool) -> Verdict {
+    if is_system(assertion.pid) {
+        return Verdict::DropSilently;
     }
+    if assertion.assertion_type != UPGRADE_TRIGGER_TYPE.as_str() {
+        // The only other observed type (see `OBSERVED_TYPES`).
+        return Verdict::Ignore(REASON_DISPLAY_ONLY);
+    }
+    Verdict::Upgrade
 }
 
 /// Split the observed external assertions into the ones worth upgrading and the
 /// ones to report as ignored. Pure (no `IOKit`) so it can be unit-tested.
-fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassification {
-    let trigger_type = UPGRADE_TRIGGER_TYPE.as_str();
-    let is_upgradeable = |a: &ExternalAssertion| {
-        a.assertion_type == trigger_type && !SYSTEM_DAEMONS.contains(&a.process_name.as_str())
-    };
+fn classify_external_assertions(
+    all: &[ExternalAssertion],
+    is_system: &impl Fn(i32) -> bool,
+) -> ExternalClassification {
+    let mut upgradeable = Vec::new();
+    let mut listed = Vec::new();
+    for assertion in all {
+        match verdict_for(assertion, is_system) {
+            Verdict::Upgrade => upgradeable.push(assertion.clone()),
+            Verdict::DropSilently => {}
+            Verdict::Ignore(reason) => listed.push((assertion, reason)),
+        }
+    }
 
-    let upgradeable: Vec<ExternalAssertion> =
-        all.iter().filter(|a| is_upgradeable(a)).cloned().collect();
-    let trigger_names: std::collections::HashSet<&str> = upgradeable
+    let trigger_names: HashSet<&str> = upgradeable
         .iter()
         .map(|a| a.process_name.as_str())
         .collect();
-
-    let mut ignored: Vec<IgnoredAssertion> = all
-        .iter()
-        .filter(|a| !is_upgradeable(a))
-        // A nameless holder can't be shown meaningfully; never list a process
-        // under "ignored" when another of its assertions is upgraded; and drop
-        // the always-active system processes that would only add noise.
-        .filter(|a| {
-            !a.process_name.is_empty()
-                && !trigger_names.contains(a.process_name.as_str())
-                && !SYSTEM_DAEMONS.contains(&a.process_name.as_str())
+    let mut ignored: Vec<IgnoredAssertion> = listed
+        .into_iter()
+        // A nameless holder can't be shown meaningfully, and a process is never
+        // listed as ignored when another of its assertions is upgraded.
+        .filter(|(a, _)| {
+            !a.process_name.is_empty() && !trigger_names.contains(a.process_name.as_str())
         })
-        .map(|a| IgnoredAssertion {
+        .map(|(a, reason)| IgnoredAssertion {
             process_name: a.process_name.clone(),
-            reason: ignore_reason(a).to_string(),
+            reason: reason.to_string(),
         })
         .collect();
     ignored.sort();
@@ -149,6 +162,21 @@ fn classify_external_assertions(all: &[ExternalAssertion]) -> ExternalClassifica
         upgradeable,
         ignored,
     }
+}
+
+/// Distinct, sorted holder names, so the menu and tooltip stay stable across
+/// polls (and don't show the same app twice when it holds several assertions).
+/// Nameless holders are dropped: they still count as present, but there is
+/// nothing to display.
+fn holder_names(assertions: &[ExternalAssertion]) -> Vec<String> {
+    let mut names: Vec<String> = assertions
+        .iter()
+        .map(|assertion| assertion.process_name.clone())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// A sleep-prevention enable running on a background thread. Acquiring an
@@ -324,6 +352,11 @@ pub struct AppState {
     /// `None` when no scan has run for the current session/selection; readers
     /// fall back to a fresh scan.
     app_watch_running: Option<bool>,
+    /// How the watcher decides whether a holder belongs to the OS. Indirected
+    /// through a function pointer for the same reason [`verdict_for`] takes its
+    /// rule as a parameter: the real one needs live PIDs, so the classification
+    /// it drives would otherwise be untestable.
+    is_system_pid: fn(i32) -> bool,
 }
 
 impl AppState {
@@ -345,6 +378,7 @@ impl AppState {
             upgrade_ignored: Vec::new(),
             menu_dirty: false,
             app_watch_running: None,
+            is_system_pid: process_enum::is_system_pid,
         }
     }
 
@@ -1227,6 +1261,13 @@ impl AppState {
         }
     }
 
+    /// Classify one poll's external assertions, telling the operating system's
+    /// own holders from the user's programs.
+    fn classify(&self, all: &[ExternalAssertion]) -> ExternalClassification {
+        let is_system_pid = self.is_system_pid;
+        classify_external_assertions(all, &is_system_pid)
+    }
+
     /// Poll external assertions and start/stop an upgrade session as needed.
     /// Returns true when the icon/tooltip should be refreshed.
     ///
@@ -1259,7 +1300,7 @@ impl AppState {
         let ExternalClassification {
             upgradeable,
             ignored,
-        } = classify_external_assertions(&external);
+        } = self.classify(&external);
 
         // Refresh the informational ignored list. Rebuild the menu only when the
         // set actually changes so an open menu isn't churned every poll.
@@ -1269,17 +1310,9 @@ impl AppState {
         }
 
         let present = !upgradeable.is_empty();
-        // Distinct, sorted process names so the menu/tooltip stay stable across
-        // polls (and don't show the same app twice when it holds several
-        // assertions). The list can be empty even when `present` is true if no
-        // holder exposed a name.
-        let mut app_names: Vec<String> = upgradeable
-            .into_iter()
-            .map(|assertion| assertion.process_name)
-            .filter(|name| !name.is_empty())
-            .collect();
-        app_names.sort();
-        app_names.dedup();
+        // The list can be empty even when `present` is true if no holder
+        // exposed a name.
+        let app_names = holder_names(&upgradeable);
 
         if !present {
             let needs_clear_grace = self
@@ -1381,6 +1414,9 @@ mod tests {
             upgrade_ignored: Vec::new(),
             menu_dirty: false,
             app_watch_running: None,
+            // No live PIDs in tests: nothing is a system holder unless it is
+            // `SYSTEM_PID` (see `system_assertion`).
+            is_system_pid: |pid| pid == SYSTEM_PID,
         }
     }
 
@@ -1747,11 +1783,23 @@ mod tests {
         assert!(!state.is_on());
     }
 
+    /// PID of a holder the injected classifier calls a system program.
+    const SYSTEM_PID: i32 = 1;
+    /// PID of a holder that belongs to the user.
+    const USER_PID: i32 = 501;
+
     fn assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
         ExternalAssertion {
-            pid: 501,
+            pid: USER_PID,
             process_name: name.to_string(),
             assertion_type: type_.as_str().to_string(),
+        }
+    }
+
+    fn system_assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
+        ExternalAssertion {
+            pid: SYSTEM_PID,
+            ..assertion(name, type_)
         }
     }
 
@@ -1762,28 +1810,38 @@ mod tests {
         }
     }
 
+    /// Classify with the system check driven through the PID rather than live
+    /// processes.
+    fn classify(all: &[ExternalAssertion]) -> ExternalClassification {
+        classify_external_assertions(all, &|pid| pid == SYSTEM_PID)
+    }
+
     #[test]
     fn system_idle_holder_is_upgradeable_not_ignored() {
         let all = [assertion(
             "Claude Code",
             AssertionType::PreventUserIdleSystemSleep,
         )];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         assert_eq!(result.upgradeable.len(), 1);
         assert_eq!(result.upgradeable[0].process_name, "Claude Code");
         assert!(result.ignored.is_empty());
     }
 
+    /// Every system program is dropped — not just a hardcoded few — whatever it
+    /// is called and whichever sleep-relevant assertion it holds.
     #[test]
-    fn silently_ignored_system_processes_are_neither_triggers_nor_listed() {
+    fn system_programs_are_neither_triggers_nor_listed() {
         let all = [
-            assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
-            assertion("runningboardd", AssertionType::PreventUserIdleSystemSleep),
+            system_assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
+            system_assertion("runningboardd", AssertionType::PreventUserIdleSystemSleep),
+            system_assertion("coreaudiod", AssertionType::PreventUserIdleSystemSleep),
+            system_assertion("Music", AssertionType::PreventUserIdleDisplaySleep),
         ];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         // These never trigger an upgrade ...
         assert!(result.upgradeable.is_empty());
-        // ... and, being always active, are dropped from the menu entirely.
+        // ... and, being the OS's own business, are dropped from the menu.
         assert!(result.ignored.is_empty());
     }
 
@@ -1793,9 +1851,9 @@ mod tests {
             "Safari",
             AssertionType::PreventUserIdleDisplaySleep,
         )];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         assert!(result.upgradeable.is_empty());
-        assert_eq!(result.ignored, vec![ignored("Safari", "display only")]);
+        assert_eq!(result.ignored, vec![ignored("Safari", REASON_DISPLAY_ONLY)]);
     }
 
     #[test]
@@ -1804,7 +1862,7 @@ mod tests {
             assertion("", AssertionType::PreventUserIdleSystemSleep),
             assertion("", AssertionType::PreventUserIdleDisplaySleep),
         ];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         // The nameless system-idle hold still counts as upgradeable (presence is
         // detected without a name) ...
         assert_eq!(result.upgradeable.len(), 1);
@@ -1820,7 +1878,7 @@ mod tests {
             assertion("Zoom", AssertionType::PreventUserIdleSystemSleep),
             assertion("Zoom", AssertionType::PreventUserIdleDisplaySleep),
         ];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         assert_eq!(result.upgradeable.len(), 1);
         assert!(result.ignored.is_empty());
     }
@@ -1829,18 +1887,18 @@ mod tests {
     fn ignored_list_is_sorted_and_deduped() {
         let all = [
             assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
-            // powerd is silently ignored, so it never reaches the list.
-            assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
+            // A system holder is silently dropped, so it never reaches the list.
+            system_assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
             assertion("IINA", AssertionType::PreventUserIdleDisplaySleep),
             // Duplicate display hold from the same app collapses to one entry.
             assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
         ];
-        let result = classify_external_assertions(&all);
+        let result = classify(&all);
         assert_eq!(
             result.ignored,
             vec![
-                ignored("IINA", "display only"),
-                ignored("VLC", "display only"),
+                ignored("IINA", REASON_DISPLAY_ONLY),
+                ignored("VLC", REASON_DISPLAY_ONLY),
             ]
         );
     }
