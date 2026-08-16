@@ -280,6 +280,10 @@ const ASSERTION_PROCESS_NAME_KEY: &str = "Process Name";
 /// A sleep-preventing power assertion held by another process.
 #[derive(Debug, Clone)]
 pub struct ExternalAssertion {
+    /// PID of the holder. The tray resolves it to an executable path to tell a
+    /// system daemon from a program the user launched; process names alone are
+    /// ambiguous (and absent for some holders).
+    pub pid: i32,
     pub process_name: String,
     pub assertion_type: String,
 }
@@ -359,6 +363,7 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
                 continue;
             }
             found.push(ExternalAssertion {
+                pid,
                 process_name: dict_string(dict, &name_key).unwrap_or_default(),
                 assertion_type,
             });
@@ -475,8 +480,8 @@ mod tests {
                 AssertionType::PreventUserIdleSystemSleep.as_str()
             );
             println!(
-                "external assertion: name={} type={}",
-                assertion.process_name, assertion.assertion_type
+                "external assertion: pid={} name={} type={}",
+                assertion.pid, assertion.process_name, assertion.assertion_type
             );
         }
     }

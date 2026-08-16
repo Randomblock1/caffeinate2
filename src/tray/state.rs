@@ -1749,6 +1749,7 @@ mod tests {
 
     fn assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
         ExternalAssertion {
+            pid: 501,
             process_name: name.to_string(),
             assertion_type: type_.as_str().to_string(),
         }
