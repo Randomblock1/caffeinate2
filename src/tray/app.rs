@@ -12,7 +12,7 @@ use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -21,6 +21,19 @@ use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 /// Longest the main event pump will block when otherwise idle, so an
 /// off-main-thread shutdown signal is noticed promptly (see the pump call site).
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Set by the signal thread when SIGINT/SIGTERM arrives. A flag rather than a
+/// channel because more than the run loop has to see it: a modal dialog runs
+/// its own nested event loop, and must tear itself down instead of holding the
+/// process (and its sleep assertions) open until somebody clicks a button.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process has been asked to quit. Long-running main-thread work
+/// must poll this and bail out, so `run` reaches the teardown that releases the
+/// holds.
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
 
 fn poll_stop_conditions(state: &mut AppState) -> bool {
     // `|` (not `||`): every poll must run each tick. `check_app_watch` and
@@ -101,12 +114,10 @@ pub fn run() -> Result<(), TrayError> {
     let (workspace_dirty, _workspace_guard) =
         crate::tray::macos_activation::install_workspace_observers();
 
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<i32>();
     thread::spawn(move || {
         let mut signals =
             Signals::new([SIGINT, SIGTERM]).expect("failed to create signal iterator");
-        if let Some(signal) = signals.forever().next() {
-            let _ = shutdown_tx.send(signal);
+        if signals.forever().next().is_some() {
             crate::tray::macos_activation::wake_event_loop();
         }
     });
@@ -173,7 +184,7 @@ pub fn run() -> Result<(), TrayError> {
     let mut handles = initial_handles;
 
     'main: loop {
-        if shutdown_rx.try_recv().is_ok() {
+        if shutdown_requested() {
             break 'main;
         }
 
