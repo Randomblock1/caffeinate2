@@ -75,6 +75,13 @@ pub struct TrayConfig {
     /// configs (without this key) loadable.
     #[serde(default)]
     pub upgrade_external: bool,
+    /// Programs the watcher must never upgrade, by the process name IOKit
+    /// reports for the assertion. Built from the menu bar (the upgrade dialog's
+    /// "Never Upgrade This App", removable under **Ignored apps**) and editable
+    /// by hand in `tray.toml`. Compared case-insensitively; kept sorted and
+    /// deduped by [`TrayConfig::normalize_ignored_apps`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_apps: Vec<String>,
 }
 
 const fn default_config_version() -> u32 {
@@ -90,6 +97,7 @@ impl Default for TrayConfig {
             wait_for_apps: Vec::new(),
             wait_for_app: None,
             upgrade_external: false,
+            ignored_apps: Vec::new(),
         }
     }
 }
@@ -104,6 +112,25 @@ impl TrayConfig {
                 self.wait_for_apps.push(target);
             }
         }
+    }
+
+    /// Sort, dedupe (case-insensitively) and drop blank entries from
+    /// `ignored_apps`, so a hand-edited config behaves like a menu-edited one
+    /// and the **Ignored apps** submenu lists each program exactly once.
+    pub fn normalize_ignored_apps(&mut self) {
+        self.ignored_apps.retain(|name| !name.trim().is_empty());
+        self.ignored_apps.sort_by_key(|name| name.to_lowercase());
+        self.ignored_apps.dedup_by_key(|name| name.to_lowercase());
+    }
+
+    /// Whether `name` is on the user's ignore list. Case-insensitive: IOKit's
+    /// process names are whatever the holder registered, and a hand-edited
+    /// config should not have to match their capitalization exactly.
+    #[must_use]
+    pub fn ignores_app(&self, name: &str) -> bool {
+        self.ignored_apps
+            .iter()
+            .any(|ignored| ignored.eq_ignore_ascii_case(name))
     }
 }
 
@@ -150,6 +177,7 @@ pub fn load_config() -> TrayConfig {
         }
     };
     config.normalize_legacy();
+    config.normalize_ignored_apps();
     config
 }
 
@@ -370,6 +398,31 @@ name = "Example"
         let config: TrayConfig =
             toml::from_str("mode = \"system\"\nupgrade_external = true\n").unwrap();
         assert!(config.upgrade_external);
+    }
+
+    #[test]
+    fn parse_config_defaults_ignored_apps_to_empty() {
+        let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
+        assert!(config.ignored_apps.is_empty());
+        assert!(!config.ignores_app("Zoom"));
+    }
+
+    #[test]
+    fn hand_edited_ignore_list_is_normalized_and_matched_case_insensitively() {
+        let mut config: TrayConfig =
+            toml::from_str("ignored_apps = [\"zoom\", \"  \", \"Amphetamine\", \"ZOOM\"]\n")
+                .unwrap();
+        config.normalize_ignored_apps();
+        assert_eq!(config.ignored_apps, vec!["Amphetamine", "zoom"]);
+        assert!(config.ignores_app("Zoom"));
+        assert!(config.ignores_app("amphetamine"));
+        assert!(!config.ignores_app("Zoo"));
+    }
+
+    #[test]
+    fn empty_ignore_list_is_not_written_back() {
+        let serialized = toml::to_string_pretty(&TrayConfig::default()).unwrap();
+        assert!(!serialized.contains("ignored_apps"));
     }
 
     #[test]
