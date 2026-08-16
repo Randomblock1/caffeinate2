@@ -21,6 +21,8 @@ pub mod tray_icons;
 #[cfg(all(target_os = "macos", feature = "tray"))]
 pub mod tray_mode;
 #[cfg(all(target_os = "macos", feature = "tray"))]
+mod upgrade_dialog;
+#[cfg(all(target_os = "macos", feature = "tray"))]
 mod wait_window;
 
 #[cfg(all(target_os = "macos", feature = "tray"))]

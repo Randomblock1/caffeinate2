@@ -49,6 +49,10 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSWindow",
     "NSPanel",
     "NSOpenPanel",
+    # Tray-click dialog for an upgraded assertion (ignore / take over), with the
+    # app picker it shows when several apps are being upgraded at once.
+    "NSAlert",
+    "NSPopUpButton",
     "NSView",
     "NSControl",
     "NSButton",
@@ -83,6 +87,9 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "NSURL",
     "NSDate",
     "NSRunLoop",
+    # Drives the upgrade dialog from inside its own modal run loop (raise the
+    # panel, and end it on a shutdown signal rather than blocking the process).
+    "NSTimer",
     "NSNotification",
     "NSOperation",
     "block2",

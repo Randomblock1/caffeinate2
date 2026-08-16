@@ -127,7 +127,7 @@ Run `caffeinate2-tray` after installing with `--features full`. To run it in the
 
 This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Its stderr is captured, best-effort, to `~/Library/Logs/caffeinate2-tray.log` (appended, never rotated), and is discarded only if that file cannot be opened; run it in the foreground to watch the logs live. Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
 
-- **Left click:** toggle the selected sleep mode on/off.
+- **Left click:** toggle the selected sleep mode on/off — or, while caffeinate2 is upgrading another app's sleep assertion, open the upgrade dialog (see below).
 - **Right-click:** open the menu:
   - **Mode** — Display, Disk, System, System (on AC), User active, or Entirely.
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
@@ -144,7 +144,15 @@ When a **time limit** is set, left-clicking to start sleep prevention turns it o
 - Requires the privileged helper. Enabling the toggle installs it if necessary (prompting once).
 - Only *your* programs are upgraded. macOS's own processes hold sleep assertions during ordinary use all the time (the power daemon, `runningboardd`, audio and media daemons, Apple's apps); they release them on their own, so caffeinate2 ignores every one of them and never mentions them in the menu.
 - The menu shows which app triggered the upgrade, and lists assertions it deliberately ignores.
-- A manual left-click-off overrides the watcher until the next new assertion.
+- While an upgrade is active, left-clicking the icon opens the upgrade dialog (below) rather than simply switching sleep prevention off — "off" would be ambiguous when the hold is being taken on another program's behalf. It still toggles off directly in the one case the dialog has nothing to ask about: an upgrade whose holder exposes no process name.
+- A manual left-click-off — when the watcher is idle, or from that nameless-holder case — overrides the watcher until the next new assertion.
+
+**The upgrade dialog.** Left-clicking the icon while an upgrade is active asks what to do with it instead of just switching it off (with several apps upgraded at once, a pop-up in the dialog picks which one the ignore choices apply to):
+
+- **Hold For _30m_** (or **Hold Until I Stop It** with no time limit set) — take over with caffeinate2's own session, using the configured mode and time limit. Useful when you don't know how long the other app will keep asserting but you *do* know how long you need the Mac awake. The watcher stays out of the way until that app's assertion goes away.
+- **Ignore This Time** — stop upgrading the assertion it is holding right now. The ignore expires once that app has stopped asserting for about 20 seconds, so the next thing it starts is upgraded again.
+- **Never Upgrade This App** — add it to the ignore list under **Ignored apps**, where clicking it removes it again.
+- **Cancel** — leave the upgrade running.
 
 Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
 
@@ -164,9 +172,9 @@ Unsigned binaries may require running from Terminal once (right-click → Open) 
 - **Wait for apps matching:** the target is remembered by bundle ID (for example `Codex.app` stays matched across restarts).
 - **Upgrade release delay:** caffeinate2 releases its Entirely hold about 20 seconds after the external assertion goes away.
 - **Upgrade menu display:** a single named app appears as one line; several collapse into an expandable **Upgrading N apps** submenu (the tooltip lists them too). When an app's name is unavailable, a generic **Upgrading external app** line is shown instead.
-- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason is _display only_ for the display-only assertions video players hold, and _you ignore this app_ for the persistent ignore list. caffeinate2 never reacts to its own holds.
+- **Ignored assertions:** caffeinate2 only reacts to idle-system-sleep assertions (what agents use). Others are listed under **Ignoring _name_ (_reason_)** lines — collapsing into an **Ignoring N assertions** submenu when there are several — so a quiet menu is never mistaken for "nothing is keeping the Mac awake." The reason is _display only_ for the display-only assertions video players hold, _you ignore this app_ for the persistent ignore list, and _ignored this time_ for a one-off ignore. caffeinate2 never reacts to its own holds.
 - **What counts as a system program:** anything running as another user (root daemons and service accounts like `coreaudiod`), any Apple `.app`, anything launched from `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin` or `/Library/Apple` — macOS's daemons and per-user agents — and any process whose executable can't be read. These are silently dropped: never upgraded, never listed. Everything else you run is upgradeable, including Homebrew binaries and Apple's own command-line tools: `caffeinate -i` from `/usr/bin` is you asking to stay awake, not the OS doing housekeeping.
-- **Ignored apps list:** stored as `ignored_apps` in `tray.toml` (a list of process names as IOKit reports them, matched case-insensitively) and editable by hand as well as from the menu.
+- **Ignored apps list:** stored as `ignored_apps` in `tray.toml` (a list of process names as IOKit reports them, matched case-insensitively) and editable by hand as well as from the menu. Ignoring an app takes effect immediately: if nothing else is worth upgrading, the hold is released right away rather than after the usual 20-second delay.
 - **Any matching assertion counts:** a desktop app that holds an idle-system-sleep assertion while open (some Electron apps do) will keep the upgrade active until it quits.
 
 ## Entirely mode

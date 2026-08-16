@@ -8,7 +8,7 @@ use crate::tray::error::TrayError;
 use crate::tray::process_enum;
 use crate::tray::tray_icons;
 use crate::tray::tray_mode::{self, TrayConfig};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,6 +40,7 @@ const OBSERVED_TYPES: &[AssertionType] = &[
 
 /// Reason text for the menu's "Ignoring…" lines, one per non-upgraded verdict.
 const REASON_USER_IGNORED: &str = "you ignore this app";
+const REASON_IGNORED_ONCE: &str = "ignored this time";
 const REASON_DISPLAY_ONLY: &str = "display only";
 
 /// Now on a clock that keeps advancing while the system is asleep, as an
@@ -116,12 +117,13 @@ enum Verdict {
 fn verdict_for(
     assertion: &ExternalAssertion,
     ignores_app: &impl Fn(&str) -> bool,
+    ignored_once: &HashSet<&str>,
     is_system: &impl Fn(i32) -> bool,
 ) -> Verdict {
     if is_system(assertion.pid) {
         return Verdict::DropSilently;
     }
-    // Type before the ignore list: a display-only hold was never upgradeable in
+    // Type before the ignore lists: a display-only hold was never upgradeable in
     // the first place, so blaming an ignore rule for it would misattribute the
     // reason shown in the menu (VLC on the ignore list still reads
     // "display only", because that is why it isn't upgraded).
@@ -132,6 +134,9 @@ fn verdict_for(
     if ignores_app(&assertion.process_name) {
         return Verdict::Ignore(REASON_USER_IGNORED);
     }
+    if ignored_once.contains(assertion.process_name.as_str()) {
+        return Verdict::Ignore(REASON_IGNORED_ONCE);
+    }
     Verdict::Upgrade
 }
 
@@ -140,12 +145,13 @@ fn verdict_for(
 fn classify_external_assertions(
     all: &[ExternalAssertion],
     ignores_app: &impl Fn(&str) -> bool,
+    ignored_once: &HashSet<&str>,
     is_system: &impl Fn(i32) -> bool,
 ) -> ExternalClassification {
     let mut upgradeable = Vec::new();
     let mut listed = Vec::new();
     for assertion in all {
-        match verdict_for(assertion, ignores_app, is_system) {
+        match verdict_for(assertion, ignores_app, ignored_once, is_system) {
             Verdict::Upgrade => upgradeable.push(assertion.clone()),
             Verdict::DropSilently => {}
             Verdict::Ignore(reason) => listed.push((assertion, reason)),
@@ -359,6 +365,14 @@ pub struct AppState {
     /// Latest set of ignored external assertions from `poll_upgrade`, surfaced
     /// in the menu. Updated only while the watcher is on; cleared when it is off.
     upgrade_ignored: Vec<IgnoredAssertion>,
+    /// Holders the user chose to ignore just this once (the upgrade dialog's
+    /// "Ignore this assertion"), keyed by process name, valued by the last poll
+    /// that still saw an assertion from them. The entry expires once the holder
+    /// has been gone for [`UPGRADE_CLEAR_GRACE`] — the same debounce the session
+    /// uses, so an agent that drops its assertion between turns stays ignored
+    /// rather than being re-upgraded seconds later. Never persisted: an ignore
+    /// "this time" must not outlive the run.
+    upgrade_ignored_once: HashMap<String, Instant>,
     /// Set when the tray menu's structure (not just checkbox state) needs to be
     /// rebuilt — currently when the set of upgraded processes changes. The event
     /// loop reinstalls the menu and clears this via `take_menu_dirty`.
@@ -369,10 +383,13 @@ pub struct AppState {
     /// `None` when no scan has run for the current session/selection; readers
     /// fall back to a fresh scan.
     app_watch_running: Option<bool>,
-    /// How the watcher decides whether a holder belongs to the OS. Indirected
-    /// through a function pointer for the same reason [`verdict_for`] takes its
-    /// rule as a parameter: the real one needs live PIDs, so the classification
-    /// it drives would otherwise be untestable.
+    /// How the watcher reads the live external assertions, and how it decides
+    /// whether a holder belongs to the OS. Indirected through function pointers
+    /// for the same reason [`verdict_for`] takes its rules as parameters: the
+    /// real ones need `IOKit` and live PIDs, so the session-level behaviour they
+    /// drive (an ignore releasing the hold immediately, a session surviving
+    /// because another holder is left) would otherwise be untestable.
+    scan_assertions: fn(&[AssertionType]) -> Result<Vec<ExternalAssertion>, u32>,
     is_system_pid: fn(i32) -> bool,
 }
 
@@ -393,8 +410,10 @@ impl AppState {
             last_upgrade_error: None,
             upgrade_overridden: false,
             upgrade_ignored: Vec::new(),
+            upgrade_ignored_once: HashMap::new(),
             menu_dirty: false,
             app_watch_running: None,
+            scan_assertions: power_management::external_assertions,
             is_system_pid: process_enum::is_system_pid,
         }
     }
@@ -1140,6 +1159,7 @@ impl AppState {
             self.upgrade_clear_since = None;
             self.upgrade_failed = false;
             self.upgrade_overridden = false;
+            self.upgrade_ignored_once.clear();
             // Drop any "Ignoring…" entries; the menu rebuild removes them.
             if !self.upgrade_ignored.is_empty() {
                 self.upgrade_ignored.clear();
@@ -1287,6 +1307,117 @@ impl AppState {
         }
     }
 
+    /// Classify one poll's external assertions against the live ignore rules:
+    /// the operating system's own holders, the user's persistent ignore list,
+    /// and the ignore-once set.
+    fn classify(&self, all: &[ExternalAssertion]) -> ExternalClassification {
+        let ignored_once: HashSet<&str> = self
+            .upgrade_ignored_once
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let is_system_pid = self.is_system_pid;
+        classify_external_assertions(
+            all,
+            &|name: &str| self.config.ignores_app(name),
+            &ignored_once,
+            &is_system_pid,
+        )
+    }
+
+    /// Refresh and expire the ignore-once entries for one poll: a holder still
+    /// present keeps its ignore alive, one gone for [`UPGRADE_CLEAR_GRACE`]
+    /// loses it (so the *next* assertion from that program is upgraded again).
+    fn age_ignored_once(&mut self, all: &[ExternalAssertion]) {
+        if self.upgrade_ignored_once.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for assertion in all {
+            if let Some(last_seen) = self.upgrade_ignored_once.get_mut(&assertion.process_name) {
+                *last_seen = now;
+            }
+        }
+        let before = self.upgrade_ignored_once.len();
+        self.upgrade_ignored_once
+            .retain(|_, last_seen| now.duration_since(*last_seen) < UPGRADE_CLEAR_GRACE);
+        if self.upgrade_ignored_once.len() != before {
+            self.menu_dirty = true;
+        }
+    }
+
+    /// Whether the watcher is actively upgrading right now (a committed session
+    /// it started). Drives the tray click's upgrade dialog.
+    pub fn is_upgrading(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.started_by_upgrade)
+    }
+
+    /// Names of the processes the active upgrade session covers (empty when the
+    /// watcher isn't upgrading, or when no holder exposed a name).
+    pub fn upgrading_apps(&self) -> Vec<String> {
+        self.session
+            .as_ref()
+            .filter(|session| session.started_by_upgrade)
+            .map_or_else(Vec::new, |session| session.upgrade_apps.clone())
+    }
+
+    pub const fn time_limit_secs(&self) -> Option<u64> {
+        self.config.time_limit_secs
+    }
+
+    /// The configured mode — what a session started now would run in.
+    pub const fn mode(&self) -> SleepMode {
+        self.config.mode
+    }
+
+    /// Ignore `name`'s current assertion: stop upgrading it until it goes away
+    /// (see [`AppState::age_ignored_once`] for when the ignore expires).
+    ///
+    /// Releases the hold through [`AppState::resync_upgrade_session`] even when
+    /// a two-phase mode switch is mid-flight (the user changed **Mode** while
+    /// the watcher held the session, so an enable for the new mode is still
+    /// acquiring). That briefly leaves nothing preventing sleep, unlike an
+    /// ordinary mode switch, which keeps the old hold until the new one commits
+    /// — but the alternative is worse: keeping an upgrade hold the user has
+    /// just explicitly dismissed, for the seconds the acquire takes. The
+    /// in-flight enable is a *manual* one and still commits, so the window is
+    /// bounded by that acquire and ends with the mode the user asked for.
+    pub fn ignore_assertion_once(&mut self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        self.upgrade_ignored_once
+            .insert(name.to_string(), Instant::now());
+        self.menu_dirty = true;
+        self.resync_upgrade_session();
+    }
+
+    /// Add `name` to the persistent ignore list, so the watcher never upgrades it
+    /// again until the user removes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be written; the in-memory list is
+    /// left untouched in that case (see `set_mode` for the persist-first rule).
+    pub fn ignore_app(&mut self, name: &str) -> Result<(), TrayError> {
+        if name.is_empty() || self.config.ignores_app(name) {
+            return Ok(());
+        }
+        let mut new_config = self.config.clone();
+        new_config.ignored_apps.push(name.to_string());
+        new_config.normalize_ignored_apps();
+        tray_mode::save_config(&new_config)?;
+        self.config = new_config;
+
+        // A program on the persistent list needs no ignore-once entry.
+        self.upgrade_ignored_once.remove(name);
+        self.menu_dirty = true;
+        self.resync_upgrade_session();
+        Ok(())
+    }
+
     /// Remove `name` from the persistent ignore list (the **Ignored apps**
     /// submenu). A live assertion from it is upgraded again on the next poll.
     ///
@@ -1313,15 +1444,88 @@ impl AppState {
         Ok(())
     }
 
-    /// Classify one poll's external assertions against the live ignore rules:
-    /// the operating system's own holders and the user's ignore list.
-    fn classify(&self, all: &[ExternalAssertion]) -> ExternalClassification {
-        let is_system_pid = self.is_system_pid;
-        classify_external_assertions(
-            all,
-            &|name: &str| self.config.ignores_app(name),
-            &is_system_pid,
-        )
+    /// Hand the upgrade over to a normal caffeinate2 session: the configured mode
+    /// and time limit take over from the external assertion, so the hold ends on
+    /// caffeinate2's clock instead of whenever the other program happens to stop
+    /// asserting. The watcher stays out of the way for the rest of this trigger
+    /// episode (like a manual left-click-off).
+    ///
+    /// Keeping the same hold when the configured mode is the one already in
+    /// force (Entirely, for an upgrade session) avoids a needless
+    /// release/acquire round trip through the privileged helper.
+    pub fn take_over_upgrade_session(&mut self) {
+        if !self.is_upgrading() {
+            return;
+        }
+        self.upgrade_overridden = true;
+        self.upgrade_clear_since = None;
+        self.menu_dirty = true;
+        self.last_tooltip = None;
+
+        if self.session.as_ref().map(|session| session.mode) != Some(self.config.mode) {
+            // Two-phase switch: the current hold keeps preventing sleep until
+            // the new mode's hold commits (see `set_mode`).
+            self.start_session_with(self.config.mode, false, None);
+            return;
+        }
+
+        // Re-seed the app watch from a fresh scan: the watch is suspended while
+        // the watcher owns a session, so the latch on it means nothing to the
+        // manual session taking over.
+        process_enum::invalidate_exec_path_cache();
+        let app_saw_running = process_enum::any_target_running(&self.config.wait_for_apps);
+        self.app_watch_running = Some(app_saw_running);
+        let until = self
+            .config
+            .time_limit_secs
+            .map(|secs| sleep_aware_now() + Duration::from_secs(secs));
+        if let Some(session) = self.session.as_mut() {
+            session.started_by_upgrade = false;
+            session.until = until;
+            session.upgrade_apps.clear();
+            session.app_saw_running = app_saw_running;
+        }
+    }
+
+    /// Re-evaluate the watcher immediately after the ignore rules changed, so an
+    /// ignore takes effect on the click rather than after the poll interval (and
+    /// without the [`UPGRADE_CLEAR_GRACE`] debounce, which exists for assertions
+    /// that vanish on their own, not for an explicit decision).
+    ///
+    /// Only ever reached with a *committed* upgrade session: both callers come
+    /// from the upgrade dialog, which the run loop only opens when
+    /// [`AppState::is_upgrading`] holds. An upgrade enable that is still
+    /// acquiring its hold therefore needs no handling here — `poll_upgrade`
+    /// starts one only while `session` is `None`, so the two states never
+    /// coexist, and a click during that window goes to `toggle` instead.
+    fn resync_upgrade_session(&mut self) {
+        if !self.is_upgrading() {
+            return;
+        }
+        let Ok(external) = (self.scan_assertions)(OBSERVED_TYPES) else {
+            // Transient IOKit failure: leave the session alone. The next
+            // `poll_upgrade` re-evaluates with the new ignore rules anyway.
+            return;
+        };
+        let ExternalClassification {
+            upgradeable,
+            ignored,
+        } = self.classify(&external);
+        self.upgrade_ignored = ignored;
+
+        if upgradeable.is_empty() {
+            self.upgrade_clear_since = None;
+            // stop_session flags the menu dirty so the entries disappear.
+            self.stop_session();
+            return;
+        }
+
+        // Something else is still worth upgrading; keep the session and refresh
+        // the names it displays.
+        if let Some(session) = self.session.as_mut() {
+            session.upgrade_apps = holder_names(&upgradeable);
+        }
+        self.last_tooltip = None;
     }
 
     /// Poll external assertions and start/stop an upgrade session as needed.
@@ -1346,13 +1550,17 @@ impl AppState {
                 self.upgrade_ignored.clear();
                 self.menu_dirty = true;
             }
+            // Ignore-once entries age out against live assertions, which are no
+            // longer polled; drop them so re-enabling the watcher starts clean.
+            self.upgrade_ignored_once.clear();
             return false;
         }
 
-        let Ok(external) = power_management::external_assertions(OBSERVED_TYPES) else {
+        let Ok(external) = (self.scan_assertions)(OBSERVED_TYPES) else {
             // Transient IOKit failure; leave the current state and retry.
             return false;
         };
+        self.age_ignored_once(&external);
         let ExternalClassification {
             upgradeable,
             ignored,
@@ -1468,12 +1676,28 @@ mod tests {
             last_upgrade_error: None,
             upgrade_overridden: false,
             upgrade_ignored: Vec::new(),
+            upgrade_ignored_once: HashMap::new(),
             menu_dirty: false,
             app_watch_running: None,
-            // No live PIDs in tests: nothing is a system holder unless it is
+            // No live IOKit in tests: the scan yields nothing until a test
+            // installs one, and no PID is a system holder unless it is
             // `SYSTEM_PID` (see `system_assertion`).
+            scan_assertions: |_| Ok(Vec::new()),
             is_system_pid: |pid| pid == SYSTEM_PID,
         }
+    }
+
+    /// Pin the assertions the watcher will "see" for the rest of the test. A
+    /// function pointer can't capture, so the list lives in a thread-local the
+    /// injected scan reads.
+    fn set_live_assertions(state: &mut AppState, live: Vec<ExternalAssertion>) {
+        LIVE_ASSERTIONS.with(|cell| *cell.borrow_mut() = live);
+        state.scan_assertions = |_| Ok(LIVE_ASSERTIONS.with(|cell| cell.borrow().clone()));
+    }
+
+    thread_local! {
+        static LIVE_ASSERTIONS: std::cell::RefCell<Vec<ExternalAssertion>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     #[test]
@@ -1869,14 +2093,15 @@ mod tests {
     /// Classify with no ignore rules beyond the system check, which the tests
     /// drive through the PID rather than live processes.
     fn classify(all: &[ExternalAssertion]) -> ExternalClassification {
-        classify_with(all, &|_| false)
+        classify_with(all, &|_| false, &HashSet::new())
     }
 
     fn classify_with(
         all: &[ExternalAssertion],
         ignores_app: &impl Fn(&str) -> bool,
+        ignored_once: &HashSet<&str>,
     ) -> ExternalClassification {
-        classify_external_assertions(all, ignores_app, &|pid| pid == SYSTEM_PID)
+        classify_external_assertions(all, ignores_app, ignored_once, &|pid| pid == SYSTEM_PID)
     }
 
     #[test]
@@ -1922,7 +2147,7 @@ mod tests {
     #[test]
     fn user_ignored_app_is_listed_with_its_own_reason() {
         let all = [assertion("Zoom", AssertionType::PreventUserIdleSystemSleep)];
-        let result = classify_with(&all, &|name| name == "Zoom");
+        let result = classify_with(&all, &|name| name == "Zoom", &HashSet::new());
         assert!(result.upgradeable.is_empty());
         assert_eq!(result.ignored, vec![ignored("Zoom", REASON_USER_IGNORED)]);
     }
@@ -1930,12 +2155,27 @@ mod tests {
     /// A display-only hold was never upgradeable, so an ignore rule is not the
     /// reason it isn't upgraded and must not be shown as one.
     #[test]
-    fn display_only_reason_wins_over_the_ignore_list() {
+    fn display_only_reason_wins_over_the_ignore_lists() {
         let all = [assertion("VLC", AssertionType::PreventUserIdleDisplaySleep)];
+        let once: HashSet<&str> = ["VLC"].into_iter().collect();
         assert_eq!(
-            classify_with(&all, &|name| name == "VLC").ignored,
+            classify_with(&all, &|name| name == "VLC", &once).ignored,
             vec![ignored("VLC", REASON_DISPLAY_ONLY)]
         );
+    }
+
+    #[test]
+    fn ignored_once_holder_is_listed_and_not_upgraded() {
+        let all = [assertion(
+            "Codex",
+            AssertionType::PreventUserIdleSystemSleep,
+        )];
+        let once: HashSet<&str> = ["Codex"].into_iter().collect();
+        let result = classify_with(&all, &|_| false, &once);
+        assert!(result.upgradeable.is_empty());
+        assert_eq!(result.ignored, vec![ignored("Codex", REASON_IGNORED_ONCE)]);
+        // Without the ignore-once entry the same assertion is upgraded again.
+        assert_eq!(classify(&all).upgradeable.len(), 1);
     }
 
     #[test]
@@ -1983,6 +2223,174 @@ mod tests {
                 ignored("VLC", REASON_DISPLAY_ONLY),
             ]
         );
+    }
+
+    /// An ignore-once entry survives the holder briefly dropping its assertion
+    /// (agents do this between turns) and expires only after the same grace the
+    /// session release uses.
+    #[test]
+    fn ignore_once_entries_expire_only_after_the_clear_grace() {
+        let mut state = bare_state();
+        state
+            .upgrade_ignored_once
+            .insert("Codex".to_string(), Instant::now());
+
+        // Still holding: the entry is refreshed, not dropped.
+        let live = [assertion(
+            "Codex",
+            AssertionType::PreventUserIdleSystemSleep,
+        )];
+        state.age_ignored_once(&live);
+        assert!(state.upgrade_ignored_once.contains_key("Codex"));
+
+        // Gone, but not yet for long enough.
+        state.age_ignored_once(&[]);
+        assert!(state.upgrade_ignored_once.contains_key("Codex"));
+
+        // Gone past the grace period: the next assertion from it is upgraded.
+        state.upgrade_ignored_once.insert(
+            "Codex".to_string(),
+            Instant::now() - UPGRADE_CLEAR_GRACE - Duration::from_secs(1),
+        );
+        state.age_ignored_once(&[]);
+        assert!(state.upgrade_ignored_once.is_empty());
+        assert!(state.menu_dirty);
+    }
+
+    fn upgrade_session_for(apps: &[&str]) -> ActiveTraySession {
+        ActiveTraySession {
+            hold: ActiveSleepHold::Noop,
+            mode: SleepMode::Entirely,
+            until: None,
+            app_saw_running: false,
+            started_by_upgrade: true,
+            upgrade_apps: apps.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    /// The ignore has to land on the click, not on the next poll: with nothing
+    /// else worth upgrading the hold goes away immediately, skipping the
+    /// `UPGRADE_CLEAR_GRACE` debounce that exists for assertions which vanish on
+    /// their own rather than by an explicit decision.
+    #[test]
+    fn ignoring_the_only_upgraded_holder_releases_the_hold_immediately() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.session = Some(upgrade_session_for(&["Codex"]));
+        set_live_assertions(
+            &mut state,
+            vec![assertion(
+                "Codex",
+                AssertionType::PreventUserIdleSystemSleep,
+            )],
+        );
+
+        state.ignore_assertion_once("Codex");
+
+        assert!(state.session.is_none());
+        assert!(state.upgrade_clear_since.is_none());
+        assert!(state.menu_dirty);
+        // And it is now explained in the menu rather than silently gone.
+        assert_eq!(
+            state.upgrade_ignored,
+            vec![ignored("Codex", REASON_IGNORED_ONCE)]
+        );
+    }
+
+    /// Ignoring one of several holders must not release a hold the others still
+    /// justify — it just stops crediting the ignored one.
+    #[test]
+    fn ignoring_one_of_two_holders_keeps_the_session_for_the_rest() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.session = Some(upgrade_session_for(&["Claude", "Codex"]));
+        set_live_assertions(
+            &mut state,
+            vec![
+                assertion("Claude", AssertionType::PreventUserIdleSystemSleep),
+                assertion("Codex", AssertionType::PreventUserIdleSystemSleep),
+            ],
+        );
+
+        state.ignore_assertion_once("Codex");
+
+        let session = state.session.as_ref().expect("session kept for Claude");
+        assert!(session.started_by_upgrade);
+        assert_eq!(session.upgrade_apps, vec!["Claude".to_string()]);
+        assert_eq!(
+            state.upgrade_ignored,
+            vec![ignored("Codex", REASON_IGNORED_ONCE)]
+        );
+    }
+
+    /// A transient `IOKit` failure must not tear the session down; the next
+    /// `poll_upgrade` re-evaluates with the new rule anyway.
+    #[test]
+    fn a_failed_rescan_leaves_the_upgrade_session_alone() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.session = Some(upgrade_session_for(&["Codex"]));
+        state.scan_assertions = |_| Err(1);
+
+        state.ignore_assertion_once("Codex");
+
+        assert!(state.is_upgrading());
+        assert!(state.upgrade_ignored_once.contains_key("Codex"));
+    }
+
+    /// Taking over converts the watcher's session into a manual one on
+    /// caffeinate2's own clock, and keeps the watcher from re-upgrading the
+    /// assertion that is still there.
+    #[test]
+    fn take_over_converts_the_upgrade_session_to_a_timed_manual_one() {
+        let mut state = bare_state();
+        state.config.mode = SleepMode::Entirely;
+        state.config.time_limit_secs = Some(1800);
+        state.session = Some(ActiveTraySession {
+            hold: ActiveSleepHold::Noop,
+            mode: SleepMode::Entirely,
+            until: None,
+            app_saw_running: false,
+            started_by_upgrade: true,
+            upgrade_apps: vec!["Claude".to_string()],
+        });
+
+        state.take_over_upgrade_session();
+
+        let session = state.session.as_ref().expect("session kept");
+        // The same hold is reused (no helper round trip) but it is now ours.
+        assert!(!session.started_by_upgrade);
+        assert!(session.upgrade_apps.is_empty());
+        assert!(session.until.is_some());
+        assert!(state.upgrade_overridden);
+        assert!(!state.is_upgrading());
+        // No enable was spawned: the mode already matched.
+        assert!(state.pending_enable.is_none());
+    }
+
+    /// Taking over with a different configured mode acquires that mode's hold
+    /// without dropping the current one first.
+    #[test]
+    fn take_over_with_a_different_mode_switches_in_two_phases() {
+        let mut state = bare_state();
+        state.config.mode = SleepMode::Display;
+        state.session = Some(ActiveTraySession {
+            hold: ActiveSleepHold::Noop,
+            mode: SleepMode::Entirely,
+            until: None,
+            app_saw_running: false,
+            started_by_upgrade: true,
+            upgrade_apps: vec!["Claude".to_string()],
+        });
+
+        state.take_over_upgrade_session();
+
+        // The upgrade session still holds while the Display hold is acquired.
+        assert!(state.is_upgrading());
+        let pending = state.pending_enable.as_ref().expect("enable in flight");
+        assert_eq!(pending.mode, SleepMode::Display);
+        assert!(!pending.started_by_upgrade);
+        assert!(state.upgrade_overridden);
     }
 
     #[test]

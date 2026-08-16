@@ -6,6 +6,7 @@ use crate::tray::menu::{
 use crate::tray::single_instance;
 use crate::tray::state::{AppState, PendingEnableOutcome, PendingInstallOutcome};
 use crate::tray::tray_icons;
+use crate::tray::upgrade_dialog::{self, UpgradeChoice};
 use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use objc2_foundation::MainThreadMarker;
 use signal_hook::{
@@ -99,6 +100,32 @@ fn poll_pending_install(state: &mut AppState, tray: &tray_icon::TrayIcon, handle
     }
 }
 
+/// Handle a tray click that lands while the watcher is upgrading another
+/// program: ask what to do (see [`crate::tray::upgrade_dialog`]) and apply it.
+/// The menu structure changes that follow (ignore lists, an upgrade that ended)
+/// are picked up by the run loop's `take_menu_dirty` rebuild.
+fn handle_upgrade_click(
+    mtm: MainThreadMarker,
+    state: &mut AppState,
+    tray: &tray_icon::TrayIcon,
+    apps: &[String],
+) {
+    match upgrade_dialog::ask(mtm, apps, state.mode(), state.time_limit_secs()) {
+        UpgradeChoice::KeepUpgrading => return,
+        UpgradeChoice::IgnoreAssertion(name) => state.ignore_assertion_once(&name),
+        UpgradeChoice::TakeOver => state.take_over_upgrade_session(),
+        UpgradeChoice::IgnoreApp(name) => {
+            if let Err(e) = state.ignore_app(&name) {
+                eprintln!("{e}");
+                state.set_icon(tray);
+                state.show_error_tooltip(tray, &e.to_string());
+                return;
+            }
+        }
+    }
+    state.set_icon(tray);
+}
+
 ///
 /// # Errors
 ///
@@ -118,6 +145,7 @@ pub fn run() -> Result<(), TrayError> {
         let mut signals =
             Signals::new([SIGINT, SIGTERM]).expect("failed to create signal iterator");
         if signals.forever().next().is_some() {
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
             crate::tray::macos_activation::wake_event_loop();
         }
     });
@@ -243,6 +271,14 @@ pub fn run() -> Result<(), TrayError> {
                 ..
             } = event
             {
+                // While the watcher is upgrading someone else's assertion, "off"
+                // is ambiguous — ask instead of toggling. An upgrade with no
+                // named holder has nothing to ask about, so it keeps toggling.
+                let upgraded_apps = state.upgrading_apps();
+                if state.is_upgrading() && !upgraded_apps.is_empty() {
+                    handle_upgrade_click(mtm, &mut state, &tray, &upgraded_apps);
+                    continue;
+                }
                 let turning_on = !state.is_on() && !state.is_enabling();
                 state.show_icon_state(&tray, !state.is_on() || state.is_enabling());
                 if turning_on && state.menu_snapshot().mode == SleepMode::Entirely {
