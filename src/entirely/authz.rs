@@ -25,25 +25,61 @@ use std::ffi::{CStr, CString};
 pub const GRANT_GROUP: &str = "caffeinate2";
 const ADMIN_GROUP: &str = "admin";
 
-struct User {
-    name: String,
-    primary_gid: libc::gid_t,
+/// A user's passwd record, as much of it as callers need. `home` and `shell`
+/// exist for `--drop-root`, which points the child's HOME/USER/LOGNAME/SHELL
+/// at the target user; either may be empty when the directory record omits it
+/// or it isn't UTF-8.
+pub struct User {
+    pub name: String,
+    pub primary_gid: libc::gid_t,
+    pub home: String,
+    pub shell: String,
 }
 
-fn user_for_uid(uid: libc::uid_t) -> Option<User> {
+/// Upper bound for the `getpwuid_r`/`getgrnam_r` record buffers grown on
+/// ERANGE. Directory-bound records (e.g. an `admin` group whose `gr_mem`
+/// lists many accounts) can exceed a fixed 4 KiB; the cap only stops a
+/// pathological loop.
+const MAX_RECORD_BUFFER: usize = 1 << 20;
+
+/// Run one of the `*_r` record lookups, growing `buf` on ERANGE. A too-small
+/// buffer must be a retry, not a denial: these lookups back [`uid_may_hold`]'s
+/// fail-closed check, and treating ERANGE as "no such record" turned a large
+/// directory record into "not authorized" ([`group_ids_for_user`] grows for
+/// the same reason). Returns whether the record was found.
+fn lookup_with_growing_buffer(
+    buf: &mut Vec<libc::c_char>,
+    mut call: impl FnMut(&mut Vec<libc::c_char>) -> (libc::c_int, bool),
+) -> bool {
+    loop {
+        let (ret, found) = call(buf);
+        if ret == libc::ERANGE && buf.len() < MAX_RECORD_BUFFER {
+            let new_len = (buf.len() * 2).min(MAX_RECORD_BUFFER);
+            buf.resize(new_len, 0);
+            continue;
+        }
+        return ret == 0 && found;
+    }
+}
+
+#[must_use]
+pub fn user_for_uid(uid: libc::uid_t) -> Option<User> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let ret = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &raw mut pwd,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut result,
-        )
-    };
-    if ret != 0 || result.is_null() {
+    let found = lookup_with_growing_buffer(&mut buf, |buf| {
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &raw mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        (ret, !result.is_null())
+    });
+    if !found {
         return None;
     }
     let name = unsafe { CStr::from_ptr(pwd.pw_name) }
@@ -56,27 +92,46 @@ fn user_for_uid(uid: libc::uid_t) -> Option<User> {
     Some(User {
         name,
         primary_gid: pwd.pw_gid,
+        home: passwd_string_field(pwd.pw_dir),
+        shell: passwd_string_field(pwd.pw_shell),
     })
+}
+
+/// Copy an optional C-string field out of a passwd record `getpwuid_r` filled
+/// in (`ptr` must point into that still-live record/buffer). Null or non-UTF-8
+/// reads as empty — unlike `pw_name`, these fields are informational, so a
+/// missing value shouldn't fail the whole lookup.
+fn passwd_string_field(ptr: *const libc::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn gid_for_group(name: &str) -> Option<libc::gid_t> {
     let cname = CString::new(name).ok()?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    // A group record carries every member name in `gr_mem`, so `admin` on a
+    // directory-bound deployment realistically overflows 4 KiB — exactly the
+    // record this authorization check needs (see lookup_with_growing_buffer).
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::group = std::ptr::null_mut();
-    let ret = unsafe {
-        libc::getgrnam_r(
-            cname.as_ptr(),
-            &raw mut grp,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut result,
-        )
-    };
-    if ret != 0 || result.is_null() {
-        return None;
-    }
-    Some(grp.gr_gid)
+    let found = lookup_with_growing_buffer(&mut buf, |buf| {
+        let ret = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &raw mut grp,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        (ret, !result.is_null())
+    });
+    found.then_some(grp.gr_gid)
 }
 
 /// Upper bound on the group-list buffer we'll grow to. Real accounts have far
@@ -141,9 +196,10 @@ pub fn uid_may_hold(uid: libc::uid_t) -> bool {
         .any(|name| gid_for_group(name).is_some_and(|gid| groups.contains(&gid)))
 }
 
-/// Denial message sent to the client; starts with the
-/// [`crate::entirely::helper_ipc::is_authorization_error`] prefix and includes the
-/// exact grant command for this user.
+/// Denial message sent to the client. Starts with the `not authorized` prefix
+/// that [`crate::entirely::error::HelperIpcError`] classifies as
+/// [`crate::entirely::error::HelperIpcErrorKind::NotAuthorized`], and includes
+/// the exact grant command for this user.
 #[must_use]
 pub fn denial_message(uid: libc::uid_t) -> String {
     // Single-quote the resolved name so the suggested command is copy-paste-safe
@@ -172,6 +228,10 @@ mod tests {
         let uid = nix::unistd::getuid().as_raw();
         let user = user_for_uid(uid).expect("current user should resolve");
         assert!(!user.name.is_empty());
+        // Every real macOS account has a home directory and a login shell;
+        // --drop-root relies on these to rebuild the child's environment.
+        assert!(user.home.starts_with('/'));
+        assert!(user.shell.starts_with('/'));
         let groups =
             group_ids_for_user(&user.name, user.primary_gid).expect("groups should resolve");
         assert!(groups.contains(&user.primary_gid));
