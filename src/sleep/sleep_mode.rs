@@ -1,8 +1,6 @@
 use crate::entirely::coordinator::{EntirelyCoordinator, EntirelyHoldGuard};
-use crate::entirely::error::HelperIpcError;
-use crate::entirely::helper_ipc::{
-    HelperClient, HelperHoldGuard, is_authorization_error, is_connect_error,
-};
+use crate::entirely::error::{HelperIpcError, HelperIpcErrorKind};
+use crate::entirely::helper_ipc::{HelperClient, HelperHoldGuard};
 use crate::sleep::power_management::{self, AssertionType, PowerAssertion, UserActivityHold};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -45,13 +43,10 @@ pub enum EnableError {
 
 /// Map a helper RPC error onto the typed error the UIs dispatch on.
 fn classify_helper_error(error: HelperIpcError) -> EnableError {
-    let message = error.to_string();
-    if is_connect_error(&message) {
-        EnableError::HelperUnavailable
-    } else if is_authorization_error(&message) {
-        EnableError::NotAuthorized(message)
-    } else {
-        EnableError::Ipc(message)
+    match error.kind() {
+        HelperIpcErrorKind::Connect => EnableError::HelperUnavailable,
+        HelperIpcErrorKind::NotAuthorized => EnableError::NotAuthorized(error.to_string()),
+        _ => EnableError::Ipc(error.to_string()),
     }
 }
 
@@ -67,7 +62,7 @@ fn acquire_entirely(verbose: bool, policy: EntirelyPolicy) -> Result<EntirelyHol
     match policy {
         EntirelyPolicy::HelperOrLocalFallback => match HelperHoldGuard::try_acquire(&client) {
             Ok(guard) => Ok(EntirelyHold::Helper(guard)),
-            Err(error) if is_connect_error(&error.to_string()) => {
+            Err(error) if error.kind() == HelperIpcErrorKind::Connect => {
                 // The local fallback toggles the system SleepDisabled setting
                 // directly, which only works as root. Fail fast with a clear
                 // error instead of writing a lockfile entry and surfacing the
@@ -141,12 +136,11 @@ impl SleepMode {
                 acquire_entirely(verbose, entirely_policy).map(ActiveSleepHold::Entirely)
             }
             mode => {
-                let Some(assertion_type) = mode.assertion_type() else {
-                    return Err(EnableError::Ipc(format!(
-                        "no IOKit assertion for {}",
-                        mode.label()
-                    )));
-                };
+                // The two non-assertion modes are matched above, so the
+                // remaining four always map to an IOKit assertion type.
+                let assertion_type = mode
+                    .assertion_type()
+                    .expect("assertion modes handled above");
                 power_management::create_assertion(assertion_type, verbose)
                     .map(ActiveSleepHold::Assertion)
                     .map_err(EnableError::Iokit)
@@ -255,10 +249,12 @@ impl ActiveSleepHold {
     }
 }
 
-/// All holds for a running CLI or tray session.
+/// All holds for a running CLI or tray session. The holds are released by
+/// dropping the session; the field is private so no caller can pluck one out
+/// and release it independently of the rest.
 #[derive(Default)]
 pub struct ActiveSession {
-    pub holds: Vec<ActiveSleepHold>,
+    holds: Vec<ActiveSleepHold>,
 }
 
 impl ActiveSession {

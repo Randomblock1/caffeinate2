@@ -1,5 +1,5 @@
 use crate::entirely::coordinator;
-use crate::entirely::error::InstallError;
+use crate::entirely::error::{HelperIpcErrorKind, InstallError};
 use crate::entirely::helper_ipc;
 use crate::entirely::lockfile;
 use crate::entirely::process_util;
@@ -20,23 +20,10 @@ use std::process::Command;
 // redirect the path via a writable ancestor.
 pub const HELPER_INSTALL_PATH: &str =
     "/Library/PrivilegedHelperTools/com.randomblock1.caffeinate2.helper";
-// Pre-migration versions installed the root-owned helper here; nothing writes
-// this path anymore, so install/uninstall clean it up rather than orphaning a
-// stale privileged binary.
-const LEGACY_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/caffeinate2/caffeinate2-helper";
 pub const HELPER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.randomblock1.caffeinate2.helper.plist";
 pub const HELPER_PLIST_LABEL: &str = "com.randomblock1.caffeinate2.helper";
 pub const TRAY_LAUNCH_AGENT_LABEL: &str = "com.randomblock1.caffeinate2-tray";
-
-const NEWSYSLOG_CONF_PATH: &str = "/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf";
-
-// Must match the path in resources/newsyslog/…helper.conf so newsyslog rotates
-// the file the daemon writes.
-const HELPER_LOG_PATH: &str = "/var/log/caffeinate2-helper.log";
-
-const NEWSYSLOG_CONF_TEMPLATE: &str =
-    include_str!("../../resources/newsyslog/com.randomblock1.caffeinate2.helper.conf");
 
 const HELPER_BINARY_HINT: &str = "install caffeinate2 with --features full or helper-bin, \
     use the GitHub release bundle, or place caffeinate2-helper in the same directory as caffeinate2";
@@ -93,9 +80,14 @@ struct HelperLaunchDaemon {
     /// `Interactive` keeps the daemon responsive to RPCs and exempt from the
     /// aggressive throttling applied to background ProcessTypes; it still runs
     /// as root with full privileges, so this does not weaken helper operation.
+    ///
+    /// Deliberately no StandardOut/ErrorPath: launchd opens such a file once
+    /// and the daemon inherits the fd, so after newsyslog rotated it the
+    /// writes went into the renamed archive forever and the fresh file stayed
+    /// empty. The helper logs to the unified system log instead
+    /// (`tracing_oslog`, subsystem com.randomblock1.caffeinate2.helper),
+    /// which needs no rotation.
     process_type: String,
-    standard_error_path: String,
-    standard_out_path: String,
 }
 
 // launchd LaunchAgent definition for the per-user tray. Field order is the
@@ -126,8 +118,6 @@ pub fn helper_plist_content(helper_path: &Path) -> String {
         run_at_load: true,
         keep_alive: true,
         process_type: "Interactive".to_string(),
-        standard_error_path: HELPER_LOG_PATH.to_string(),
-        standard_out_path: HELPER_LOG_PATH.to_string(),
     })
 }
 
@@ -185,12 +175,22 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     // the process mid-write; bootstrap below would also no-op while the old
     // service is still loaded. bootout may fail on first install, so suppress it.
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
+    // On a first install nothing answers and this returns on the first probe.
+    // On a reinstall, an old daemon that survived the bootout keeps the
+    // service loaded, so the bootstrap below silently no-ops and the old
+    // binary keeps serving — warn so the apparent success isn't trusted.
+    if !helper_stopped_answering() {
+        tracing::warn!(
+            "the old helper daemon still answers after launchctl bootout; the new binary may \
+             not take over. If --status still reports a stale helper, run `sudo launchctl \
+             bootout system/{HELPER_PLIST_LABEL}` and re-run --install-helper"
+        );
+    }
     match fs::remove_file(&dest) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("could not remove old helper binary: {e}"),
     }
-    remove_legacy_helper();
     // Copy with O_NOFOLLOW|O_EXCL and pin root:wheel 0o755 on the open fd, so a
     // symlink planted at the destination cannot redirect the privileged write
     // and the installed binary is never momentarily owned or writable by a
@@ -203,7 +203,6 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     // write it with an explicit root-owned 0644.
     fs_util::atomic_write_with_mode(Path::new(HELPER_PLIST_PATH), plist.as_bytes(), 0o644)
         .map_err(InstallError::from)?;
-    install_newsyslog_conf();
 
     // Best-effort: create the grant group so administrators can allow
     // standard accounts with a single dseditgroup -o edit command. The
@@ -348,130 +347,6 @@ fn install_helper_binary(source: &Path, dest: &Path) -> Result<(), InstallError>
     Ok(())
 }
 
-fn install_newsyslog_conf() {
-    let path = Path::new(NEWSYSLOG_CONF_PATH);
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        tracing::warn!("could not create newsyslog config directory: {e}");
-        return;
-    }
-    // newsyslog also expects a root-owned, non-world-writable config.
-    if let Err(e) = fs_util::atomic_write_with_mode(path, NEWSYSLOG_CONF_TEMPLATE.as_bytes(), 0o644)
-    {
-        tracing::warn!("could not install newsyslog config: {e}");
-    }
-}
-
-/// Best-effort removal of the pre-migration helper binary (and the caffeinate2
-/// directory that existed only to hold it). Errors are ignored: the path may be
-/// absent, or the directory non-empty because something else was placed there.
-///
-/// Invariant: this runs as root, so it must never follow a symlink while
-/// removing. The parent chain is opened component-by-component with
-/// `O_DIRECTORY|O_NOFOLLOW` and the leaf file/directory are removed with
-/// `unlinkat` relative to those dirfds, so a symlink swapped in for any
-/// intermediate component — or for the leaf itself — cannot redirect a
-/// privileged unlink outside the intended tree (the same discipline as
-/// `ensure_secure_install_dir` and the `O_NOFOLLOW|O_EXCL` binary/plist writes).
-/// A no-op when the path does not exist.
-fn remove_legacy_helper() {
-    use std::os::fd::AsFd;
-
-    let legacy = Path::new(LEGACY_HELPER_INSTALL_PATH);
-    // Remove the file relative to a dirfd on its parent directory, opened
-    // without ever traversing a symlink.
-    if let (Some(dir), Some(file_name)) = (legacy.parent(), legacy.file_name())
-        && let Some(dir_fd) = open_dir_chain_nofollow(dir)
-    {
-        let _ = unlinkat_name(dir_fd.as_fd(), file_name, 0);
-        // Then remove the now-empty directory relative to a dirfd on *its*
-        // parent, again symlink-free. rmdir no-ops if the directory is missing
-        // or non-empty.
-        if let (Some(grandparent), Some(dir_name)) = (dir.parent(), dir.file_name())
-            && let Some(parent_fd) = open_dir_chain_nofollow(grandparent)
-        {
-            let _ = unlinkat_name(parent_fd.as_fd(), dir_name, libc::AT_REMOVEDIR);
-        }
-    }
-}
-
-/// Open `dir` as a directory fd by walking its absolute path from the
-/// filesystem root, opening each component with `O_DIRECTORY|O_NOFOLLOW` so no
-/// intermediate symlink is ever traversed. Best effort: returns `None` if `dir`
-/// is not absolute/normalized, or any component is missing, not a directory, or
-/// a symlink.
-fn open_dir_chain_nofollow(dir: &Path) -> Option<std::os::fd::OwnedFd> {
-    use std::os::fd::AsFd;
-    use std::path::Component;
-
-    if !dir.is_absolute() {
-        return None;
-    }
-    // Anchor the walk at "/": it is never a symlink, so O_NOFOLLOW opens it
-    // safely and it becomes the dirfd for the first component.
-    let root = std::ffi::CString::new("/").ok()?;
-    let mut current = open_dir_at_nofollow(None, &root)?;
-    for component in dir.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                use std::os::unix::ffi::OsStrExt;
-                let c_name = std::ffi::CString::new(name.as_bytes()).ok()?;
-                current = open_dir_at_nofollow(Some(current.as_fd()), &c_name)?;
-            }
-            // A normalized absolute path has no `.`/`..`/prefix components;
-            // refuse to traverse them rather than walk outside the chain.
-            _ => return None,
-        }
-    }
-    Some(current)
-}
-
-/// `openat` a directory named `name` relative to `dirfd` (or the absolute path
-/// `name` when `dirfd` is `None`), with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`.
-/// `None` on any failure.
-fn open_dir_at_nofollow(
-    dirfd: Option<std::os::fd::BorrowedFd<'_>>,
-    name: &std::ffi::CStr,
-) -> Option<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let raw_dirfd = dirfd.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
-    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY;
-    // SAFETY: `name` is a valid NUL-terminated C string and `raw_dirfd` is
-    // either AT_FDCWD or a live borrowed fd. The returned fd is wrapped in an
-    // OwnedFd so it is closed exactly once.
-    let fd = unsafe { libc::openat(raw_dirfd, name.as_ptr(), flags) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: `fd` is a fresh, valid, owned descriptor returned by openat.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// `unlinkat(dirfd, name, flags)` — `flags` is `0` to remove a file or
-/// `AT_REMOVEDIR` to remove a directory. Errors are returned for the caller to
-/// ignore (best-effort legacy cleanup).
-fn unlinkat_name(
-    dirfd: std::os::fd::BorrowedFd<'_>,
-    name: &std::ffi::OsStr,
-    flags: libc::c_int,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: `dirfd` is a live directory fd and `c_name` is NUL-terminated.
-    let rc = unsafe { libc::unlinkat(dirfd.as_raw_fd(), c_name.as_ptr(), flags) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 fn ensure_grant_group() {
     let group = crate::entirely::authz::GRANT_GROUP;
     let exists = Command::new("/usr/sbin/dseditgroup")
@@ -534,22 +409,32 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
     }
 
     let _ = launchctl_bootout_system(HELPER_PLIST_LABEL);
+    // A bootout "success" does not prove the daemon stopped (see
+    // helper_stopped_answering). Removing the files under a daemon that kept
+    // running would orphan an unreachable root process whose binary is gone —
+    // and a later --install-helper's bootstrap would no-op against the
+    // still-loaded service instead of starting the new binary. Refuse before
+    // any file is removed and before sleep is re-enabled.
+    if !helper_stopped_answering() {
+        return Err(InstallError::msg(format!(
+            "the helper daemon still answers after launchctl bootout; leaving its files in \
+             place so a running root daemon is not orphaned. Stop it with `sudo launchctl \
+             bootout system/{HELPER_PLIST_LABEL}` and re-run --uninstall-helper"
+        )));
+    }
     let _ = fs::remove_file(HELPER_PLIST_PATH);
-    let _ = fs::remove_file(NEWSYSLOG_CONF_PATH);
     let _ = fs::remove_file(HELPER_INSTALL_PATH);
     let _ = fs::remove_file(helper_ipc::HELPER_SOCKET_PATH);
-    remove_legacy_helper();
 
     // Once the helper is removed nobody can send Release, so re-enable sleep if
     // caffeinate2 is (or was) managing the SleepDisabled setting. That evidence
-    // is the lockfile's *contents*, never its mere existence: the helper's
-    // startup reconcile creates the file on every boot, so an existence check
-    // is always true on a helper machine and would clobber an unrelated manual
-    // `pmset disablesleep`. The evidence mirrors `reconcile_startup`: the
-    // durable ownership marker, or — for legacy pre-marker lockfiles — any
-    // recorded holder entries, even ones just pruned as dead (this is the last
-    // chance to converge; no future helper startup will run the legacy
-    // fallback for us).
+    // is the lockfile's durable ownership marker, never the file's mere
+    // existence: the helper's startup reconcile creates the file, and it
+    // persists in /var/db from then on, so an existence check is always true on
+    // a helper machine and would clobber an unrelated manual
+    // `pmset disablesleep`. (Holder entries need no separate check: an acquire
+    // sets the marker in the same write, and it is cleared only with zero
+    // holders, so holders imply the marker.)
     //
     // Read the evidence from a FRESH prune, not the pre-bootout snapshot: the
     // helper kept serving between that snapshot and its death, so a hold could
@@ -560,14 +445,14 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
     let caffeinate2_managed_sleep = lock_path.exists()
         && match lockfile::prune_lockfile(false, lock_path, &process_util::default_process_checker)
         {
-            Ok(outcome) => outcome.owns_disable || outcome.had_entries,
+            Ok(outcome) => outcome.owns_disable,
             Err(e) => {
                 tracing::warn!("could not re-read helper lockfile during uninstall: {e}");
                 // Fall back to the pre-bootout snapshot rather than skipping
                 // the re-enable outright.
                 lock_outcome
                     .as_ref()
-                    .is_some_and(|outcome| outcome.owns_disable || outcome.had_entries)
+                    .is_some_and(|outcome| outcome.owns_disable)
             }
         };
     if caffeinate2_managed_sleep {
@@ -679,6 +564,45 @@ fn launchctl_bootstrap_system(plist_path: &str) -> Result<(), InstallError> {
     run_launchctl(&["load", "-w", plist_path])
 }
 
+/// Wait for the helper daemon to stop listening on its socket after a bootout.
+/// Returns `true` once it is gone, `false` if it is still there at the
+/// deadline. Needed because bootout's exit status is not evidence the daemon
+/// stopped: the legacy `launchctl unload` fallback exits 0 even on failure
+/// (per launchctl(1), load/unload return non-zero only on improper usage). The
+/// generous budget covers a daemon finishing an in-flight connection before
+/// exiting; a dead daemon refuses the connect immediately, so the common case
+/// returns on the first probe.
+fn helper_stopped_answering() -> bool {
+    helper_stopped_answering_within(
+        &helper_ipc::HelperClient::new(),
+        std::time::Duration::from_secs(5),
+    )
+}
+
+fn helper_stopped_answering_within(
+    client: &helper_ipc::HelperClient,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        // Only a refused connect is evidence the listener is gone. Everything
+        // else a Status probe can return comes from a live process the bootout
+        // did not stop: an Error response (saturated connection slots, a
+        // lockfile failure), a read timeout from a wedged daemon, or an
+        // undecodable reply. Treating those as "stopped" would delete the
+        // files under a running root daemon — the exact outcome this check
+        // exists to prevent.
+        match client.status() {
+            Err(e) if e.kind() == HelperIpcErrorKind::Connect => return true,
+            Ok(_) | Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn launchctl_bootout_system(label: &str) -> Result<(), InstallError> {
     // bootout takes a service target (`system/<label>`), not a bare label.
     if run_launchctl(&["bootout", &format!("system/{label}")]).is_ok() {
@@ -716,6 +640,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_treats_refused_connect_as_stopped() {
+        let client =
+            helper_ipc::HelperClient::with_socket_path("/nonexistent/caffeinate2-test.sock");
+        // Long budget on purpose: a refused connect must return on the first
+        // probe, so the test hanging near this budget would itself be the bug.
+        assert!(helper_stopped_answering_within(
+            &client,
+            std::time::Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn probe_treats_an_error_response_as_still_alive() {
+        // A daemon that ANSWERS — even with an error, as it does when its
+        // connection slots are saturated — is alive, and uninstall must refuse.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("caffeinate2-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind test socket");
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"{\"kind\":\"error\",\"message\":\"too many concurrent clients\"}\n",
+                );
+            }
+        });
+        let client = helper_ipc::HelperClient::with_socket_path(&path.to_string_lossy());
+        assert!(!helper_stopped_answering_within(
+            &client,
+            std::time::Duration::from_millis(300)
+        ));
+        drop(std::os::unix::net::UnixStream::connect(&path)); // unblock accept
+        let _ = std::fs::remove_file(&path);
+        drop(server); // detach; the thread dies with the test process
+    }
+
+    #[test]
     fn helper_plist_contains_path_and_keys() {
         let content = helper_plist_content(Path::new(HELPER_INSTALL_PATH));
         assert!(content.contains(HELPER_INSTALL_PATH));
@@ -723,7 +687,10 @@ mod tests {
         assert!(content.contains(HELPER_PLIST_LABEL));
         assert!(content.contains("<key>ProcessType</key>"));
         assert!(content.contains("<string>Interactive</string>"));
-        assert!(content.contains(HELPER_LOG_PATH));
+        // No file redirection: the daemon's inherited fd would keep writing
+        // into a rotated-away file (see HelperLaunchDaemon).
+        assert!(!content.contains("StandardOutPath"));
+        assert!(!content.contains("StandardErrorPath"));
     }
 
     #[test]

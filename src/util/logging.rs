@@ -26,8 +26,10 @@ pub fn init_cli_tracing(verbose: bool) {
 
 /// Initialize tracing for the privileged helper daemon.
 ///
-/// On macOS, logs go to Console.app via os_log and to stderr (captured by
-/// launchd in `/var/log/caffeinate2-helper.log`). Respects `RUST_LOG`.
+/// On macOS, logs go to the unified system log via os_log (subsystem
+/// `com.randomblock1.caffeinate2.helper` — view with Console.app or
+/// `log show`) and to stderr, which launchd discards for the daemon; the
+/// stderr layer serves a helper run by hand. Respects `RUST_LOG`.
 /// Default filter: `warn,caffeinate2=info`.
 #[cfg(target_os = "macos")]
 pub fn init_helper_tracing() {
@@ -46,6 +48,17 @@ pub fn init_helper_tracing() {
         .with(stderr)
         .try_init()
         .ok();
+
+    // Panics bypass tracing entirely and go to the raw stderr fd, which
+    // launchd points at /dev/null for the daemon — without this hook a panic
+    // in a connection worker (or a KeepAlive restart loop's cause) would
+    // leave no trace anywhere. Route the text through tracing, and thus
+    // os_log, before the default hook runs.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
 }
 
 #[cfg(not(target_os = "macos"))]

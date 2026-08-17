@@ -1,8 +1,8 @@
 use crate::entirely::coordinator::EntirelyCoordinator;
-use crate::entirely::error::HelperIpcError;
+use crate::entirely::error::{HelperIpcError, HelperIpcErrorKind};
 use crate::entirely::process_util;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -39,12 +39,10 @@ pub enum HelperResponse {
     Status {
         holders: usize,
         sleep_disabled: bool,
-        /// The daemon's crate version. `default` keeps responses from
-        /// pre-versioning helpers parseable (they decode as `None`, which
-        /// [`HelperStatus::is_stale`] reports as stale); older clients in turn
-        /// ignore the unknown field, so the handshake is compatible both ways.
-        #[serde(default)]
-        version: Option<String>,
+        /// The daemon's crate version. Required: every helper that ever
+        /// shipped reports one, so a response without it is malformed, not a
+        /// compatibility case.
+        version: String,
     },
     Error {
         message: String,
@@ -56,14 +54,17 @@ pub enum HelperResponse {
 pub struct HelperStatus {
     pub holders: usize,
     pub sleep_disabled: bool,
-    /// The helper daemon's crate version; `None` means a pre-versioning
-    /// helper binary is still installed.
-    pub version: Option<String>,
+    /// The helper daemon's crate version.
+    pub version: String,
 }
 
 impl HelperStatus {
-    /// This binary's crate version, for comparison against the daemon's.
-    pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+    /// This binary's crate version. It plays both sides of the version
+    /// handshake: clients compare it against the daemon's reported version
+    /// ([`Self::is_stale`]), and the daemon reports it as its own in every
+    /// `Status` response. One constant on purpose — splitting the two roles
+    /// into separately-named versions invites bumping one without the other.
+    pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
     /// True when the installed helper daemon reports a different version than
     /// this binary. The helper is a copied snapshot that launchd keeps
@@ -71,24 +72,21 @@ impl HelperStatus {
     /// after a reinstall (`sudo caffeinate2 --install-helper`) — callers
     /// should surface that.
     ///
-    /// Deliberately direction-blind: any mismatch (helper older *or* newer, or
-    /// pre-versioning) is stale, because a reinstall is warranted either way.
-    /// Callers that need to word the remediation by direction use
-    /// [`Self::helper_is_newer`].
+    /// Deliberately direction-blind: any mismatch (helper older *or* newer) is
+    /// stale, because a reinstall is warranted either way. Callers that need
+    /// to word the remediation by direction use [`Self::helper_is_newer`].
     #[must_use]
     pub fn is_stale(&self) -> bool {
-        self.version.as_deref() != Some(Self::CLIENT_VERSION)
+        self.version != Self::BINARY_VERSION
     }
 
     /// True iff the installed helper reports a version strictly newer than this
-    /// binary, comparing dot-separated components as `u64`s. An absent or
-    /// unparsable helper version reads as false, so a caller only claims the
-    /// helper is ahead when it can prove the direction.
+    /// binary, comparing dot-separated components as `u64`s. An unparsable
+    /// helper version reads as false, so a caller only claims the helper is
+    /// ahead when it can prove the direction.
     #[must_use]
     pub fn helper_is_newer(&self) -> bool {
-        self.version
-            .as_deref()
-            .is_some_and(|version| version_is_newer(version, Self::CLIENT_VERSION))
+        version_is_newer(&self.version, Self::BINARY_VERSION)
     }
 }
 
@@ -178,7 +176,7 @@ fn try_encode<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
 /// # Errors
 ///
 /// Returns an error if the line is not valid JSON for `T`.
-pub fn decode<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
+fn decode<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(line.trim())
 }
 
@@ -202,51 +200,44 @@ fn write_request(stream: &mut UnixStream, request: &HelperRequest) -> Result<(),
         .map_err(|e| HelperIpcError::new(format!("flush failed: {e}")))
 }
 
-fn read_line(stream: &mut UnixStream) -> Result<String, HelperIpcError> {
-    let mut reader = BufReader::new(stream).take(MAX_REQUEST_BYTES as u64 + 1);
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(|e| HelperIpcError::new(format!("read failed: {e}")))?;
-    if bytes == 0 {
-        return Err(HelperIpcError::new("missing request"));
-    }
-    if !line.ends_with('\n') {
-        return Err(HelperIpcError::new("request missing newline"));
-    }
-    if line.len() > MAX_REQUEST_BYTES {
-        return Err(HelperIpcError::new("request too large"));
-    }
-    Ok(line)
-}
-
-fn read_response_line(stream: &mut UnixStream) -> Result<HelperResponse, HelperIpcError> {
-    let line = read_line(stream)?;
-    decode(&line).map_err(|e| HelperIpcError::new(format!("invalid response: {e}")))
-}
-
-/// Read one newline-framed line, enforcing `deadline` across the whole read:
-/// the read timeout is shrunk to the time remaining before every recv, so a
-/// writer feeding one byte per timeout window hits the deadline instead of
-/// resetting a fresh `SO_RCVTIMEO` window with each byte. Server-side only —
-/// clients talk to a helper that answers in one write, so [`read_line`]'s
-/// per-recv timeout suffices there.
-fn read_line_with_deadline(
+/// Read one newline-framed line of at most [`MAX_REQUEST_BYTES`] (counting the
+/// newline). The one framing implementation for both sides of the socket:
+///
+/// * With a `deadline`, it is enforced across the whole read — the read
+///   timeout is shrunk to the time remaining before every recv, so a writer
+///   feeding one byte per timeout window hits the deadline instead of
+///   resetting a fresh `SO_RCVTIMEO` window with each byte (the server).
+/// * Without one, the socket's existing per-recv timeout is the only clock —
+///   clients talk to a helper that answers in one write, so the 5 s
+///   `SO_RCVTIMEO` from `configure_rpc_timeouts` suffices and is left alone.
+///
+/// The newline is only honored within the first `MAX_REQUEST_BYTES + 1` bytes,
+/// so which error an oversized line gets ("too large" when its newline sits at
+/// the cap, "missing newline" when it sits beyond) never depends on chunk
+/// arrival timing.
+fn read_framed_line(
     stream: &mut UnixStream,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<String, HelperIpcError> {
     const PER_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(HelperIpcError::new("connection deadline exceeded"));
+        let mut deadline_shrunk = false;
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(HelperIpcError::with_kind(
+                    HelperIpcErrorKind::DeadlineExceeded,
+                    "connection deadline exceeded",
+                ));
+            }
+            let timeout = remaining.min(PER_RECV_TIMEOUT);
+            deadline_shrunk = timeout < PER_RECV_TIMEOUT;
+            stream
+                .set_read_timeout(Some(timeout))
+                .map_err(|e| HelperIpcError::new(format!("set timeout: {e}")))?;
         }
-        let timeout = remaining.min(PER_RECV_TIMEOUT);
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| HelperIpcError::new(format!("set timeout: {e}")))?;
         let mut chunk = [0u8; 1024];
         let bytes = match stream.read(&mut chunk) {
             Ok(bytes) => bytes,
@@ -258,8 +249,11 @@ fn read_line_with_deadline(
             {
                 // A recv that timed out on a window shrunk below the per-recv
                 // timeout ran out of *deadline*, not of client patience.
-                if timeout < PER_RECV_TIMEOUT {
-                    return Err(HelperIpcError::new("connection deadline exceeded"));
+                if deadline_shrunk {
+                    return Err(HelperIpcError::with_kind(
+                        HelperIpcErrorKind::DeadlineExceeded,
+                        "connection deadline exceeded",
+                    ));
                 }
                 return Err(HelperIpcError::new(format!("read failed: {e}")));
             }
@@ -267,29 +261,50 @@ fn read_line_with_deadline(
         };
         if bytes == 0 {
             if buf.is_empty() {
-                return Err(HelperIpcError::new("missing request"));
+                return Err(HelperIpcError::with_kind(
+                    HelperIpcErrorKind::EmptyRequest,
+                    "missing request",
+                ));
             }
-            return Err(HelperIpcError::new("request missing newline"));
+            return Err(HelperIpcError::with_kind(
+                HelperIpcErrorKind::MissingNewline,
+                "request missing newline",
+            ));
         }
         buf.extend_from_slice(&chunk[..bytes]);
-        if let Some(newline) = buf.iter().position(|&b| b == b'\n') {
+        if let Some(newline) = buf
+            .iter()
+            .take(MAX_REQUEST_BYTES + 1)
+            .position(|&b| b == b'\n')
+        {
             if newline + 1 > MAX_REQUEST_BYTES {
-                return Err(HelperIpcError::new("request too large"));
+                return Err(HelperIpcError::with_kind(
+                    HelperIpcErrorKind::RequestTooLarge,
+                    "request too large",
+                ));
             }
             return String::from_utf8(buf[..=newline].to_vec())
                 .map_err(|e| HelperIpcError::new(format!("read failed: {e}")));
         }
         if buf.len() > MAX_REQUEST_BYTES {
-            return Err(HelperIpcError::new("request missing newline"));
+            return Err(HelperIpcError::with_kind(
+                HelperIpcErrorKind::MissingNewline,
+                "request missing newline",
+            ));
         }
     }
+}
+
+fn read_response_line(stream: &mut UnixStream) -> Result<HelperResponse, HelperIpcError> {
+    let line = read_framed_line(stream, None)?;
+    decode(&line).map_err(|e| HelperIpcError::new(format!("invalid response: {e}")))
 }
 
 fn read_request_line(
     stream: &mut UnixStream,
     deadline: Instant,
 ) -> Result<HelperRequest, HelperIpcError> {
-    let line = read_line_with_deadline(stream, deadline)?;
+    let line = read_framed_line(stream, Some(deadline))?;
     decode(&line).map_err(|e| HelperIpcError::new(format!("invalid request: {e}")))
 }
 
@@ -319,6 +334,15 @@ impl HelperClient {
         }
     }
 
+    /// A client for a non-default socket path, so tests can point probes at a
+    /// scripted listener instead of the real helper.
+    #[cfg(test)]
+    pub(crate) fn with_socket_path(path: &str) -> Self {
+        Self {
+            socket_path: path.to_string(),
+        }
+    }
+
     fn try_connect(&self) -> Result<UnixStream, HelperIpcError> {
         UnixStream::connect(&self.socket_path).map_err(HelperIpcError::connect)
     }
@@ -335,22 +359,6 @@ impl HelperClient {
     pub fn status(&self) -> Result<HelperStatus, HelperIpcError> {
         rpc(&self.socket_path, &HelperRequest::Status)?.into_status()
     }
-}
-
-#[must_use]
-pub fn is_connect_error(message: &str) -> bool {
-    message.starts_with("connect failed:")
-}
-
-/// True for helper errors that mean the peer is not allowed to take
-/// entirely-mode holds (an actual policy denial).
-///
-/// Distinct from the helper being unreachable or failing internally (e.g. a
-/// failed peer-credential read, which uses the `internal error:` prefix).
-/// Matches the prefix used by [`crate::entirely::authz::denial_message`].
-#[must_use]
-pub fn is_authorization_error(message: &str) -> bool {
-    message.starts_with("not authorized")
 }
 
 /// Process-wide count of live helper holds. The helper keys holds by process
@@ -641,6 +649,16 @@ fn serve_connection_inner(
 
     let request = match read_request_line(&mut stream, deadline) {
         Ok(req) => req,
+        // A peer that connected and closed without sending a byte is a
+        // liveness probe (`HelperClient::is_available`), fired at every tray
+        // startup, manual Entirely enable, and watcher toggle — not a failure.
+        // Answering the closed socket would die with a broken pipe that the
+        // accept loop then logs as a warning, filling the audit-carrying log
+        // with false alarms during routine use. Stay quiet instead.
+        Err(e) if e.kind() == HelperIpcErrorKind::EmptyRequest => {
+            tracing::debug!("peer closed without a request (liveness probe)");
+            return Ok(());
+        }
         Err(e) => {
             return write_response(
                 &mut stream,
@@ -732,7 +750,7 @@ fn serve_connection_inner(
             Ok(status) => HelperResponse::Status {
                 holders: status.holders,
                 sleep_disabled: status.sleep_disabled,
-                version: Some(HelperStatus::CLIENT_VERSION.to_string()),
+                version: HelperStatus::BINARY_VERSION.to_string(),
             },
             Err(e) => HelperResponse::Error {
                 message: e.to_string(),
@@ -765,29 +783,47 @@ fn serve_connection_inner(
             // successfully (new epoch), the stale rollback must not release that
             // newer, guarded hold. Audit the true fate so the trail never shows
             // a durable hold that was actually undone.
-            (Err(_), Some(hold_epoch)) => match coordinator.release_if_hold_epoch(peer, hold_epoch)
-            {
-                Ok(true) => audit_log(
-                    "hold-rollback",
-                    uid,
-                    Some(peer.pid),
-                    Err("response write failed; hold rolled back"),
-                ),
-                Ok(false) => audit_log(
-                    "hold-rollback",
-                    uid,
-                    Some(peer.pid),
-                    Err("response write failed; rollback skipped: a newer hold superseded it"),
-                ),
-                Err(e) => audit_log(
-                    "hold-rollback",
-                    uid,
-                    Some(peer.pid),
-                    Err(&format!(
-                        "response write failed and hold rollback also failed: {e}"
-                    )),
-                ),
-            },
+            //
+            // The rollback is retried once (idempotent under the epoch check):
+            // if it stays failed, the stranded entry keeps the reaper
+            // re-disabling sleep for as long as the peer lives, while the peer
+            // was told its hold failed — the one outcome that must never pass
+            // silently, hence the error-level log naming the entry.
+            (Err(_), Some(hold_epoch)) => {
+                match coordinator
+                    .release_if_hold_epoch(peer, hold_epoch)
+                    .or_else(|_| coordinator.release_if_hold_epoch(peer, hold_epoch))
+                {
+                    Ok(true) => audit_log(
+                        "hold-rollback",
+                        uid,
+                        Some(peer.pid),
+                        Err("response write failed; hold rolled back"),
+                    ),
+                    Ok(false) => audit_log(
+                        "hold-rollback",
+                        uid,
+                        Some(peer.pid),
+                        Err("response write failed; rollback skipped: a newer hold superseded it"),
+                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            "could not roll back the unacknowledged hold for pid {}: {e}; its \
+                             lockfile entry keeps sleep disabled until that process exits or \
+                             the entry is released",
+                            peer.pid
+                        );
+                        audit_log(
+                            "hold-rollback",
+                            uid,
+                            Some(peer.pid),
+                            Err(&format!(
+                                "response write failed and hold rollback also failed: {e}"
+                            )),
+                        );
+                    }
+                }
+            }
         }
     }
     write_result
@@ -956,7 +992,7 @@ mod tests {
             ];
             for response in script {
                 let (mut stream, _) = listener.accept().unwrap();
-                let line = read_line(&mut stream).unwrap();
+                let line = read_framed_line(&mut stream, None).unwrap();
                 requests_server
                     .lock()
                     .unwrap()
@@ -1038,7 +1074,7 @@ mod tests {
         let Err(error) = HelperHoldGuard::try_acquire(&client) else {
             panic!("hold should have been denied");
         };
-        assert!(is_authorization_error(&error.to_string()), "{error}");
+        assert_eq!(error.kind(), HelperIpcErrorKind::NotAuthorized, "{error}");
         // The denied hold must not have registered anything.
         let status = client.status().unwrap();
         assert_eq!((status.holders, status.sleep_disabled), (0, false));
@@ -1096,8 +1132,8 @@ mod tests {
         });
 
         assert_eq!(
-            read_line(&mut right).unwrap_err().message(),
-            "request missing newline"
+            read_framed_line(&mut right, None).unwrap_err().kind(),
+            HelperIpcErrorKind::MissingNewline
         );
         writer.join().unwrap();
     }
@@ -1116,10 +1152,34 @@ mod tests {
         });
 
         assert_eq!(
-            read_line(&mut right).unwrap_err().message(),
-            "request too large"
+            read_framed_line(&mut right, None).unwrap_err().kind(),
+            HelperIpcErrorKind::RequestTooLarge
         );
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn bare_probe_disconnect_is_served_quietly() {
+        // `is_available` probes connect and close without sending a byte. The
+        // server must not answer one (the write would break-pipe, and the
+        // accept loop logs any serve error as a "connection error" warning) —
+        // the quiet path returns Ok and writes nothing.
+        let (mut left, right) = UnixStream::pair().unwrap();
+        left.shutdown(std::net::Shutdown::Write).unwrap();
+        let disabler: SleepDisabler = Arc::new(|_state, _verbose| Ok(()));
+        let coordinator = Arc::new(EntirelyCoordinator::with_options(
+            false,
+            std::env::temp_dir().join(format!(
+                "caffeinate2-quiet-probe-{}.lock",
+                std::process::id()
+            )),
+            disabler,
+            Arc::new(process_util::default_process_checker),
+        ));
+        serve_connection_inner(right, &coordinator, &|_| Ok(()), &peer_process_id).unwrap();
+        let mut reply = String::new();
+        left.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "", "a probe disconnect must not be answered");
     }
 
     #[test]
@@ -1140,10 +1200,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_millis(200);
         assert_eq!(
-            read_line_with_deadline(&mut right, deadline)
+            read_framed_line(&mut right, Some(deadline))
                 .unwrap_err()
-                .message(),
-            "connection deadline exceeded"
+                .kind(),
+            HelperIpcErrorKind::DeadlineExceeded
         );
         drop(right);
         writer.join().unwrap();
@@ -1155,21 +1215,34 @@ mod tests {
         left.write_all(b"{\"op\":\"status\"}\n").unwrap();
 
         let line =
-            read_line_with_deadline(&mut right, Instant::now() + Duration::from_secs(5)).unwrap();
+            read_framed_line(&mut right, Some(Instant::now() + Duration::from_secs(5))).unwrap();
         assert_eq!(
             decode::<HelperRequest>(&line).unwrap(),
             HelperRequest::Status
         );
     }
 
+    /// Errors received over the wire carry only a message, so their kind is
+    /// classified from the stable message prefixes.
     #[test]
-    fn authorization_error_detection() {
-        assert!(is_authorization_error("not authorized: nope"));
-        assert!(!is_authorization_error("connect failed: nope"));
+    fn wire_errors_classify_by_prefix() {
+        assert_eq!(
+            HelperIpcError::new("not authorized: nope").kind(),
+            HelperIpcErrorKind::NotAuthorized
+        );
+        assert_eq!(
+            HelperIpcError::new("connect failed: nope").kind(),
+            HelperIpcErrorKind::Connect
+        );
         // A credential-read failure is an internal error, not a policy denial.
-        assert!(!is_authorization_error(
-            "internal error: could not verify peer credentials: x"
-        ));
+        assert_eq!(
+            HelperIpcError::new("internal error: could not verify peer credentials: x").kind(),
+            HelperIpcErrorKind::Internal
+        );
+        assert_eq!(
+            HelperIpcError::new("hold failed").kind(),
+            HelperIpcErrorKind::Other
+        );
     }
 
     #[test]
@@ -1189,54 +1262,35 @@ mod tests {
         let resp = HelperResponse::Status {
             holders: 2,
             sleep_disabled: true,
-            version: Some(HelperStatus::CLIENT_VERSION.to_string()),
+            version: HelperStatus::BINARY_VERSION.to_string(),
         };
         let decoded = decode::<HelperResponse>(&try_encode(&resp).unwrap()).unwrap();
         assert_eq!(decoded, resp);
     }
 
-    /// A pre-versioning helper's Status response (no `version` field) must
-    /// still parse — and read as stale, so upgraded clients surface the
-    /// reinstall hint instead of silently talking to the old daemon.
+    /// Every helper that ever shipped reports its version, so a Status
+    /// response without one is malformed — it must fail to decode rather than
+    /// pass as some special compatibility case.
     #[test]
-    fn legacy_status_without_version_parses_as_stale() {
-        let legacy = r#"{"kind":"status","holders":1,"sleep_disabled":true}"#;
-        let status = decode::<HelperResponse>(legacy)
-            .unwrap()
-            .into_status()
-            .unwrap();
-        assert_eq!(status.version, None);
-        assert!(status.is_stale());
-
-        let current = HelperResponse::Status {
-            holders: 1,
-            sleep_disabled: true,
-            version: Some(HelperStatus::CLIENT_VERSION.to_string()),
-        };
-        assert!(!current.into_status().unwrap().is_stale());
+    fn status_without_version_is_rejected() {
+        let versionless = r#"{"kind":"status","holders":1,"sleep_disabled":true}"#;
+        assert!(decode::<HelperResponse>(versionless).is_err());
     }
 
     /// `helper_is_newer` answers the direction question `is_stale` deliberately
     /// leaves open: only a parseable, strictly-newer helper version is true.
     #[test]
     fn helper_is_newer_is_direction_aware() {
-        let status = |version: Option<&str>| HelperStatus {
+        let status = |version: &str| HelperStatus {
             holders: 0,
             sleep_disabled: false,
-            version: version.map(str::to_string),
+            version: version.to_string(),
         };
 
-        assert!(status(Some("999.0.0")).helper_is_newer());
-        assert!(!status(Some(HelperStatus::CLIENT_VERSION)).helper_is_newer());
-        assert!(!status(Some("0.0.0")).helper_is_newer());
-        assert!(!status(None).helper_is_newer());
-        assert!(!status(Some("not.a.version")).helper_is_newer());
-    }
-
-    #[test]
-    fn connect_error_detection() {
-        assert!(is_connect_error("connect failed: No such file"));
-        assert!(!is_connect_error("hold failed"));
+        assert!(status("999.0.0").helper_is_newer());
+        assert!(!status(HelperStatus::BINARY_VERSION).helper_is_newer());
+        assert!(!status("0.0.0").helper_is_newer());
+        assert!(!status("not.a.version").helper_is_newer());
     }
 
     #[test]
@@ -1252,14 +1306,14 @@ mod tests {
         let resp = HelperResponse::Status {
             holders: 3,
             sleep_disabled: false,
-            version: None,
+            version: "0.9.0".to_string(),
         };
         assert_eq!(
             resp.into_status().unwrap(),
             HelperStatus {
                 holders: 3,
                 sleep_disabled: false,
-                version: None,
+                version: "0.9.0".to_string(),
             }
         );
     }

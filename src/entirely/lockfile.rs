@@ -26,8 +26,8 @@ const MAX_LOCKFILE_BYTES: u64 = 64 * 1024;
 /// machine with sleep disabled and no holders.
 ///
 /// It deliberately does not parse as a `ProcessId` (which requires a positive
-/// `pid:seconds:microseconds` triple), so older code that only understood
-/// holder lines simply ignored it.
+/// `pid:seconds:microseconds` triple), so it can never be mistaken for a
+/// holder entry.
 const DISABLE_MARKER: &str = "!disabled";
 
 /// Prefix of the sentinel line persisting the ownership *generation*: a counter
@@ -39,8 +39,7 @@ const DISABLE_MARKER: &str = "!disabled";
 /// in between, and clearing that would orphan the new disable. The counter is
 /// persisted independently of the marker so it never regresses while the
 /// lockfile exists: a stale observation can never match a recycled value. Like
-/// the marker, the line does not parse as a `ProcessId`, so older versions
-/// ignored it.
+/// the marker, the line does not parse as a `ProcessId`.
 const GENERATION_PREFIX: &str = "!generation:";
 
 /// The full parsed contents of the lockfile: the live holder set, whether
@@ -213,12 +212,22 @@ fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std:
     // that process lived. A power loss mid-writeback can persist any byte
     // subset, but every holder pid recorded before the loss is dead after
     // reboot and the next locked mutation prunes it.
-    let current_len = file.seek(SeekFrom::End(0))?;
+    // read_state has already capped the file at MAX_LOCKFILE_BYTES, so this
+    // re-read is bounded and the padded length fits in usize.
+    let mut current = Vec::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_end(&mut current)?;
     let mut bytes = content.into_bytes();
-    if (bytes.len() as u64) < current_len {
-        // read_state has already capped the file at MAX_LOCKFILE_BYTES, so the
-        // length fits in usize.
-        bytes.resize(current_len as usize, b'\n');
+    if bytes.len() < current.len() {
+        bytes.resize(current.len(), b'\n');
+    }
+    // Skip the rewrite (and its fsync) when the serialized snapshot already
+    // matches the file byte-for-byte — the common case for a Status RPC or an
+    // idle reconcile that pruned nothing. Compared against the raw bytes, not
+    // the parsed state, so a malformed or oddly-padded file is still
+    // normalized by a real write.
+    if bytes == current {
+        return Ok(());
     }
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&bytes)?;
@@ -463,12 +472,6 @@ pub(crate) fn clear_owns_disable_if_current(
 pub(crate) struct PruneOutcome {
     /// Live holders remaining after pruning dead/malformed entries.
     pub live: usize,
-    /// Whether the lockfile contained any parseable holders before pruning.
-    /// A legacy fallback (for lockfiles written before the ownership marker
-    /// existed) distinguishing "we just pruned dead holders to zero" from "the
-    /// lockfile was already empty". The `owns_disable` marker supersedes it for
-    /// any lockfile this version wrote.
-    pub had_entries: bool,
     /// Whether caffeinate2 owns the current sleep disable (the durable marker).
     pub owns_disable: bool,
     /// Ownership generation observed by this prune; a re-enable decided from
@@ -477,8 +480,7 @@ pub(crate) struct PruneOutcome {
 }
 
 /// Prune stale lockfile entries under an exclusive lock and report the live
-/// holder count, whether the file had any holders beforehand, and whether
-/// caffeinate2 owns the current sleep disable.
+/// holder count and whether caffeinate2 owns the current sleep disable.
 ///
 /// Modeled by `tests/protocol_model.rs` as the atomic prune+decide start of
 /// `StartReconcile`/`StartStartup` (and `CrossAction::Reconcile`/`Status`);
@@ -491,7 +493,6 @@ pub(crate) fn prune_lockfile(
 ) -> Result<PruneOutcome, std::io::Error> {
     let mut file = open_validated_lockfile(path)?;
     let mut state = read_state(&mut file)?;
-    let had_entries = !state.holders.is_empty();
     prune_stale_holders(&mut state.holders, verbose, process_checker, None);
     let live = state.holders.len();
     let owns_disable = state.owns_disable;
@@ -499,7 +500,6 @@ pub(crate) fn prune_lockfile(
     write_state(&mut file, &state)?;
     Ok(PruneOutcome {
         live,
-        had_entries,
         owns_disable,
         disable_generation,
     })
@@ -819,8 +819,8 @@ mod tests {
     #[test]
     fn release_pruning_to_empty_without_marker_does_not_toggle() {
         // Same prune-to-empty, but no ownership marker: this models a manual
-        // `pmset disablesleep` (or a legacy/foreign entry) that caffeinate2 does
-        // not own, so it must not re-enable sleep.
+        // `pmset disablesleep` (or a foreign entry) that caffeinate2 does not
+        // own, so it must not re-enable sleep.
         let lock_path = temp_lock_path();
         let dead_holder = proc(200, 456);
         let unrelated = proc(100, 123);
