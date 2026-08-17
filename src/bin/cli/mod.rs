@@ -58,6 +58,7 @@ pub struct Args {
     /// Drop root privileges in command.
     /// You need root to disable sleep entirely,
     /// but some programs don't want to run as root.
+    /// Also sets HOME, USER, LOGNAME, and SHELL to the target user's.
     #[arg(long)]
     pub drop_root: bool,
 
@@ -97,7 +98,9 @@ pub struct Args {
     #[arg(short, long, name = "DURATION")]
     pub timeout: Option<String>,
 
-    /// Wait for program with PID X to complete and pass its exit code.
+    /// Wait for program with PID X to complete and pass its exit code
+    /// (another user's process can be waited on, but its exit code
+    /// is unreadable; caffeinate2 then exits 0).
     #[arg(short, long, name = "PID", value_parser = parse_positive_pid)]
     pub waitfor: Option<i32>,
 

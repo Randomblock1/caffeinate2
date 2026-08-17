@@ -29,7 +29,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(target_os = "macos")]
 use std::process;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
@@ -49,23 +49,69 @@ fn release_active_and_exit(active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>
     process::exit(code);
 }
 
+/// Shared state coordinating the command spawner with the signal thread, so a
+/// signal can never orphan a command mid-launch. The handshake: the spawner
+/// holds `gate` across store(SPAWN_IN_FLIGHT) → spawn() → store(real pid or
+/// 0), and refuses to spawn at all once `shutting_down` is set; the signal
+/// thread sets that flag first and then acquires the gate (bounded try_lock),
+/// so the pid it reads is settled — never mid-spawn. Residual window,
+/// accepted: if spawn() itself hangs past the signal thread's 100 ms bound,
+/// the pid still reads as SPAWN_IN_FLIGHT and no SIGTERM is forwarded.
+#[cfg(target_os = "macos")]
+struct SpawnSync {
+    child_pid: AtomicI32,
+    gate: Mutex<()>,
+    shutting_down: AtomicBool,
+}
+
+#[cfg(target_os = "macos")]
+impl SpawnSync {
+    /// `child_pid` value marking a `spawn()` in flight.
+    const SPAWN_IN_FLIGHT: i32 = -1;
+
+    fn new() -> Self {
+        Self {
+            child_pid: AtomicI32::new(0),
+            gate: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Credentials to apply to a spawned command. `groups` is `Some` only when
 /// `--drop-root` is in effect: the child's supplementary group list must be
 /// reset to the target user's own groups so it doesn't inherit root's (e.g.
 /// `wheel`, `admin`). `None` means leave the inherited group list alone.
+/// `login` (also `--drop-root`-only) is the target user's passwd identity,
+/// used to reset the child's login environment.
 #[cfg(target_os = "macos")]
 struct CommandCredentials {
     uid: u32,
     gid: u32,
     groups: Option<Vec<u32>>,
+    login: Option<authz::User>,
 }
 
+/// Resolve the credentials for the wrapped command. Runs in `main` before any
+/// sleep prevention is enabled, so every error path here can plain-exit.
 #[cfg(target_os = "macos")]
-fn command_credentials(
-    args: &Args,
-    active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
-) -> CommandCredentials {
+fn command_credentials(args: &Args) -> CommandCredentials {
     if args.drop_root {
+        // Nothing to drop when not root: `setgroups` is root-only on macOS
+        // (setuid/setgid to one's own ids would succeed), so the pre_exec
+        // hook made every non-root --drop-root run die at its first call with
+        // EPERM before the command started — and running without sudo is the
+        // natural invocation now that the helper removes the need for it.
+        // Warn and run with the credentials already in force.
+        if !unistd::geteuid().is_root() {
+            eprintln!("Warning: --drop-root: not running as root, nothing to drop");
+            return CommandCredentials {
+                uid: unistd::getuid().into(),
+                gid: unistd::getgid().into(),
+                groups: None,
+                login: None,
+            };
+        }
         let sudo_uid = std::env::var("SUDO_UID").ok();
         let sudo_gid = std::env::var("SUDO_GID").ok();
         // sudo always exports SUDO_UID and SUDO_GID together. Exactly one being
@@ -76,7 +122,7 @@ fn command_credentials(
             eprintln!(
                 "Error: --drop-root requires SUDO_UID and SUDO_GID to be set together; only one is present"
             );
-            release_active_and_exit(active, 1);
+            process::exit(1);
         }
         let uid_str = sudo_uid
             .clone()
@@ -86,11 +132,11 @@ fn command_credentials(
             .unwrap_or_else(|| unistd::getgid().to_string());
         let Ok(uid) = uid_str.parse::<u32>() else {
             eprintln!("Error: invalid SUDO_UID: {uid_str}");
-            release_active_and_exit(active, 1);
+            process::exit(1);
         };
         let Ok(gid) = gid_str.parse::<u32>() else {
             eprintln!("Error: invalid SUDO_GID: {gid_str}");
-            release_active_and_exit(active, 1);
+            process::exit(1);
         };
         // With neither SUDO_UID nor SUDO_GID set we fell back to the current
         // ids; if those are root, --drop-root would silently run the command as
@@ -100,7 +146,7 @@ fn command_credentials(
             eprintln!(
                 "Error: --drop-root requires running via sudo; SUDO_UID/SUDO_GID are unset and the process is root, so privileges cannot be dropped"
             );
-            release_active_and_exit(active, 1);
+            process::exit(1);
         }
         // Resolve via SUDO_USER when present; otherwise fall back to just the
         // primary group so the child still sheds root's supplementary groups.
@@ -108,16 +154,31 @@ fn command_credentials(
             .ok()
             .and_then(|user| authz::group_ids_for_user(&user, gid))
             .unwrap_or_else(|| vec![gid]);
+        let groups = cap_groups_for_setgroups(groups, gid);
+        // The child's environment must match the identity it runs as: sudo
+        // resets USER, LOGNAME, and SHELL to root's, and HOME too under
+        // `sudo -H`/`sudo -i` or a sudoers without HOME in env_keep — so
+        // anything reading per-user config (git, ssh, cargo, ...) silently
+        // misbehaves without this. SUDO_* and PATH are deliberately left
+        // alone, matching sudo itself.
+        let login = authz::user_for_uid(uid);
+        if login.is_none() {
+            eprintln!(
+                "Warning: no passwd entry for uid {uid}; the command keeps the current HOME/USER/LOGNAME/SHELL"
+            );
+        }
         CommandCredentials {
             uid,
             gid,
             groups: Some(groups),
+            login,
         }
     } else {
         CommandCredentials {
             uid: unistd::getuid().into(),
             gid: unistd::getgid().into(),
             groups: None,
+            login: None,
         }
     }
 }
@@ -126,21 +187,23 @@ fn command_credentials(
 fn run_command_mode(
     args: &Args,
     sleep_str: &str,
+    credentials: CommandCredentials,
     active: &Arc<Mutex<Option<sleep_mode::ActiveSession>>>,
-    child_pid: &Arc<AtomicI32>,
+    sync: &SpawnSync,
     exit_code: &Arc<AtomicI32>,
 ) {
+    // `WaitMode::Command` is produced only for a non-empty trailing command
+    // (see `wait_mode`), so presence and non-emptiness both hold here.
     let command = args.command.as_ref().expect("Command should be present");
-    if command.is_empty() {
-        eprintln!("Error: empty command");
-        release_active_and_exit(active, 2);
-    }
     println!("{sleep_str}until command finishes.");
 
-    let CommandCredentials { uid, gid, groups } = command_credentials(args, active);
-    if args.verbose {
-        println!("uid: {uid}, gid: {gid}");
-    }
+    let CommandCredentials {
+        uid,
+        gid,
+        groups,
+        login,
+    } = credentials;
+    tracing::debug!("uid: {uid}, gid: {gid}");
 
     let mut child_command = if args.shell {
         let mut child_command = process::Command::new("/bin/sh");
@@ -183,14 +246,65 @@ fn run_command_mode(
         }
     }
 
-    let mut child = match child_command.spawn() {
+    // --drop-root: point HOME/USER/LOGNAME/SHELL at the target user (see
+    // command_credentials; only these four — PATH, cwd, and umask are left
+    // alone). Empty fields mean the passwd record omitted them; an empty HOME
+    // would break more than an inherited one, so it is skipped, while an
+    // empty shell gets the POSIX default.
+    if let Some(user) = login {
+        if !user.home.is_empty() {
+            child_command.env("HOME", &user.home);
+        }
+        child_command.env("USER", &user.name);
+        child_command.env("LOGNAME", &user.name);
+        let shell = if user.shell.is_empty() {
+            "/bin/sh"
+        } else {
+            user.shell.as_str()
+        };
+        child_command.env("SHELL", shell);
+    }
+
+    let spawned = {
+        let _gate = sync
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The signal thread sets the flag before taking this gate: seen here,
+        // the process is already tearing down its hold, and a command started
+        // now would be orphaned the instant it exits. Park instead — the
+        // signal thread owns the exit.
+        if sync.shutting_down.load(Ordering::Relaxed) {
+            drop(_gate);
+            loop {
+                thread::park();
+            }
+        }
+        sync.child_pid
+            .store(SpawnSync::SPAWN_IN_FLIGHT, Ordering::Relaxed);
+        let spawned = child_command.spawn();
+        sync.child_pid.store(
+            spawned.as_ref().map_or(0, |child| child.id().cast_signed()),
+            Ordering::Relaxed,
+        );
+        spawned
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Error: failed to execute command: {e}");
-            release_active_and_exit(active, 127);
+            // 127 is the shell's "command not found"; everything else (a
+            // pre_exec privilege failure, a permission error) is "found but
+            // cannot execute" (126) — don't mislabel those as a missing
+            // program.
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            release_active_and_exit(active, code);
         }
     };
-    child_pid.store(child.id().cast_signed(), Ordering::Relaxed);
 
     let status = match child.wait() {
         Ok(status) => status,
@@ -206,7 +320,7 @@ fn run_command_mode(
     // it — the window is microscopic, the signal handler only forwards a
     // terminating signal the user is already sending, and it is the same
     // PID-reuse limitation that `-w` carries (see `wait_for_pid`).
-    child_pid.store(0, Ordering::Relaxed);
+    sync.child_pid.store(0, Ordering::Relaxed);
     // Match the -w decoding: report signal deaths as 128 + signal number
     // instead of masking them as success.
     let code = status
@@ -214,6 +328,35 @@ fn run_command_mode(
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(0);
     exit_code.store(code, Ordering::Relaxed);
+}
+
+/// Cap a supplementary group list for `setgroups`, keeping the primary gid
+/// first.
+///
+/// The kernel rejects `setgroups` with more than `NGROUPS_MAX` (16) entries
+/// outright (EINVAL) — and `getgrouplist` follows directory-services
+/// membership, so a stock admin account resolves to 16 groups before the
+/// `caffeinate2` grant group pushes it to 17. Truncating matches what
+/// `initgroups` does for every real login session; membership beyond the
+/// kernel list is still honored through the directory service, so the dropped
+/// tail only affects the rare syscall reading the process group list directly.
+/// The primary gid leads because it must survive the cut: it determines the
+/// group ownership of files the child creates.
+#[cfg(target_os = "macos")]
+fn cap_groups_for_setgroups(groups: Vec<u32>, primary_gid: u32) -> Vec<u32> {
+    let mut capped = Vec::with_capacity(groups.len() + 1);
+    capped.push(primary_gid);
+    capped.extend(groups.into_iter().filter(|&gid| gid != primary_gid));
+    capped.truncate(ngroups_max());
+    capped
+}
+
+/// The kernel's `NGROUPS_MAX` (16 on macOS), from sysconf; libc exports no
+/// constant for it on Apple targets.
+#[cfg(target_os = "macos")]
+fn ngroups_max() -> usize {
+    // SAFETY: sysconf with a valid name constant has no other preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) }).unwrap_or(16)
 }
 
 /// Timeout to hand [`wait_for_pid`] when `-w` is combined with `-t`.
@@ -246,13 +389,11 @@ fn run_timed_wait_mode(
     let waitfor = args.waitfor.is_some();
     if timeout {
         duration = parsed_timeout.copied().expect("Timeout should be present");
-        if duration <= jiff::SignedDuration::ZERO {
-            eprintln!("Error: timeout must be positive");
-            release_active_and_exit(active, 1);
-        }
-        // main() rejects timeouts that overflow the timestamp range before
-        // any sleep prevention is enabled; saturate rather than fail (an
-        // unwind here would skip the release of an active hold).
+        // main() rejects non-positive timeouts and timeouts that overflow the
+        // timestamp range before any sleep prevention is enabled, so this add
+        // cannot fail in practice; the fallback leaves `end_time` at "now" —
+        // a zero wait — rather than unwinding with an active hold. (Not a
+        // saturating wait: jiff refuses, it doesn't clamp.)
         if let Ok(next) = end_time.checked_add(duration) {
             end_time = next;
         }
@@ -266,7 +407,7 @@ fn run_timed_wait_mode(
     print!("{sleep_str}");
 
     // With `-t` set the "for <duration>" prefix is always present (a
-    // non-positive timeout is rejected above), so the " or " separator is
+    // non-positive timeout is rejected in main()), so the " or " separator is
     // needed exactly when a timeout and a PID are both awaited.
     if timeout && waitfor {
         print!(" or ");
@@ -288,14 +429,23 @@ fn run_timed_wait_mode(
                 end_time.strftime(SHORT_TIME_FMT)
             }
         );
-        let std_duration = match std::time::Duration::try_from(duration) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("Error: timeout is too large");
-                release_active_and_exit(active, 1);
+        // The printed resume time is wall-clock, but nanosleep (thread::sleep)
+        // does not advance while the system sleeps — one long sleep would
+        // overshoot the promise by however long the machine slept mid-window.
+        // Re-arm against the absolute end time in bounded chunks instead: a
+        // chunk suspended by system sleep costs at most one chunk of overshoot
+        // before the loop re-reads the clock. `TryFrom<SignedDuration>` fails
+        // only for negative durations (the remaining time is checked positive
+        // first), so the conversion is infallible here.
+        const RESUME_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+        loop {
+            let remaining = jiff::Zoned::now().duration_until(&end_time);
+            if remaining <= jiff::SignedDuration::ZERO {
+                break;
             }
-        };
-        thread::sleep(std_duration);
+            let remaining = std::time::Duration::try_from(remaining).unwrap_or_default();
+            thread::sleep(remaining.min(RESUME_RECHECK));
+        }
     }
 
     if !waitfor {
@@ -303,18 +453,18 @@ fn run_timed_wait_mode(
     }
 
     let pid = args.waitfor.expect("PID should be present");
-    let timeout_duration = match waitfor_timeout(timeout, duration) {
-        Some(d) => match std::time::Duration::try_from(d) {
-            Ok(d) => Some(d),
-            Err(_) => {
-                eprintln!("Error: timeout is too large");
-                release_active_and_exit(active, 1);
-            }
-        },
-        None => None,
-    };
+    // Infallible for the positive duration main() guaranteed; a failure would
+    // degrade to a zero wait (an instant "Timeout reached"), not an unwind.
+    //
+    // Time-base caveat: this hands a *relative* timeout to kevent, which (like
+    // nanosleep) does not advance across system sleep — so `-t X -w PID`
+    // bounds awake time, while `-t X` alone honors the wall clock above.
+    // Nothing printed for the combined mode promises a wall-clock deadline,
+    // so the difference is deliberate rather than corrected here.
+    let timeout_duration = waitfor_timeout(timeout, duration)
+        .map(|d| std::time::Duration::try_from(d).unwrap_or_default());
 
-    match wait_for_pid(pid, timeout_duration, args.verbose) {
+    match wait_for_pid(pid, timeout_duration) {
         Ok(WaitForPidResult::Exited(pid_exit_code)) => {
             exit_code.store(pid_exit_code, Ordering::Relaxed);
 
@@ -323,22 +473,34 @@ fn run_timed_wait_mode(
             print!("{} ", now.strftime(SHORT_TIME_FMT));
             println!("with exit code {}", exit_code.load(Ordering::Relaxed));
         }
+        Ok(WaitForPidResult::ExitedStatusUnknown) => {
+            // Exit code stays 0: the status of another user's process cannot
+            // be read (see `wait_for_pid`), and inventing a failure code for
+            // an exit we know nothing about would be worse.
+            print!("PID {pid} finished ");
+            let now = jiff::Zoned::now();
+            print!("{} ", now.strftime(SHORT_TIME_FMT));
+            println!("(exit code unavailable for another user's process).");
+        }
         Ok(WaitForPidResult::TimedOut) => {
             if timeout {
                 let now = jiff::Zoned::now();
                 println!("Timeout reached {}.", now.strftime(SHORT_TIME_FMT));
             }
         }
-        Err(WaitForPidError::InvalidPid) => {
-            eprintln!("Error: invalid PID {pid}; expected a positive process ID");
-            release_active_and_exit(active, 1);
-        }
-        Err(WaitForPidError::NotFound) => {
-            eprintln!("Error: PID {pid} not found");
-            release_active_and_exit(active, 1);
-        }
-        Err(WaitForPidError::Kevent(e)) => {
-            eprintln!("kevent error waiting for PID {pid}: {e}");
+        Err(error) => {
+            match error {
+                // Unreachable from the CLI: clap's `parse_positive_pid`
+                // rejects non-positive PIDs. `wait_for_pid` keeps the guard
+                // for its direct callers.
+                WaitForPidError::InvalidPid => {
+                    eprintln!("Error: invalid PID {pid}; expected a positive process ID");
+                }
+                WaitForPidError::NotFound => eprintln!("Error: PID {pid} not found"),
+                WaitForPidError::Kevent(e) => {
+                    eprintln!("kevent error waiting for PID {pid}: {e}");
+                }
+            }
             release_active_and_exit(active, 1);
         }
     }
@@ -389,17 +551,17 @@ fn run_maintenance(command: MaintenanceCommand) {
                         };
                         println!(
                             "Helper version: {} (this binary is {}; {advice})",
-                            status.version.as_deref().unwrap_or("pre-0.8.0"),
-                            helper_ipc::HelperStatus::CLIENT_VERSION
+                            status.version,
+                            helper_ipc::HelperStatus::BINARY_VERSION
                         );
                     } else {
                         println!(
                             "Helper version: {}",
-                            helper_ipc::HelperStatus::CLIENT_VERSION
+                            helper_ipc::HelperStatus::BINARY_VERSION
                         );
                     }
                 }
-                Err(e) if helper_ipc::is_connect_error(&e.to_string()) => {
+                Err(e) if e.kind() == caffeinate2::entirely::error::HelperIpcErrorKind::Connect => {
                     println!(
                         "Helper: not running (install with: sudo caffeinate2 --install-helper)"
                     );
@@ -470,28 +632,20 @@ fn main() {
         process::exit(2);
     }
 
-    if args
-        .command
-        .as_ref()
-        .is_some_and(|command| !command.is_empty())
-        && (args.timeout.is_some() || args.waitfor.is_some())
-    {
+    let mode = wait_mode(&args);
+    if matches!(mode, WaitMode::Command) && (args.timeout.is_some() || args.waitfor.is_some()) {
         eprintln!("Warning: trailing command takes priority over --timeout and --waitfor");
     }
 
     let mut sleep_modes = args.sleep_modes();
     sleep_modes.apply_defaults();
 
-    if args.verbose {
-        println!("DEBUG {args:#?}");
-    }
+    tracing::debug!("{args:#?}");
 
     let mut sleep_str = format!(
         "Preventing sleep types: [{}] ",
         sleep_modes.selected_labels().join(", ")
     );
-
-    let mode = wait_mode(&args);
 
     // Parse the timeout before enabling any sleep prevention: a bad -t value
     // must not toggle the system sleep setting and then exit without
@@ -536,6 +690,11 @@ fn main() {
         process::exit(1);
     }
 
+    // Resolve --drop-root credentials under the same rule as the timeout
+    // validation above: a tampered SUDO_UID/SUDO_GID must error out before any
+    // sleep prevention is enabled, not after.
+    let credentials = matches!(mode, WaitMode::Command).then(|| command_credentials(&args));
+
     let active = match sleep_modes.enable_all(args.verbose, args.dry_run) {
         Ok(active) => active,
         Err(e) => {
@@ -555,8 +714,8 @@ fn main() {
     let active = Arc::new(Mutex::new(Some(active)));
     let active_signal = active.clone();
     let exit_code = Arc::new(AtomicI32::new(0));
-    let child_pid = Arc::new(AtomicI32::new(0));
-    let child_pid_signal = Arc::clone(&child_pid);
+    let spawn_sync = Arc::new(SpawnSync::new());
+    let spawn_sync_signal = Arc::clone(&spawn_sync);
 
     // Also catch SIGTERM/SIGHUP (kill, logout): exiting without releasing an
     // entirely-mode hold would leave system sleep disabled until the helper
@@ -566,7 +725,23 @@ fn main() {
     thread::spawn(move || {
         if let Some(signal) = signals.forever().next() {
             println!("\nStopping...");
-            let pid = child_pid_signal.load(Ordering::Relaxed);
+            // Refuse future spawns first, then serialize with any spawn in
+            // flight (see SpawnSync): once the gate is acquired the pid is
+            // settled — real, or 0 — never mid-spawn. The try_lock bound
+            // keeps shutdown prompt if spawn() itself hangs; in that one case
+            // the pid may still read as SPAWN_IN_FLIGHT and no kill is sent.
+            spawn_sync_signal
+                .shutting_down
+                .store(true, Ordering::Relaxed);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            let pid = loop {
+                if spawn_sync_signal.gate.try_lock().is_ok()
+                    || std::time::Instant::now() >= deadline
+                {
+                    break spawn_sync_signal.child_pid.load(Ordering::Relaxed);
+                }
+                thread::sleep(std::time::Duration::from_millis(5));
+            };
             if pid > 0 {
                 let _ = kill(unistd::Pid::from_raw(pid), Signal::SIGTERM);
             }
@@ -579,7 +754,17 @@ fn main() {
     });
 
     match mode {
-        WaitMode::Command => run_command_mode(&args, &sleep_str, &active, &child_pid, &exit_code),
+        WaitMode::Command => {
+            let credentials = credentials.expect("resolved above for Command mode");
+            run_command_mode(
+                &args,
+                &sleep_str,
+                credentials,
+                &active,
+                &spawn_sync,
+                &exit_code,
+            );
+        }
         WaitMode::Timeout | WaitMode::Pid | WaitMode::TimeoutOrPid => {
             run_timed_wait_mode(
                 &args,
@@ -738,6 +923,30 @@ mod tests {
         }
         let active = sleep_modes.enable_all(false, true).unwrap();
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn setgroups_cap_keeps_primary_first_and_at_most_ngroups_max() {
+        use crate::cap_groups_for_setgroups;
+        let max = crate::ngroups_max();
+        assert_eq!(max, 16, "macOS pins NGROUPS_MAX at 16");
+
+        // More groups than the kernel accepts, primary buried in the middle:
+        // the cap leads with the primary, dedupes it, and cuts at the limit.
+        let many: Vec<u32> = (1..=24).collect();
+        let capped = cap_groups_for_setgroups(many.clone(), 12);
+        assert_eq!(capped.len(), max);
+        assert_eq!(capped[0], 12);
+        assert_eq!(capped.iter().filter(|&&gid| gid == 12).count(), 1);
+        assert!(capped.iter().all(|gid| many.contains(gid)));
+
+        // A primary missing from the resolved list is still prepended.
+        let capped = cap_groups_for_setgroups(vec![7, 8], 20);
+        assert_eq!(capped, vec![20, 7, 8]);
+
+        // A short list is passed through (reordered to primary-first only).
+        let capped = cap_groups_for_setgroups(vec![5, 20, 7], 20);
+        assert_eq!(capped, vec![20, 5, 7]);
     }
 
     #[test]

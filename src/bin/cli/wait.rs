@@ -132,6 +132,10 @@ pub fn misquoted_duration_error(args: &Args, command_explicitly_separated: bool)
 #[derive(Debug, PartialEq, Eq)]
 pub enum WaitForPidResult {
     Exited(i32),
+    /// The process exited, but its status could not be read: subscribing to
+    /// another user's exit status is refused (EACCES), so the wait fell back
+    /// to a bare exit notification.
+    ExitedStatusUnknown,
     TimedOut,
 }
 
@@ -175,23 +179,40 @@ const fn exit_code_from_wait_status(status: i32) -> i32 {
 pub fn wait_for_pid(
     pid: i32,
     timeout: Option<Duration>,
-    verbose: bool,
 ) -> Result<WaitForPidResult, WaitForPidError> {
     if pid <= 0 {
         return Err(WaitForPidError::InvalidPid);
     }
 
+    // The man page documents `NOTE_EXITSTATUS` as valid only on child
+    // processes, but the kernel is more permissive: verified on Darwin 25, the
+    // subscription is accepted for any process of the caller's own user — even
+    // an unrelated, launchd-parented one — and delivers the real wait(2)
+    // status word. Only another user's process refuses it (the attach fails
+    // with EACCES); fall back to a bare `NOTE_EXIT` subscription then, which
+    // any observable process accepts, and report the exit without a status.
+    match wait_for_pid_with(pid, timeout, true)? {
+        WaitForPidResult::ExitedStatusUnknown => wait_for_pid_with(pid, timeout, false),
+        outcome => Ok(outcome),
+    }
+}
+
+fn wait_for_pid_with(
+    pid: i32,
+    timeout: Option<Duration>,
+    with_status: bool,
+) -> Result<WaitForPidResult, WaitForPidError> {
+    let flags = if with_status {
+        event::FilterFlag::NOTE_EXIT | event::FilterFlag::NOTE_EXITSTATUS
+    } else {
+        event::FilterFlag::NOTE_EXIT
+    };
     let kq = event::Kqueue::new().map_err(WaitForPidError::Kevent)?;
     let kev = event::KEvent::new(
         pid.cast_unsigned() as usize,
         event::EventFilter::EVFILT_PROC,
         event::EvFlags::EV_ADD | event::EvFlags::EV_ENABLE | event::EvFlags::EV_ONESHOT,
-        // `NOTE_EXITSTATUS` is documented as valid only on child processes and
-        // only alongside `NOTE_EXIT`; request both so the subscription is
-        // well-formed for arbitrary PIDs (for non-children `NOTE_EXIT` still
-        // fires the wake, the status just decodes to 0 — the same limitation as
-        // `caffeinate -w`).
-        event::FilterFlag::NOTE_EXIT | event::FilterFlag::NOTE_EXITSTATUS,
+        flags,
         0,
         0,
     );
@@ -207,19 +228,32 @@ pub fn wait_for_pid(
     }
 
     let event = eventlist[0];
-    if verbose {
-        println!("{event:#?}");
-    }
+    tracing::debug!("{event:#?}");
 
     if event.flags().contains(event::EvFlags::EV_ERROR) {
         if event.data() == nix::Error::ESRCH as isize {
+            // On the status-less retry the process was alive at the first
+            // attach, so ESRCH means it exited in between — that is an exit
+            // with an unknown status, not a bad pid.
+            if !with_status {
+                return Ok(WaitForPidResult::ExitedStatusUnknown);
+            }
             return Err(WaitForPidError::NotFound);
+        }
+        // EACCES on the status subscription: the caller may not read this
+        // process's exit status (it belongs to another user). Signal the
+        // caller to retry without one.
+        if with_status && event.data() == nix::Error::EACCES as isize {
+            return Ok(WaitForPidResult::ExitedStatusUnknown);
         }
         return Err(WaitForPidError::Kevent(nix::Error::from_raw(
             i32::try_from(event.data()).unwrap_or(i32::MAX),
         )));
     }
 
+    if !with_status {
+        return Ok(WaitForPidResult::ExitedStatusUnknown);
+    }
     Ok(WaitForPidResult::Exited(exit_code_from_wait_status(
         i32::try_from(event.data()).unwrap_or(i32::MAX),
     )))
@@ -232,20 +266,30 @@ mod tests {
 
     #[test]
     fn dead_pid_at_registration_is_not_found() {
-        let result = wait_for_pid(i32::MAX, Some(Duration::from_millis(1)), false);
+        let result = wait_for_pid(i32::MAX, Some(Duration::from_millis(1)));
         assert!(matches!(result, Err(WaitForPidError::NotFound)));
     }
 
     #[test]
     fn wait_for_pid_rejects_non_positive_pids() {
         assert!(matches!(
-            wait_for_pid(0, Some(Duration::from_millis(1)), false),
+            wait_for_pid(0, Some(Duration::from_millis(1))),
             Err(WaitForPidError::InvalidPid)
         ));
         assert!(matches!(
-            wait_for_pid(-1, Some(Duration::from_millis(1)), false),
+            wait_for_pid(-1, Some(Duration::from_millis(1))),
             Err(WaitForPidError::InvalidPid)
         ));
+    }
+
+    #[test]
+    fn another_users_process_is_waited_on_not_errored() {
+        // pid 1 (launchd, root-owned) always exists. As a non-root test run the
+        // status subscription is refused (EACCES) and the fallback must wait —
+        // here, time out — instead of failing the whole wait as it used to. A
+        // root test run attaches directly and times out the same way.
+        let result = wait_for_pid(1, Some(Duration::from_millis(10)));
+        assert!(matches!(result, Ok(WaitForPidResult::TimedOut)));
     }
 
     #[test]
