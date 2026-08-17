@@ -444,6 +444,9 @@ mod tests {
 
         for assertion_type in types {
             let assertion = create_assertion(assertion_type, false).unwrap();
+            // IOKit assertion ids are non-zero; zero would mean the create
+            // "succeeded" without actually registering anything.
+            assert_ne!(assertion.id, 0, "{assertion_type}");
             println!(
                 "Successfully created assertion type: {} with ID: {}",
                 assertion_type, assertion.id
@@ -455,25 +458,25 @@ mod tests {
     #[ignore = "declares real user activity through IOKit"]
     fn smoke_declare_user_activity() {
         let assertion = declare_user_activity(true).unwrap();
-        println!(
-            "Declared user activity with ID: {}",
-            assertion.id.load(Ordering::SeqCst)
-        );
-    }
-
-    #[test]
-    #[ignore = "calls IOKit with an invalid assertion id"]
-    fn smoke_release_assertion_invalid_id() {
-        release_assertion(u32::MAX, true);
+        let id = assertion.id.load(Ordering::SeqCst);
+        assert_ne!(id, 0, "a declared user-activity assertion has a real id");
+        println!("Declared user activity with ID: {id}");
     }
 
     #[test]
     #[ignore = "enumerates live IOKit assertions from other processes"]
     fn smoke_external_assertions() {
         // Hold an assertion ourselves; our own PID is excluded inside
-        // `external_assertions`, so only other processes' holds come back.
+        // `external_assertions`, so only other processes' holds come back —
+        // which makes the self-exclusion assertable even when nothing else on
+        // the machine is holding.
         let _held = create_assertion(AssertionType::PreventUserIdleSystemSleep, false).unwrap();
         let externals = external_assertions(&[AssertionType::PreventUserIdleSystemSleep]).unwrap();
+        let self_pid = std::process::id().cast_signed();
+        assert!(
+            externals.iter().all(|assertion| assertion.pid != self_pid),
+            "our own assertion must be filtered out"
+        );
         for assertion in &externals {
             assert_eq!(
                 assertion.assertion_type,

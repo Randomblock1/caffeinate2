@@ -36,7 +36,21 @@
 //! release-side regression (the pre-fix `removed && empty` decision) only
 //! surfaces through the restart-shaped [`CONVERGES`] counterexample, and only
 //! because reconcile checkpoints happen to follow; the release contract itself
-//! would be unchecked.
+//! would be unchecked. Both checkpoints carry `sometimes` witness properties:
+//! an always-property over states that are never reached passes vacuously, so
+//! the witnesses fail the suite if a refactor stops marking the checkpoints.
+//!
+//! Kernel toggles can also *fail* ([`Action::FailOp`] / [`CrossAction::FailOp`]
+//! — a transient IOKit error): the operation errors out and runs its rollback,
+//! exactly as `EntirelyCoordinator` does. This makes hold()'s two-write
+//! rollback property-checked: backing out the holder, and clearing the marker
+//! only when this acquire created it and the ownership generation still
+//! matches. release()'s holder restore is stepped too, but only for
+//! state-space coverage — these models describe a hold as a lockfile entry
+//! for a live pid, so they cannot tell a fabricated entry from a genuine one,
+//! and the restore's `removed` guard is not falsifiable here. The unit test
+//! `stray_release_with_failed_enable_does_not_fabricate_a_holder` in
+//! `src/entirely/coordinator.rs` pins that guard instead.
 //!
 //! A second model, [`CrossProcess`], covers the CLI-fallback deployment: with
 //! no helper installed, [`CROSS_PROCS`] root CLI *processes* share the lockfile
@@ -62,9 +76,8 @@
 //! Enable path (prune+decide, kernel toggle, marker clear), with the same
 //! post-toggle marker race. The single-process model above leaves status out
 //! for the same reason: under a single serialized coordinator its step
-//! sequences are a strict subset of reconcile's. The cross-process model in
-//! turn omits the startup-only legacy `had_entries` fallback (it only widens
-//! the Enable condition). Mid-operation process death is covered by `Crash`:
+//! sequences are a strict subset of reconcile's. Mid-operation process death
+//! is covered by `Crash`:
 //! a CLI-fallback process SIGKILLed between the atomic steps of its operation
 //! — including while other processes are also mid-operation — abandons its
 //! remaining steps, and, being coordinator and holder in one, leaves its own
@@ -124,14 +137,21 @@ enum Pending {
     None,
     /// hold(): holder+marker written (`lockfile::acquire`); the kernel disable
     /// (`sleep_disabler(true)` in `EntirelyCoordinator::hold`) is still to come.
+    /// `p` and `prior_owned` (the marker state before the acquire) are what the
+    /// rollback needs if that disable fails.
     HoldToggle {
+        p: Pid,
         first: bool,
+        prior_owned: bool,
     },
     /// release(): holder removed, marker left set (`lockfile::release`); the
     /// kernel enable (`sleep_disabler(false)` in `release_under_ops`) is still
-    /// to come.
+    /// to come. `removed` is whether this release actually removed the caller's
+    /// entry — the rollback restores only an entry that existed.
     ReleaseToggle {
+        p: Pid,
         enable: bool,
+        removed: bool,
     },
     /// release(): kernel re-enabled; clearing the marker
     /// (`lockfile::clear_owns_disable_if_current`) is still to come.
@@ -219,6 +239,10 @@ enum Action {
     StartStartup,
     /// Advance the in-flight operation by one atomic step.
     StepOp,
+    /// The in-flight operation's kernel toggle fails (transient IOKit error):
+    /// the operation returns an error after running its rollback. Offered only
+    /// for steps that actually call the kernel.
+    FailOp,
     /// Helper SIGKILL: abandon any in-flight op (and, for Buggy, lose the cache).
     Crash,
 }
@@ -233,6 +257,12 @@ const CONVERGES: &str = "reconcile converges sleep to live holders";
 /// release completes (not deferred to the next reconcile): once no live holders
 /// remain, sleep must already be re-enabled. Shared by both models.
 const RELEASE_IMMEDIATE: &str = "a completed release leaves no holderless disable";
+/// Witnesses that the checkpoint states the always-properties are guarded on
+/// are actually reached: without them, deleting the code that marks a
+/// checkpoint would leave the corresponding always-property vacuously green.
+/// Shared by both models.
+const RECONCILE_CHECKPOINTED: &str = "a reconcile-completion checkpoint is reached";
+const RELEASE_CHECKPOINTED: &str = "a release-completion checkpoint is reached";
 
 impl Model for Coordinator {
     type State = State;
@@ -267,6 +297,19 @@ impl Model for Coordinator {
             // equivalent to one just after it for these properties, since the
             // operation's decisions are already locked in.)
             actions.push(Action::StepOp);
+            // Steps that actually call the kernel can fail; the marker/clear
+            // steps are flock'd lockfile writes and stay reliable per the
+            // atomic-write assumption.
+            if matches!(
+                state.pending,
+                Pending::HoldToggle { first: true, .. }
+                    | Pending::ReleaseToggle { enable: true, .. }
+                    | Pending::ReconcileToggle {
+                        effect: Effect::Disable | Effect::Enable
+                    }
+            ) {
+                actions.push(Action::FailOp);
+            }
         }
     }
 
@@ -301,46 +344,43 @@ impl Model for Coordinator {
                 s.alive.insert(p);
                 prune(&mut s);
                 let first = s.lockfile.is_empty();
+                let prior_owned = s.marker;
                 s.lockfile.insert(p);
                 if first && self.variant == Variant::Fixed {
                     s.marker = true;
                 }
-                s.pending = Pending::HoldToggle { first };
+                s.pending = Pending::HoldToggle {
+                    p,
+                    first,
+                    prior_owned,
+                };
             }
 
             Action::Release(p) => {
                 prune(&mut s);
+                let removed = s.lockfile.remove(&p);
                 let enable = match self.variant {
                     // Fixed: mirrors `lockfile::release`'s `should_enable:
                     // holders.is_empty() && owns_disable` — re-enable when no
                     // live holders remain and we own the disable, regardless of
                     // whether this caller held.
-                    Variant::Fixed => {
-                        s.lockfile.remove(&p);
-                        s.lockfile.is_empty() && s.marker
-                    }
+                    Variant::Fixed => s.lockfile.is_empty() && s.marker,
                     // Buggy: the pre-fix `removed && empty` decision — only
                     // when this caller removed a live holder and none remain.
-                    Variant::Buggy => {
-                        let removed = s.lockfile.remove(&p);
-                        removed && s.lockfile.is_empty()
-                    }
+                    Variant::Buggy => removed && s.lockfile.is_empty(),
                 };
-                s.pending = Pending::ReleaseToggle { enable };
+                s.pending = Pending::ReleaseToggle { p, enable, removed };
             }
 
             Action::StartReconcile | Action::StartStartup => {
                 // Mirrors `EntirelyCoordinator::reconcile_locked`'s decision:
                 // `lockfile::prune_lockfile`, then holders>0 => disable;
-                // owns_disable || (treat_pruned_as_intent && had_entries) =>
-                // enable; else nothing.
-                let startup = action == Action::StartStartup;
-                if startup {
-                    // Boot-time recovery has now run; the periodic reaper may run
-                    // from here (until the next crash).
+                // owns_disable => enable; else nothing. Startup and periodic
+                // reconciles share the decision; startup only unlocks the
+                // periodic reaper (the boot ordering the real daemons follow).
+                if action == Action::StartStartup {
                     s.needs_startup = false;
                 }
-                let had_entries = !s.lockfile.is_empty();
                 prune(&mut s);
                 let live = s.lockfile.len();
                 let owns = match self.variant {
@@ -349,9 +389,7 @@ impl Model for Coordinator {
                 };
                 let effect = if live > 0 {
                     Effect::Disable
-                } else if owns || (startup && had_entries) {
-                    // `had_entries` is the legacy startup-only fallback for
-                    // lockfiles written before the marker existed.
+                } else if owns {
                     Effect::Enable
                 } else {
                     Effect::Nothing
@@ -359,10 +397,63 @@ impl Model for Coordinator {
                 s.pending = Pending::ReconcileToggle { effect };
             }
 
+            Action::FailOp => match last.pending {
+                // FailOp is only offered for kernel-toggle steps (see actions).
+                Pending::None
+                | Pending::ReleaseClear { .. }
+                | Pending::ReconcileMarker { .. }
+                | Pending::HoldToggle { first: false, .. }
+                | Pending::ReleaseToggle { enable: false, .. }
+                | Pending::ReconcileToggle {
+                    effect: Effect::Nothing,
+                } => return None,
+
+                // hold()'s rollback: back out the holder entry; clear the
+                // marker only if this acquire created it (mirrors the
+                // `prior_owns_disable` guard, with the generation trivially
+                // still current under the serialized single coordinator).
+                Pending::HoldToggle {
+                    p,
+                    first: true,
+                    prior_owned,
+                } => {
+                    prune(&mut s);
+                    s.lockfile.remove(&p);
+                    if self.variant == Variant::Fixed && !prior_owned {
+                        s.marker = false;
+                    }
+                    s.pending = Pending::None;
+                }
+
+                // release()'s rollback: restore the holder entry — but only
+                // when this release actually removed one (a stray release that
+                // merely pruned must not fabricate a hold). The marker was
+                // left set by the release, so nothing else changes.
+                Pending::ReleaseToggle {
+                    p,
+                    enable: true,
+                    removed,
+                } => {
+                    prune(&mut s);
+                    if removed {
+                        s.lockfile.insert(p);
+                    }
+                    s.pending = Pending::None;
+                }
+
+                // reconcile() propagates the toggle error; neither the marker
+                // step nor the completion checkpoint is reached.
+                Pending::ReconcileToggle {
+                    effect: Effect::Disable | Effect::Enable,
+                } => {
+                    s.pending = Pending::None;
+                }
+            },
+
             Action::StepOp => match last.pending {
                 Pending::None => return None,
 
-                Pending::HoldToggle { first } => {
+                Pending::HoldToggle { first, .. } => {
                     if first {
                         s.kernel_disabled = true;
                         if self.variant == Variant::Buggy {
@@ -372,7 +463,7 @@ impl Model for Coordinator {
                     s.pending = Pending::None;
                 }
 
-                Pending::ReleaseToggle { enable } => {
+                Pending::ReleaseToggle { enable, .. } => {
                     if enable {
                         s.kernel_disabled = false;
                         if self.variant == Variant::Buggy {
@@ -460,6 +551,10 @@ impl Model for Coordinator {
                 }
                 !(s.kernel_disabled && live_count(s) == 0)
             }),
+            // Witnesses: the checkpoints the two always-properties are guarded
+            // on must actually be reached (see the const docs).
+            Property::<Self>::sometimes(RECONCILE_CHECKPOINTED, |_, s| s.just_reconciled),
+            Property::<Self>::sometimes(RELEASE_CHECKPOINTED, |_, s| s.just_released),
         ]
     }
 }
@@ -600,10 +695,22 @@ enum MarkerWrite {
 enum ProcPending {
     None,
     /// hold(): first holder + marker written; the kernel disable is to come.
-    HoldToggle,
-    /// release(): holder removed, re-enable decided; the kernel enable is to come.
+    /// The extra fields serve the rollback of a failed disable: `prior_owned`
+    /// is the marker state before this acquire (a pre-existing marker must
+    /// survive the rollback), `gen_valid` its captured ownership generation,
+    /// and `was_orphaned` whether the acquire's marker write covered a
+    /// standing orphaned disable (which the rollback then un-covers).
+    HoldToggle {
+        prior_owned: bool,
+        gen_valid: bool,
+        was_orphaned: bool,
+    },
+    /// release(): holder removed, re-enable decided; the kernel enable is to
+    /// come. `removed` is whether the caller's entry was actually present —
+    /// the rollback of a failed enable restores only an entry that existed.
     ReleaseToggle {
         gen_valid: bool,
+        removed: bool,
     },
     /// release(): kernel re-enabled; the marker clear is to come.
     ReleaseClear {
@@ -638,10 +745,10 @@ enum ProcPending {
 /// minimum that exhibits every cross-process marker race; three additionally
 /// covers three-way interleavings (e.g. a releaser, a fresh holder, and a
 /// reconciler all mid-operation). Measured with the full BFS in the debug test
-/// profile: 2 processes = 3,225 states (~0.05s); 3 processes = 152,801 states
-/// (~2s for both cross-process tests) — still cheap, so 3 is kept. Each extra
-/// process multiplies the space by roughly another 8-variant pending slot plus
-/// the pid subsets (~50x per step); re-measure before raising this.
+/// profile: 3 processes = 229,509 states (~3s for both cross-process tests,
+/// toggle-failure injection included) — still cheap, so 3 is kept. Each extra
+/// process multiplies the space by roughly another pending slot's variants
+/// plus the pid subsets; re-measure before raising this.
 const CROSS_PROCS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -696,6 +803,9 @@ enum CrossAction {
     Status(u8),
     /// Advance process `who`'s in-flight operation by one atomic step.
     StepOp(u8),
+    /// Process `who`'s pending kernel toggle fails (transient IOKit error):
+    /// the operation errors out after running its rollback.
+    FailOp(u8),
     /// SIGKILL the process owning `Pid` while both processes are quiescent.
     /// Mid-operation death is [`CrossAction::Crash`]; keeping the two disjoint
     /// avoids redundant states.
@@ -746,24 +856,27 @@ fn cross_prune(s: &mut CrossState) {
 fn invalidate_generations(s: &mut CrossState) {
     for pending in &mut s.pending {
         match pending {
-            ProcPending::ReleaseToggle { gen_valid }
+            ProcPending::HoldToggle { gen_valid, .. }
+            | ProcPending::ReleaseToggle { gen_valid, .. }
             | ProcPending::ReleaseClear { gen_valid }
             | ProcPending::StatusToggle { gen_valid }
             | ProcPending::StatusClear { gen_valid }
             | ProcPending::ReconcileToggle { gen_valid, .. }
             | ProcPending::ReconcileMarker { gen_valid, .. } => *gen_valid = false,
-            ProcPending::None | ProcPending::HoldToggle => {}
+            ProcPending::None => {}
         }
     }
 }
 
 impl CrossProcess {
     /// The post-toggle marker clear. Guarded mirrors
-    /// `lockfile::clear_owns_disable_if_current`: re-check the holder set and
-    /// the ownership generation inside the same flock mutation. Unconditional
-    /// is the pre-fix clear (surviving in the tree only as the
-    /// `#[cfg(test)]`-gated `lockfile::clear_owns_disable_unguarded` bypass).
+    /// `lockfile::clear_owns_disable_if_current`: prune (as every locked
+    /// mutation does first), then re-check the holder set and the ownership
+    /// generation inside the same flock mutation. Unconditional is the pre-fix
+    /// clear (surviving in the tree only as the `#[cfg(test)]`-gated
+    /// `lockfile::clear_owns_disable_unguarded` bypass).
     fn clear_marker(&self, s: &mut CrossState, gen_valid: bool) {
+        cross_prune(s);
         match self.marker_write {
             MarkerWrite::Unconditional => s.marker = false,
             MarkerWrite::Guarded => {
@@ -804,9 +917,23 @@ impl Model for CrossProcess {
                 actions.push(CrossAction::Reconcile(who));
                 actions.push(CrossAction::Status(who));
             } else {
+                let toggle_step = matches!(
+                    state.pending[who],
+                    ProcPending::HoldToggle { .. }
+                        | ProcPending::ReleaseToggle { .. }
+                        | ProcPending::StatusToggle { .. }
+                        | ProcPending::ReconcileToggle { .. }
+                );
                 let who = u8::try_from(who).unwrap();
                 actions.push(CrossAction::StepOp(who));
                 actions.push(CrossAction::Crash(who));
+                // Every pending toggle variant here is a real kernel call (a
+                // decision against toggling completes at start), so each can
+                // fail; the marker/clear steps are flock'd lockfile writes and
+                // stay reliable per the atomic-write assumption.
+                if toggle_step {
+                    actions.push(CrossAction::FailOp(who));
+                }
             }
         }
         if state.pending.iter().all(|p| *p == ProcPending::None) {
@@ -879,16 +1006,23 @@ impl Model for CrossProcess {
                 s.alive.insert(p);
                 cross_prune(&mut s);
                 let first = s.lockfile.is_empty();
+                let prior_owned = s.marker;
                 s.lockfile.insert(p);
                 if first {
                     // Marker written (and the generation bumped) in the same
                     // flock write that adds the holder; the kernel disable is a
                     // later step. The fresh record owns any standing disable,
-                    // ending an orphaned-disable window.
+                    // ending an orphaned-disable window — though a failed
+                    // toggle's rollback can reopen it (`was_orphaned`).
+                    let was_orphaned = s.orphaned_disable;
                     s.marker = true;
                     invalidate_generations(&mut s);
                     s.orphaned_disable = false;
-                    s.pending[who] = ProcPending::HoldToggle;
+                    s.pending[who] = ProcPending::HoldToggle {
+                        prior_owned,
+                        gen_valid: true,
+                        was_orphaned,
+                    };
                     s.interfered[who] = false;
                 }
                 taint_others_of(&mut s, who);
@@ -901,9 +1035,12 @@ impl Model for CrossProcess {
                 // holders.is_empty() && owns_disable`.
                 let who = usize::from(who);
                 cross_prune(&mut s);
-                s.lockfile.remove(&pid_of(who));
+                let removed = s.lockfile.remove(&pid_of(who));
                 if s.lockfile.is_empty() && s.marker {
-                    s.pending[who] = ProcPending::ReleaseToggle { gen_valid: true };
+                    s.pending[who] = ProcPending::ReleaseToggle {
+                        gen_valid: true,
+                        removed,
+                    };
                     s.interfered[who] = false;
                 } else {
                     // The decision against toggling makes that mutation the
@@ -920,9 +1057,7 @@ impl Model for CrossProcess {
 
             CrossAction::Reconcile(who) => {
                 // Mirrors `reconcile_locked`: `lockfile::prune_lockfile`, then
-                // holders>0 => disable, owns_disable => enable, else nothing
-                // (the startup-only `had_entries` fallback is omitted, see the
-                // module docs).
+                // holders>0 => disable, owns_disable => enable, else nothing.
                 let who = usize::from(who);
                 cross_prune(&mut s);
                 let owned = s.marker;
@@ -962,17 +1097,79 @@ impl Model for CrossProcess {
                 taint_others_of(&mut s, who);
             }
 
+            CrossAction::FailOp(who) => {
+                let who = usize::from(who);
+                match last.pending[who] {
+                    // FailOp is only offered for kernel-toggle steps.
+                    ProcPending::None
+                    | ProcPending::ReleaseClear { .. }
+                    | ProcPending::StatusClear { .. }
+                    | ProcPending::ReconcileMarker { .. } => return None,
+
+                    // hold()'s rollback (`EntirelyCoordinator::hold`, disable
+                    // failed): back out the holder entry, then clear the marker
+                    // only if this acquire created it — via the same
+                    // generation-guarded clear as a release, so a marker a
+                    // concurrent reconcile re-recorded meanwhile survives.
+                    ProcPending::HoldToggle {
+                        prior_owned,
+                        gen_valid,
+                        was_orphaned,
+                    } => {
+                        cross_prune(&mut s);
+                        s.lockfile.remove(&pid_of(who));
+                        if !prior_owned {
+                            let marker_before = s.marker;
+                            self.clear_marker(&mut s, gen_valid);
+                            // Rolling the marker back un-covers the standing
+                            // disable the acquire had taken ownership of: the
+                            // orphan window reopens exactly as it was.
+                            if was_orphaned && marker_before && !s.marker {
+                                s.orphaned_disable = true;
+                            }
+                        }
+                        s.pending[who] = ProcPending::None;
+                    }
+
+                    // release()'s rollback (`release_under_ops`, enable
+                    // failed): restore the removed entry via a re-acquire —
+                    // including its first-holder marker set and generation
+                    // bump — but never fabricate an entry for a stray release
+                    // that only pruned.
+                    ProcPending::ReleaseToggle { removed, .. } => {
+                        cross_prune(&mut s);
+                        if removed {
+                            let first = s.lockfile.is_empty();
+                            s.lockfile.insert(pid_of(who));
+                            if first {
+                                s.marker = true;
+                                invalidate_generations(&mut s);
+                                s.orphaned_disable = false;
+                            }
+                        }
+                        s.pending[who] = ProcPending::None;
+                    }
+
+                    // status() and reconcile() propagate the toggle error and
+                    // never reach their marker step.
+                    ProcPending::StatusToggle { .. } | ProcPending::ReconcileToggle { .. } => {
+                        s.pending[who] = ProcPending::None;
+                    }
+                }
+                taint_others_of(&mut s, who);
+            }
+
             CrossAction::StepOp(who) => {
                 let who = usize::from(who);
                 match last.pending[who] {
                     ProcPending::None => return None,
 
-                    ProcPending::HoldToggle => {
+                    ProcPending::HoldToggle { .. } => {
                         s.kernel_disabled = true;
                         s.pending[who] = ProcPending::None;
                     }
 
-                    ProcPending::ReleaseToggle { gen_valid } => {
+                    ProcPending::ReleaseToggle { gen_valid, .. } => {
                         s.kernel_disabled = false;
                         s.pending[who] = ProcPending::ReleaseClear { gen_valid };
                     }
@@ -1018,6 +1215,10 @@ impl Model for CrossProcess {
                         owned,
                         gen_valid,
                     } => {
+                        // The marker write is a locked mutation, so it prunes
+                        // first like every other (`record_owns_disable`;
+                        // `clear_marker` prunes internally for the Enable arm).
+                        cross_prune(&mut s);
                         match (effect, self.marker_write) {
                             // Pre-fix: ownership recorded only when the prune
                             // saw no marker — a concurrent release that cleared
@@ -1088,6 +1289,11 @@ impl Model for CrossProcess {
             // fails the suite if the Crash action is ever dropped, instead of
             // silently losing the crash coverage.)
             Property::<Self>::sometimes(ORPHANED, |_, s| s.orphaned_disable),
+            // Witnesses that the solo-completion checkpoints are reachable at
+            // all (see the const docs): the always-properties above are
+            // guarded on them and would otherwise pass vacuously.
+            Property::<Self>::sometimes(RECONCILE_CHECKPOINTED, |_, s| s.just_reconciled),
+            Property::<Self>::sometimes(RELEASE_CHECKPOINTED, |_, s| s.just_released),
         ]
     }
 }

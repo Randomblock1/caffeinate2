@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9a085c97afd81bc07958b1e65bff746c29a62e034341623af64265ac3595249c # shrinks to ops = [DisablerFailNext, Hold(2), Hold(0), Kill(0), DisablerFailNext, Release(2), Release(0)]
+cc fc71f77eb44a2ab78e4561e837be75a3da5af24d671dc27128b000ea9e47960e # shrinks to ops = [DisablerFailNext, Hold(0), Hold(1), Kill(1), Status]

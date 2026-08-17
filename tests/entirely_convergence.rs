@@ -133,6 +133,11 @@ enum Op {
     /// Arm the disabler to fail its next toggle (transient IOKit error),
     /// driving the hold/release/reconcile rollback paths.
     DisablerFailNext,
+    /// A status query (`--status`, the tray poll). Not read-only: its prune
+    /// can drop the last live holder, and the coordinator must converge the
+    /// kernel bit right then — between invocations of the CLI fallback there
+    /// is no reaper to do it later.
+    Status,
 }
 
 fn base_op() -> impl Strategy<Value = Op> {
@@ -143,6 +148,7 @@ fn base_op() -> impl Strategy<Value = Op> {
         Just(Op::Reconcile),
         Just(Op::Restart),
         Just(Op::DisablerFailNext),
+        Just(Op::Status),
     ]
 }
 
@@ -156,6 +162,7 @@ fn adversarial_op() -> impl Strategy<Value = Op> {
         Just(Op::ExternalDisable),
         Just(Op::ExternalEnable),
         Just(Op::DisablerFailNext),
+        Just(Op::Status),
     ]
 }
 
@@ -247,6 +254,23 @@ proptest! {
                 Op::DisablerFailNext => {
                     world.fail_next_toggle.store(true, Ordering::SeqCst);
                 }
+                Op::Status => {
+                    // A query whose prune drops the last live holder must
+                    // re-enable sleep right then (minimal failing story:
+                    // Hold, Kill the holder, Status). Deleting the re-enable
+                    // branch in `coordinator::status` leaves every other test
+                    // green — this arm is its only executable coverage. A
+                    // query that hit an armed toggle failure returns Err and
+                    // legitimately defers to a later reconcile.
+                    if let Ok(status) = coord.status() {
+                        prop_assert_eq!(status.holders, holders.len());
+                        prop_assert_eq!(
+                            world.kernel(),
+                            !holders.is_empty(),
+                            "successful status query must converge the kernel bit"
+                        );
+                    }
+                }
                 Op::ExternalDisable | Op::ExternalEnable => unreachable!(),
             }
         }
@@ -310,6 +334,15 @@ proptest! {
                         prop_assert!(world.kernel(), "live holders must be effective after restart");
                     }
                 }
+                Op::Status => {
+                    // Status's convergence contract is pinned in the base
+                    // property; under external meddling only the reported
+                    // holder count is promised (the kernel bit may have been
+                    // externally flipped either way).
+                    if let Ok(status) = coord.status() {
+                        prop_assert_eq!(status.holders, holders.len());
+                    }
+                }
             }
         }
         let _ = std::fs::remove_file(&lock_path);
@@ -362,13 +395,16 @@ fn reconcile_reapplies_disable_after_external_enable() {
 /// `Hold(1:20)`, `Kill(1:20)`, `Release(1:10)`, `Restart`.
 ///
 /// A holder is SIGKILLed, leaving a stale lockfile entry while sleep is still
-/// disabled. An unrelated *non-holder* Release then prunes that stale entry as a
-/// side effect, emptying the holder set. Before the fix this did not re-enable
-/// sleep and, crucially, left no evidence of caffeinate2's ownership, so a
-/// restart preserved the disable forever. Now the durable ownership marker means
-/// the Release re-enables immediately (it sees "no live holders && we own the
-/// disable"), and even if it didn't, the marker would survive to the restart.
-/// Either way, sleep converges back to enabled.
+/// disabled. An unrelated *non-holder* Release then prunes that stale entry as
+/// a side effect, emptying the holder set. Before the fix this left no evidence
+/// of caffeinate2's ownership, so a restart preserved the disable forever.
+///
+/// The release-side half of the fix (a successful Release re-enables
+/// immediately) is pinned by the per-Release checkpoint in the property tests
+/// above. To make the *restart* half of this test load-bearing rather than
+/// entailed by that, the Release's re-enable is armed to fail here: the marker
+/// alone must then carry the intent across the restart, whose startup
+/// reconcile performs the actual re-enable.
 #[test]
 fn lost_disable_intent_across_restart_is_fixed() {
     let world = World::new();
@@ -385,21 +421,23 @@ fn lost_disable_intent_across_restart_is_fixed() {
     // The holder is SIGKILLed: gone from the process table, stale in the lockfile.
     world.live.lock().unwrap().remove(&holder);
 
-    // A non-holder Release prunes the stale entry, emptying the holder set.
-    // Because caffeinate2 owns the disable (durable marker), this now re-enables
-    // sleep immediately instead of stranding it.
-    coord.release(non_holder).unwrap();
+    // A non-holder Release prunes the stale entry to empty and decides to
+    // re-enable — but the toggle fails (transient IOKit error), so the Release
+    // errors out with sleep still disabled and the ownership marker still set.
+    world.fail_next_toggle.store(true, Ordering::SeqCst);
+    assert!(coord.release(non_holder).is_err());
     assert!(
-        !world.kernel(),
-        "release should re-enable sleep once no live holders remain"
+        world.kernel(),
+        "the failed re-enable must leave the kernel bit untouched"
     );
 
-    // The restart is then a clean no-op: the marker was cleared on re-enable.
+    // The restart must recover from the durable marker alone: no live holders,
+    // no in-memory state, just the lockfile saying "we own this disable".
     let coord = make_coord(&world, &lock_path);
     coord.reconcile_startup().unwrap();
     assert!(
         !world.kernel(),
-        "sleep must remain enabled with no live holders after restart"
+        "restart must re-enable sleep from the durable ownership marker"
     );
     let _ = std::fs::remove_file(&lock_path);
 }
