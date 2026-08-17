@@ -431,29 +431,46 @@ fn new_row(proc: &ProcInfo, bundle: Option<BundleRef>, first: ChildProc) -> Prog
     }
 }
 
-/// Whether *any* of the targets is still running.
+/// Whether *any* of the targets is still running, or `None` when the answer
+/// is unknown because the process scan failed this tick.
 ///
-/// Bundle targets use the cheap `NSRunningApplication` lookup; only when an
-/// `Executable` target is present do we do a single process-tree scan covering
-/// all of them.
+/// Bundle targets use the cheap `NSRunningApplication` lookup (which cannot
+/// fail), so `None` is only possible with `Executable` targets. An empty path
+/// scan reads as failure: a successful scan always contains at least this
+/// process's own executable, so empty ⟺ the underlying `pids_by_type` call
+/// failed. Callers that act on "not running" (ending a watch session) must
+/// treat `None` as "leave things alone and retry next tick", not as `false`.
 #[must_use]
-pub fn any_target_running(targets: &[WatchTarget]) -> bool {
+pub fn any_target_running_checked(targets: &[WatchTarget]) -> Option<bool> {
     let mut exec_paths: Vec<&str> = Vec::new();
     for target in targets {
         match target {
             WatchTarget::Bundle { bundle_id, .. } => {
                 if macos_apps::is_bundle_running(bundle_id) {
-                    return true;
+                    return Some(true);
                 }
             }
             WatchTarget::Executable { path, .. } => exec_paths.push(path),
         }
     }
     if exec_paths.is_empty() {
-        return false;
+        return Some(false);
     }
     let raw_live = running_executable_paths_raw();
-    exec_paths_match(&exec_paths, &raw_live, || canonical_live_paths(&raw_live))
+    if raw_live.is_empty() {
+        return None;
+    }
+    Some(exec_paths_match(&exec_paths, &raw_live, || {
+        canonical_live_paths(&raw_live)
+    }))
+}
+
+/// [`any_target_running_checked`] with a failed scan read as "not running" —
+/// for callers where a one-tick wrong answer is harmless (display, seeding a
+/// fresh session's latch).
+#[must_use]
+pub fn any_target_running(targets: &[WatchTarget]) -> bool {
+    any_target_running_checked(targets).unwrap_or(false)
 }
 
 /// Raw-first match of executable `targets` against the live process paths.

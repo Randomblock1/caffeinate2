@@ -42,7 +42,8 @@ impl WatchTarget {
         }
     }
 
-    /// Lift a legacy single-app target into the multi-select model.
+    /// Lift a bundle identity (as resolved from a picked `.app`) into a watch
+    /// target.
     #[must_use]
     pub fn from_app_target(app: AppTarget) -> Self {
         Self::Bundle {

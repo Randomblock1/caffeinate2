@@ -5,7 +5,6 @@ use crate::tray::menu::{
 };
 use crate::tray::single_instance;
 use crate::tray::state::{AppState, PendingEnableOutcome, PendingInstallOutcome};
-use crate::tray::tray_icons;
 use crate::tray::upgrade_dialog::{self, UpgradeChoice};
 use crate::tray::wait_window::{self, WaitWindow, WaitWindowMsg};
 use objc2_foundation::MainThreadMarker;
@@ -17,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
 /// Longest the main event pump will block when otherwise idle, so an
 /// off-main-thread shutdown signal is noticed promptly (see the pump call site).
@@ -166,14 +165,14 @@ pub fn run() -> Result<(), TrayError> {
                 // the fix is updating this binary instead.
                 tracing::warn!(
                     "installed caffeinate2 helper is version {}, this binary is only {}; update this caffeinate2 binary",
-                    status.version.as_deref().unwrap_or("pre-0.8.0"),
-                    HelperStatus::CLIENT_VERSION,
+                    status.version,
+                    HelperStatus::BINARY_VERSION,
                 );
             } else {
                 tracing::warn!(
                     "installed caffeinate2 helper is version {}, this binary is {}; update it with: sudo caffeinate2 --install-helper",
-                    status.version.as_deref().unwrap_or("pre-0.8.0"),
-                    HelperStatus::CLIENT_VERSION,
+                    status.version,
+                    HelperStatus::BINARY_VERSION,
                 );
             }
         }
@@ -182,14 +181,12 @@ pub fn run() -> Result<(), TrayError> {
     // tray-icon requires a running main-thread event loop before creating the icon.
     crate::tray::macos_activation::pump_event_loop(Some(Duration::from_millis(16)));
 
-    let (icon_off_rgba, icon_width, icon_height) =
-        tray_icons::decode_icon_rgba(tray_icons::ICON_OFF)?;
-    let icon_off = Icon::from_rgba(icon_off_rgba, icon_width, icon_height)
-        .map_err(|e| TrayError::BuildIcon(e.to_string()))?;
-
     // Everything below runs on the main thread only (validated above via `mtm`);
     // muda menu items are not Send, so no locking or sharing is involved.
     let mut state = AppState::new();
+    // From the startup cache in `state`, so each icon PNG is decoded once; a
+    // corrupt asset still fails here, before any AppKit object exists.
+    let icon_off = state.initial_icon()?;
     let initial = state.menu_snapshot();
 
     // The picker window reports its result back over this channel, drained at
@@ -248,6 +245,12 @@ pub fn run() -> Result<(), TrayError> {
                 WaitWindowMsg::Apply(targets) => {
                     if let Err(e) = state.set_wait_for_apps(targets) {
                         eprintln!("{e}");
+                        // The picker window has already closed and the menu
+                        // reverts to the old selection on rebuild — without
+                        // this the user's choice vanishes with no visible
+                        // explanation (under the LaunchAgent, launchd
+                        // discards stderr).
+                        state.show_error_tooltip(&tray, &e.to_string());
                     } else if state.is_on() {
                         state.invalidate_tooltip();
                         state.update_tooltip(&tray);
@@ -279,8 +282,12 @@ pub fn run() -> Result<(), TrayError> {
                     handle_upgrade_click(mtm, &mut state, &tray, &upgraded_apps);
                     continue;
                 }
+                // The immediate paint must show where the click is taking the
+                // session: in particular, a click that cancels an in-flight
+                // enable means OFF, so painting `is_enabling()` as on would
+                // flash the wrong state.
                 let turning_on = !state.is_on() && !state.is_enabling();
-                state.show_icon_state(&tray, !state.is_on() || state.is_enabling());
+                state.show_icon_state(&tray, turning_on);
                 if turning_on && state.menu_snapshot().mode == SleepMode::Entirely {
                     let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                     state.invalidate_tooltip();

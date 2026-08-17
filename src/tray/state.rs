@@ -4,6 +4,9 @@ use crate::entirely::install;
 use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
 use crate::sleep::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
 use crate::tray::app_target::WatchTarget;
+use crate::tray::assertion_watch::{
+    ExternalClassification, OBSERVED_TYPES, classify_external_assertions, holder_names,
+};
 use crate::tray::error::TrayError;
 use crate::tray::process_enum;
 use crate::tray::tray_icons;
@@ -12,7 +15,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tray_icon::{Icon, TrayIcon};
+
+pub use crate::tray::assertion_watch::IgnoredAssertion;
+
+/// Icon, tooltip, and menu-bar-title rendering — the only part of `AppState`
+/// that touches the live `tray_icon::TrayIcon`.
+mod render;
 
 /// How often to re-check external assertions while the upgrade watcher is on.
 /// External assertion changes post no `NSWorkspace` notification, so the only
@@ -23,25 +31,6 @@ const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Agents (Claude Code, Codex, …) routinely drop their assertion for a moment
 /// between turns; the grace period avoids flapping the hold off and on.
 const UPGRADE_CLEAR_GRACE: Duration = Duration::from_secs(20);
-
-/// Assertion type the watcher upgrades: the system-idle hold (what agents and
-/// `caffeinate -i` use). Display-only assertions (video players) are surfaced as
-/// "ignored" rather than upgraded.
-const UPGRADE_TRIGGER_TYPE: AssertionType = AssertionType::PreventUserIdleSystemSleep;
-
-/// Assertion types the watcher scans for: the one it upgrades plus the
-/// display-only one, so the latter can be reported as ignored instead of
-/// silently dropped. Other types (disk idle) are intentionally left out to keep
-/// the "ignored" list focused on sleep-relevant holds and free of system noise.
-const OBSERVED_TYPES: &[AssertionType] = &[
-    AssertionType::PreventUserIdleSystemSleep,
-    AssertionType::PreventUserIdleDisplaySleep,
-];
-
-/// Reason text for the menu's "Ignoring…" lines, one per non-upgraded verdict.
-const REASON_USER_IGNORED: &str = "you ignore this app";
-const REASON_IGNORED_ONCE: &str = "ignored this time";
-const REASON_DISPLAY_ONLY: &str = "display only";
 
 /// Now on a clock that keeps advancing while the system is asleep, as an
 /// opaque offset from an arbitrary epoch. Timed sessions must expire on
@@ -78,124 +67,6 @@ fn should_latch_upgrade_failure(error: &EnableError) -> bool {
     // the next poll so a momentary flake does not disable upgrades for the
     // whole external-trigger episode.
     matches!(error, EnableError::NotAuthorized(_))
-}
-
-/// A sleep-relevant external assertion the watcher saw but did not upgrade,
-/// paired with the reason, for the informational "Ignoring…" menu entries.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IgnoredAssertion {
-    pub process_name: String,
-    pub reason: String,
-}
-
-/// The watcher's verdict on the external assertions found in one poll.
-struct ExternalClassification {
-    /// System-idle holders worth upgrading. Nameless holders are kept so
-    /// presence is detected even without a process name.
-    upgradeable: Vec<ExternalAssertion>,
-    /// Holders deliberately not upgraded, with a reason, for display.
-    ignored: Vec<IgnoredAssertion>,
-}
-
-/// What the watcher does with one observed assertion.
-enum Verdict {
-    /// Take a stronger hold while this assertion lasts.
-    Upgrade,
-    /// Neither upgrade nor mention it. Reserved for the operating system's own
-    /// holders: macOS daemons (`powerd`, `runningboardd`, `coreaudiod`, …) hold
-    /// sleep assertions during ordinary use essentially always and release them
-    /// on their own, so upgrading them only flaps the watcher and listing them is
-    /// pure noise. Only the user's programs are ever upgraded.
-    DropSilently,
-    /// Don't upgrade, but say so in the menu, with this reason.
-    Ignore(&'static str),
-}
-
-/// The watcher's decision for a single assertion. `is_system` answers "does this
-/// PID belong to the operating system rather than to the user?" — injected so
-/// the rules can be unit-tested without live PIDs.
-fn verdict_for(
-    assertion: &ExternalAssertion,
-    ignores_app: &impl Fn(&str) -> bool,
-    ignored_once: &HashSet<&str>,
-    is_system: &impl Fn(i32) -> bool,
-) -> Verdict {
-    if is_system(assertion.pid) {
-        return Verdict::DropSilently;
-    }
-    // Type before the ignore lists: a display-only hold was never upgradeable in
-    // the first place, so blaming an ignore rule for it would misattribute the
-    // reason shown in the menu (VLC on the ignore list still reads
-    // "display only", because that is why it isn't upgraded).
-    if assertion.assertion_type != UPGRADE_TRIGGER_TYPE.as_str() {
-        // The only other observed type (see `OBSERVED_TYPES`).
-        return Verdict::Ignore(REASON_DISPLAY_ONLY);
-    }
-    if ignores_app(&assertion.process_name) {
-        return Verdict::Ignore(REASON_USER_IGNORED);
-    }
-    if ignored_once.contains(assertion.process_name.as_str()) {
-        return Verdict::Ignore(REASON_IGNORED_ONCE);
-    }
-    Verdict::Upgrade
-}
-
-/// Split the observed external assertions into the ones worth upgrading and the
-/// ones to report as ignored. Pure (no `IOKit`) so it can be unit-tested.
-fn classify_external_assertions(
-    all: &[ExternalAssertion],
-    ignores_app: &impl Fn(&str) -> bool,
-    ignored_once: &HashSet<&str>,
-    is_system: &impl Fn(i32) -> bool,
-) -> ExternalClassification {
-    let mut upgradeable = Vec::new();
-    let mut listed = Vec::new();
-    for assertion in all {
-        match verdict_for(assertion, ignores_app, ignored_once, is_system) {
-            Verdict::Upgrade => upgradeable.push(assertion.clone()),
-            Verdict::DropSilently => {}
-            Verdict::Ignore(reason) => listed.push((assertion, reason)),
-        }
-    }
-
-    let trigger_names: HashSet<&str> = upgradeable
-        .iter()
-        .map(|a| a.process_name.as_str())
-        .collect();
-    let mut ignored: Vec<IgnoredAssertion> = listed
-        .into_iter()
-        // A nameless holder can't be shown meaningfully, and a process is never
-        // listed as ignored when another of its assertions is upgraded.
-        .filter(|(a, _)| {
-            !a.process_name.is_empty() && !trigger_names.contains(a.process_name.as_str())
-        })
-        .map(|(a, reason)| IgnoredAssertion {
-            process_name: a.process_name.clone(),
-            reason: reason.to_string(),
-        })
-        .collect();
-    ignored.sort();
-    ignored.dedup();
-
-    ExternalClassification {
-        upgradeable,
-        ignored,
-    }
-}
-
-/// Distinct, sorted holder names, so the menu and tooltip stay stable across
-/// polls (and don't show the same app twice when it holds several assertions).
-/// Nameless holders are dropped: they still count as present, but there is
-/// nothing to display.
-fn holder_names(assertions: &[ExternalAssertion]) -> Vec<String> {
-    let mut names: Vec<String> = assertions
-        .iter()
-        .map(|assertion| assertion.process_name.clone())
-        .filter(|name| !name.is_empty())
-        .collect();
-    names.sort();
-    names.dedup();
-    names
 }
 
 /// A sleep-prevention enable running on a background thread. Acquiring an
@@ -341,6 +212,10 @@ pub struct AppState {
     icon_on_rgba: Option<(Vec<u8>, u32, u32)>,
     icon_off_rgba: Option<(Vec<u8>, u32, u32)>,
     last_tooltip: Option<String>,
+    /// While set (a recent [`AppState::show_error_tooltip`]), the per-second
+    /// tooltip refresh leaves the error text in place instead of replacing it
+    /// one tick after the failure.
+    error_tooltip_until: Option<Instant>,
     /// Last menu bar title text pushed to the tray (the live countdown while a
     /// timed session runs, `None` when the icon should stand alone). Mirrors
     /// `last_tooltip`: cached so a per-second refresh only calls `set_title`
@@ -380,13 +255,15 @@ pub struct AppState {
     /// Whether any wait-for-apps target was seen running by the most recent
     /// `check_app_watch` scan, cached so `waiting_for_app_launch` (called later
     /// in the same tick for the tooltip) doesn't repeat the process walk.
-    /// `None` when no scan has run for the current session/selection; readers
-    /// fall back to a fresh scan.
+    /// `None` when no scan has run for the current session/selection — or when
+    /// the last scan *failed* (see `any_target_running_checked`); readers fall
+    /// back to a fresh scan either way.
     app_watch_running: Option<bool>,
     /// How the watcher reads the live external assertions, and how it decides
     /// whether a holder belongs to the OS. Indirected through function pointers
-    /// for the same reason [`verdict_for`] takes its rules as parameters: the
-    /// real ones need `IOKit` and live PIDs, so the session-level behaviour they
+    /// for the same reason the classification rules in
+    /// [`crate::tray::assertion_watch`] take theirs as parameters: the real
+    /// ones need `IOKit` and live PIDs, so the session-level behaviour they
     /// drive (an ignore releasing the hold immediately, a session surviving
     /// because another holder is left) would otherwise be untestable.
     scan_assertions: fn(&[AssertionType]) -> Result<Vec<ExternalAssertion>, u32>,
@@ -403,6 +280,7 @@ impl AppState {
             icon_on_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_ON).ok(),
             icon_off_rgba: tray_icons::decode_icon_rgba(tray_icons::ICON_OFF).ok(),
             last_tooltip: None,
+            error_tooltip_until: None,
             last_title: None,
             start_at_login: install::tray_launch_agent_installed(),
             upgrade_clear_since: None,
@@ -543,129 +421,6 @@ impl AppState {
                 .unwrap_or_else(|| process_enum::any_target_running(&self.config.wait_for_apps))
     }
 
-    /// Set the tray image for the given on/off state without touching the
-    /// session or tooltip. Used to flip the icon optimistically before a
-    /// potentially slow toggle (e.g. the helper RPC in Entirely mode). Reuses
-    /// the icons decoded at startup so a flip never re-decodes the PNG.
-    pub fn show_icon_state(&self, tray: &TrayIcon, on: bool) {
-        let cached = if on {
-            self.icon_on_rgba.as_ref()
-        } else {
-            self.icon_off_rgba.as_ref()
-        };
-        let icon = match cached {
-            Some((rgba, width, height)) => {
-                Icon::from_rgba(rgba.clone(), *width, *height).map_err(|e| e.to_string())
-            }
-            None => {
-                // Startup decode failed; fall back to decoding on demand.
-                let bytes = if on {
-                    tray_icons::ICON_ON
-                } else {
-                    tray_icons::ICON_OFF
-                };
-                tray_icons::decode_icon_rgba(bytes)
-                    .map_err(|e| e.to_string())
-                    .and_then(|(rgba, width, height)| {
-                        Icon::from_rgba(rgba, width, height).map_err(|e| e.to_string())
-                    })
-            }
-        };
-        match icon {
-            Ok(icon) => {
-                let _ = tray.set_icon_with_as_template(Some(icon), true);
-            }
-            Err(e) => eprintln!("failed to decode tray icon: {e}"),
-        }
-    }
-
-    pub fn set_icon(&mut self, tray: &TrayIcon) {
-        // An in-flight enable shows the target on-state while it acquires.
-        self.show_icon_state(tray, self.is_on() || self.is_enabling());
-        self.update_tooltip(tray);
-    }
-
-    /// Whole seconds left on the active timed session, or `None` when there is
-    /// no session or the session carries no time limit (upgrade sessions and
-    /// untimed manual holds). Recomputed from `until` on demand — there is no
-    /// stored countdown to drift.
-    fn remaining_secs(&self) -> Option<u64> {
-        self.session.as_ref().and_then(|session| {
-            session
-                .until
-                .map(|until| until.saturating_sub(sleep_aware_now()).as_secs())
-        })
-    }
-
-    /// The menu bar title shown next to the icon: the minutes remaining while a
-    /// timed session runs (see `format_countdown_minutes` for why not seconds),
-    /// `None` otherwise (idle, enabling, or a session with no time limit) so
-    /// the icon stands alone. Zero is treated as "no title": the session is
-    /// torn down by `check_timeout` on the same tick it hits 0, so there is
-    /// nothing left to count down to.
-    fn menu_bar_title(&self) -> Option<String> {
-        self.remaining_secs()
-            .filter(|&secs| secs > 0)
-            .map(crate::util::duration_parser::format_countdown_minutes)
-    }
-
-    pub fn update_tooltip(&mut self, tray: &TrayIcon) {
-        // Keep the menu bar countdown text in step with the tooltip; this runs
-        // on the same ~1s cadence while a timed session is active.
-        let title = self.menu_bar_title();
-        if self.last_title != title {
-            self.last_title = title.clone();
-            // Clear with `Some("")`, never `None`: tray-icon's macOS backend
-            // silently ignores `set_title(None)` (its `set_title_inner` only
-            // acts on `Some`), which would leave the final countdown value
-            // stuck in the menu bar after the session ends.
-            tray.set_title(Some(title.as_deref().unwrap_or("")));
-        }
-
-        let tooltip = if self.is_installing() {
-            "caffeinate2 (installing helper…)".to_string()
-        } else if self.is_enabling() {
-            if self.pending_mode() == Some(SleepMode::Entirely) {
-                "caffeinate2 (enabling Entirely mode…)".to_string()
-            } else {
-                "caffeinate2 (enabling…)".to_string()
-            }
-        } else if self.is_on() {
-            let remaining = self.remaining_secs();
-            let waiting = self.waiting_for_app_launch();
-            let upgrading = self
-                .session
-                .as_ref()
-                .filter(|session| session.started_by_upgrade)
-                .map(|session| session.upgrade_apps.as_slice());
-            tray_mode::format_active_tooltip(
-                remaining,
-                &self.config.wait_for_apps,
-                waiting,
-                upgrading,
-            )
-        } else {
-            "caffeinate2".to_string()
-        };
-        if self.last_tooltip.as_ref() != Some(&tooltip) {
-            self.last_tooltip = Some(tooltip.clone());
-            let _ = tray.set_tooltip(Some(tooltip));
-        }
-    }
-
-    pub fn invalidate_tooltip(&mut self) {
-        self.last_tooltip = None;
-        self.last_title = None;
-    }
-
-    /// Show an error in the tooltip (e.g. a denied entirely-mode hold).
-    /// Call after `set_icon` so the icon reflects the real state; the text
-    /// persists while idle and is replaced on the next tooltip update.
-    pub fn show_error_tooltip(&mut self, tray: &TrayIcon, message: &str) {
-        let _ = tray.set_tooltip(Some(format!("caffeinate2 — {message}")));
-        self.last_tooltip = None;
-    }
-
     pub fn stop_session(&mut self) {
         // Removing an upgrade session changes the menu's structure (its
         // "Upgrading…" entries), which the checkbox-only sync can't undo — so
@@ -718,14 +473,31 @@ impl AppState {
             self.app_watch_running = None;
             return false;
         }
+        // With no session there is nothing to stop, and nothing reads the scan
+        // either (`waiting_for_app_launch` requires a session too) — skip the
+        // process walk rather than paying for it on every idle tick.
+        if self.session.is_none() {
+            self.app_watch_running = None;
+            return false;
+        }
         // Resolve before the mutable session borrow — the scan can be a
         // process-tree walk. Cache the result for `waiting_for_app_launch`,
         // which runs later in the same tick.
-        let any_running = process_enum::any_target_running(&self.config.wait_for_apps);
-        self.app_watch_running = Some(any_running);
-        let Some(session) = self.session.as_mut() else {
+        let Some(any_running) =
+            process_enum::any_target_running_checked(&self.config.wait_for_apps)
+        else {
+            // Scan failed: "unknown" is not "nothing running". Acting on it
+            // would end the session on one transient enumeration hiccup, with
+            // no debounce — leave the session and its latch alone and let the
+            // next tick's scan decide.
+            self.app_watch_running = None;
             return false;
         };
+        self.app_watch_running = Some(any_running);
+        let session = self
+            .session
+            .as_mut()
+            .expect("session presence checked above");
 
         if any_running {
             session.app_saw_running = true;
@@ -752,6 +524,13 @@ impl AppState {
             self.stop_session();
             return;
         }
+        // A manual start ends the override: the user re-engaging caffeinate2
+        // is the opposite of "leave it off", so the watcher may act again
+        // after this session ends. Without this, stopping any session by hand
+        // muted the watcher for the rest of the triggering app's assertion
+        // episode. (The take-over path sets its own override on the way in,
+        // and does not come through here.)
+        self.upgrade_overridden = false;
         self.start_session();
     }
 
@@ -1039,9 +818,6 @@ impl AppState {
             // Two-phase mode switch: keep the current session until the new hold
             // is acquired. On failure, poll_pending_enable rolls config back and
             // the old session (if any) keeps preventing sleep.
-            if !self.is_on() {
-                self.stop_session();
-            }
             self.start_session_with(mode, false, Some(previous_mode));
         }
         Ok(())
@@ -1110,13 +886,19 @@ impl AppState {
             // The selection just changed, so this re-seed is a fresh "seen
             // running" decision for the new set. Drop the cached scan first so a
             // newly added, already-running target isn't missed by a scan cached
-            // before the change.
+            // before the change. A *failed* scan must not overwrite anything:
+            // downgrading an armed latch to "never seen" on a transient
+            // enumeration failure could leave the session unable to auto-stop.
             process_enum::invalidate_exec_path_cache();
-            let seen = process_enum::any_target_running(&self.config.wait_for_apps);
-            self.app_watch_running = Some(seen);
-            if let Some(session) = self.session.as_mut() {
-                session.app_saw_running = seen;
-                self.last_tooltip = None;
+            if let Some(seen) = process_enum::any_target_running_checked(&self.config.wait_for_apps)
+            {
+                self.app_watch_running = Some(seen);
+                if let Some(session) = self.session.as_mut() {
+                    session.app_saw_running = seen;
+                    self.last_tooltip = None;
+                }
+            } else {
+                self.app_watch_running = None;
             }
         } else {
             // Any cached scan reflects the old selection.
@@ -1338,12 +1120,12 @@ impl AppState {
                 *last_seen = now;
             }
         }
-        let before = self.upgrade_ignored_once.len();
+        // Expiry needs no menu rebuild: an entry can only expire after its
+        // holder has been gone for the grace period, so no "Ignoring…" line
+        // references it (the classify diff in `poll_upgrade` flagged that
+        // rebuild when the holder disappeared).
         self.upgrade_ignored_once
             .retain(|_, last_seen| now.duration_since(*last_seen) < UPGRADE_CLEAR_GRACE);
-        if self.upgrade_ignored_once.len() != before {
-            self.menu_dirty = true;
-        }
     }
 
     /// Whether the watcher is actively upgrading right now (a committed session
@@ -1431,7 +1213,7 @@ impl AppState {
         let mut new_config = self.config.clone();
         new_config
             .ignored_apps
-            .retain(|ignored| !ignored.eq_ignore_ascii_case(name));
+            .retain(|ignored| !tray_mode::same_app_name(ignored, name));
         tray_mode::save_config(&new_config)?;
         self.config = new_config;
 
@@ -1439,7 +1221,7 @@ impl AppState {
         // than leaving it in the menu this rebuild puts up, to be corrected a
         // poll later. The upgrade itself still waits for that poll.
         self.upgrade_ignored
-            .retain(|entry| !entry.process_name.eq_ignore_ascii_case(name));
+            .retain(|entry| !tray_mode::same_app_name(&entry.process_name, name));
         self.menu_dirty = true;
         Ok(())
     }
@@ -1657,6 +1439,8 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tray::assertion_watch::REASON_IGNORED_ONCE;
+    use crate::tray::assertion_watch::fixtures::{SYSTEM_PID, assertion, ignored};
 
     /// A bare `AppState` that touches neither the on-disk config nor the
     /// launch-agent probe, for exercising pure state transitions.
@@ -1669,6 +1453,7 @@ mod tests {
             icon_on_rgba: None,
             icon_off_rgba: None,
             last_tooltip: None,
+            error_tooltip_until: None,
             last_title: None,
             start_at_login: false,
             upgrade_clear_since: None,
@@ -1849,15 +1634,20 @@ mod tests {
         state.pending_enable = Some(installing_pending_enable(rx));
 
         // Cancel: the dialog can't be revoked, so the entry stays tracked
-        // (cancelled) while the UI reads idle.
+        // (cancelled) while the UI reads idle. The manual stop also latches
+        // the upgrade override.
         state.toggle();
         assert!(state.pending_enable.as_ref().is_some_and(|p| p.cancelled));
         assert!(!state.is_enabling());
+        assert!(state.upgrade_overridden);
 
         // Re-enable: must re-attach to the in-flight worker, not spawn a new
-        // one (which would stack a second password dialog).
+        // one (which would stack a second password dialog) — and a manual
+        // start must clear the override so the watcher isn't muted for the
+        // rest of the trigger episode.
         state.toggle();
         assert!(state.is_enabling());
+        assert!(!state.upgrade_overridden);
 
         // Still the original worker's channel: its result is the one consumed.
         tx.send(Err(EnableError::Ipc("mock install failure".into())))
@@ -2063,168 +1853,6 @@ mod tests {
         assert!(!state.is_on());
     }
 
-    /// PID of a holder the injected classifier calls a system program.
-    const SYSTEM_PID: i32 = 1;
-    /// PID of a holder that belongs to the user.
-    const USER_PID: i32 = 501;
-
-    fn assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
-        ExternalAssertion {
-            pid: USER_PID,
-            process_name: name.to_string(),
-            assertion_type: type_.as_str().to_string(),
-        }
-    }
-
-    fn system_assertion(name: &str, type_: AssertionType) -> ExternalAssertion {
-        ExternalAssertion {
-            pid: SYSTEM_PID,
-            ..assertion(name, type_)
-        }
-    }
-
-    fn ignored(name: &str, reason: &str) -> IgnoredAssertion {
-        IgnoredAssertion {
-            process_name: name.to_string(),
-            reason: reason.to_string(),
-        }
-    }
-
-    /// Classify with no ignore rules beyond the system check, which the tests
-    /// drive through the PID rather than live processes.
-    fn classify(all: &[ExternalAssertion]) -> ExternalClassification {
-        classify_with(all, &|_| false, &HashSet::new())
-    }
-
-    fn classify_with(
-        all: &[ExternalAssertion],
-        ignores_app: &impl Fn(&str) -> bool,
-        ignored_once: &HashSet<&str>,
-    ) -> ExternalClassification {
-        classify_external_assertions(all, ignores_app, ignored_once, &|pid| pid == SYSTEM_PID)
-    }
-
-    #[test]
-    fn system_idle_holder_is_upgradeable_not_ignored() {
-        let all = [assertion(
-            "Claude Code",
-            AssertionType::PreventUserIdleSystemSleep,
-        )];
-        let result = classify(&all);
-        assert_eq!(result.upgradeable.len(), 1);
-        assert_eq!(result.upgradeable[0].process_name, "Claude Code");
-        assert!(result.ignored.is_empty());
-    }
-
-    /// Every system program is dropped — not just a hardcoded few — whatever it
-    /// is called and whichever sleep-relevant assertion it holds.
-    #[test]
-    fn system_programs_are_neither_triggers_nor_listed() {
-        let all = [
-            system_assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
-            system_assertion("runningboardd", AssertionType::PreventUserIdleSystemSleep),
-            system_assertion("coreaudiod", AssertionType::PreventUserIdleSystemSleep),
-            system_assertion("Music", AssertionType::PreventUserIdleDisplaySleep),
-        ];
-        let result = classify(&all);
-        // These never trigger an upgrade ...
-        assert!(result.upgradeable.is_empty());
-        // ... and, being the OS's own business, are dropped from the menu.
-        assert!(result.ignored.is_empty());
-    }
-
-    #[test]
-    fn display_only_holder_is_ignored() {
-        let all = [assertion(
-            "Safari",
-            AssertionType::PreventUserIdleDisplaySleep,
-        )];
-        let result = classify(&all);
-        assert!(result.upgradeable.is_empty());
-        assert_eq!(result.ignored, vec![ignored("Safari", REASON_DISPLAY_ONLY)]);
-    }
-
-    #[test]
-    fn user_ignored_app_is_listed_with_its_own_reason() {
-        let all = [assertion("Zoom", AssertionType::PreventUserIdleSystemSleep)];
-        let result = classify_with(&all, &|name| name == "Zoom", &HashSet::new());
-        assert!(result.upgradeable.is_empty());
-        assert_eq!(result.ignored, vec![ignored("Zoom", REASON_USER_IGNORED)]);
-    }
-
-    /// A display-only hold was never upgradeable, so an ignore rule is not the
-    /// reason it isn't upgraded and must not be shown as one.
-    #[test]
-    fn display_only_reason_wins_over_the_ignore_lists() {
-        let all = [assertion("VLC", AssertionType::PreventUserIdleDisplaySleep)];
-        let once: HashSet<&str> = ["VLC"].into_iter().collect();
-        assert_eq!(
-            classify_with(&all, &|name| name == "VLC", &once).ignored,
-            vec![ignored("VLC", REASON_DISPLAY_ONLY)]
-        );
-    }
-
-    #[test]
-    fn ignored_once_holder_is_listed_and_not_upgraded() {
-        let all = [assertion(
-            "Codex",
-            AssertionType::PreventUserIdleSystemSleep,
-        )];
-        let once: HashSet<&str> = ["Codex"].into_iter().collect();
-        let result = classify_with(&all, &|_| false, &once);
-        assert!(result.upgradeable.is_empty());
-        assert_eq!(result.ignored, vec![ignored("Codex", REASON_IGNORED_ONCE)]);
-        // Without the ignore-once entry the same assertion is upgraded again.
-        assert_eq!(classify(&all).upgradeable.len(), 1);
-    }
-
-    #[test]
-    fn nameless_holder_is_dropped_from_ignored_but_still_a_trigger() {
-        let all = [
-            assertion("", AssertionType::PreventUserIdleSystemSleep),
-            assertion("", AssertionType::PreventUserIdleDisplaySleep),
-        ];
-        let result = classify(&all);
-        // The nameless system-idle hold still counts as upgradeable (presence is
-        // detected without a name) ...
-        assert_eq!(result.upgradeable.len(), 1);
-        // ... but no nameless entry is shown in the ignored list.
-        assert!(result.ignored.is_empty());
-    }
-
-    #[test]
-    fn upgraded_process_is_not_double_listed_as_ignored() {
-        // One process holds both a system-idle (upgraded) and a display hold;
-        // it must not also appear under "ignored".
-        let all = [
-            assertion("Zoom", AssertionType::PreventUserIdleSystemSleep),
-            assertion("Zoom", AssertionType::PreventUserIdleDisplaySleep),
-        ];
-        let result = classify(&all);
-        assert_eq!(result.upgradeable.len(), 1);
-        assert!(result.ignored.is_empty());
-    }
-
-    #[test]
-    fn ignored_list_is_sorted_and_deduped() {
-        let all = [
-            assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
-            // A system holder is silently dropped, so it never reaches the list.
-            system_assertion("powerd", AssertionType::PreventUserIdleSystemSleep),
-            assertion("IINA", AssertionType::PreventUserIdleDisplaySleep),
-            // Duplicate display hold from the same app collapses to one entry.
-            assertion("VLC", AssertionType::PreventUserIdleDisplaySleep),
-        ];
-        let result = classify(&all);
-        assert_eq!(
-            result.ignored,
-            vec![
-                ignored("IINA", REASON_DISPLAY_ONLY),
-                ignored("VLC", REASON_DISPLAY_ONLY),
-            ]
-        );
-    }
-
     /// An ignore-once entry survives the holder briefly dropping its assertion
     /// (agents do this between turns) and expires only after the same grace the
     /// session release uses.
@@ -2254,7 +1882,6 @@ mod tests {
         );
         state.age_ignored_once(&[]);
         assert!(state.upgrade_ignored_once.is_empty());
-        assert!(state.menu_dirty);
     }
 
     fn upgrade_session_for(apps: &[&str]) -> ActiveTraySession {

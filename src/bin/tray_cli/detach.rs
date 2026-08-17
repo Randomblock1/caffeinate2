@@ -25,10 +25,10 @@ fn child_log_path() -> Option<PathBuf> {
 /// image spawned with no arguments — the absent `-d` is what stops it from
 /// detaching again, and its own `acquire_or_exit` enforces single-instance.
 pub fn spawn_detached_or_exit() -> ! {
-    // The child's stderr goes to /dev/null, so its "already running" message
-    // would be invisible; check the lock here where the user can see it. The
-    // child's own acquire remains authoritative for the race window between
-    // this probe and its startup.
+    // The child's "already running" message lands only in its log file, not
+    // this terminal; check the lock here where the user can see the outcome.
+    // The child's own acquire remains authoritative for the race window
+    // between this probe and its startup.
     match probe() {
         InstanceProbe::Running => {
             eprintln!("caffeinate2-tray: another instance is already running");

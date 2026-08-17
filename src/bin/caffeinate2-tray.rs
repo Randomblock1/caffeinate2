@@ -1,18 +1,18 @@
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 mod tray_cli;
 
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 use anyhow::Context;
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 use caffeinate2::entirely::install;
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 use caffeinate2::util::logging;
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 use clap::Parser;
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 use tray_cli::{Args, MaintenanceCommand};
 
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 fn run_maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
     match command {
         MaintenanceCommand::InstallLaunchAgent => {
@@ -42,7 +42,7 @@ fn run_maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "tray"))]
+#[cfg(target_os = "macos")]
 fn main() {
     // The tray CLI has no verbose flag, so tracing uses the default filter
     // (RUST_LOG still overrides it).
@@ -66,8 +66,10 @@ fn main() {
     }
 }
 
-#[cfg(not(all(target_os = "macos", feature = "tray")))]
+// The `tray` feature is guaranteed by this binary's `required-features`, so
+// the only way to get here is a non-macOS target.
+#[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("caffeinate2-tray requires macOS and the tray feature.");
+    eprintln!("caffeinate2-tray requires macOS.");
     std::process::exit(1);
 }

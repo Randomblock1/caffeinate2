@@ -10,6 +10,7 @@
 //! synchronously inside a button action, which would re-enter `AppState`).
 
 use crate::tray::app_target::WatchTarget;
+use crate::tray::macos_activation::ForegroundActivation;
 use crate::tray::macos_apps;
 use crate::tray::process_enum::{self, BundleRef, ProgramRow};
 use block2::RcBlock;
@@ -17,10 +18,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAccessibility, NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSImage, NSImageView, NSModalResponse, NSModalResponseOK,
-    NSOpenPanel, NSRunningApplication, NSScrollView, NSSearchField, NSTableColumn, NSTableView,
+    NSAccessibility, NSApplication, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSImage, NSImageView, NSModalResponse,
+    NSModalResponseOK, NSOpenPanel, NSScrollView, NSSearchField, NSTableColumn, NSTableView,
     NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
@@ -94,9 +94,6 @@ struct Ivars {
     /// list to show, so [`WaitController::rebuild`] renders a retry notice
     /// instead of an empty picker.
     scan_failed: Cell<bool>,
-    /// The app that was frontmost before the picker stole focus, so closing
-    /// can hand activation back instead of leaving focus in limbo.
-    previous_app: RefCell<Option<Retained<NSRunningApplication>>>,
     tx: Sender<WaitWindowMsg>,
     table: RefCell<Option<Retained<NSTableView>>>,
     window: RefCell<Option<Retained<NSWindow>>>,
@@ -217,19 +214,10 @@ define_class!(
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             // Any close path must report a result so the run loop drops its
-            // handle, and must restore Accessory so no Dock icon lingers.
+            // handle — and with it the [`ForegroundActivation`] that restores
+            // the Accessory policy and hands focus back.
             if !self.ivars().decided.replace(true) {
                 let _ = self.ivars().tx.send(WaitWindowMsg::Cancel);
-            }
-            let app = NSApplication::sharedApplication(self.ivars().mtm);
-            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-            // Hand focus back explicitly: flipping Regular -> Accessory while
-            // frontmost otherwise strands keyboard focus until the user
-            // clicks another app.
-            if let Some(prev) = self.ivars().previous_app.borrow_mut().take()
-                && !prev.isTerminated()
-            {
-                prev.activateWithOptions(NSApplicationActivationOptions::empty());
             }
             crate::tray::macos_activation::wake_event_loop();
         }
@@ -257,7 +245,6 @@ impl WaitController {
             last_refresh_request: RefCell::new(None),
             decided: Cell::new(false),
             scan_failed: Cell::new(false),
-            previous_app: RefCell::new(None),
             tx,
             table: RefCell::new(None),
             window: RefCell::new(None),
@@ -396,8 +383,12 @@ impl WaitController {
 
     fn choose_app(&self) {
         let panel = NSOpenPanel::openPanel(self.ivars().mtm);
-        panel.setCanChooseFiles(false);
-        panel.setCanChooseDirectories(true);
+        // An .app bundle counts as a *file* for the panel's choosability rules
+        // (packages only read as directories under
+        // treatsFilePackagesAsDirectories), so files must be choosable or the
+        // Choose button never enables for any application.
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(false);
         panel.setAllowsMultipleSelection(false);
         panel.setResolvesAliases(true);
         panel.setTreatsFilePackagesAsDirectories(false);
@@ -462,19 +453,6 @@ impl WaitController {
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             window.close();
         }
-    }
-
-    /// Record the app that is about to lose focus to the picker, unless it is
-    /// us (re-raising an already-frontmost picker must not clobber the real
-    /// hand-back target).
-    fn remember_frontmost(&self) {
-        let Some(front) = NSWorkspace::sharedWorkspace().frontmostApplication() else {
-            return;
-        };
-        if front.processIdentifier() == std::process::id().cast_signed() {
-            return;
-        }
-        *self.ivars().previous_app.borrow_mut() = Some(front);
     }
 
     /// Cached app/program icon at menu-bar size.
@@ -592,9 +570,11 @@ impl WaitController {
 }
 
 /// Live handle the run loop keeps so the window/controller stay alive. Dropping
-/// it releases the controller (and the window it owns).
+/// it releases the controller (and the window it owns) and, via the activation
+/// guard, restores the Accessory policy and hands focus back.
 pub struct WaitWindow {
     controller: Retained<WaitController>,
+    _activation: ForegroundActivation,
 }
 
 impl WaitWindow {
@@ -636,7 +616,9 @@ impl WaitWindow {
         }
     }
 
-    /// Bring an already-open picker back to the front instead of opening a second copy.
+    /// Bring an already-open picker back to the front instead of opening a
+    /// second copy. The activation guard already holds the Regular promotion
+    /// and the hand-back target, so this is pure window ordering.
     pub fn bring_to_front(&self) {
         // Window operations after a decision (Apply/Cancel/close) are no-ops.
         if self.controller.ivars().decided.get() {
@@ -644,7 +626,6 @@ impl WaitWindow {
         }
         let mtm = self.controller.ivars().mtm;
         if let Some(window) = self.controller.ivars().window.borrow().as_ref() {
-            self.controller.remember_frontmost();
             activate_and_order_front(mtm, window);
         }
     }
@@ -654,17 +635,16 @@ const fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-/// Flip to Regular and force the picker to the foreground. On macOS 14+
-/// `NSApplication::activate` is cooperative — honored only if the frontmost
-/// app yields — so relying on it leaves the window behind the active app.
-/// The window is ordered front before activating so activation has an
-/// on-screen window to focus; `orderFrontRegardless` then puts it visually
-/// frontmost even when activation is deferred. The forceful legacy activation
-/// grabs key focus on pre-Sonoma systems and degrades to plain `activate` on
-/// 14+.
+/// Force the picker to the foreground (the caller holds the Regular promotion
+/// via [`ForegroundActivation`]). On macOS 14+ `NSApplication::activate` is
+/// cooperative — honored only if the frontmost app yields — so relying on it
+/// leaves the window behind the active app. The window is ordered front before
+/// activating so activation has an on-screen window to focus;
+/// `orderFrontRegardless` then puts it visually frontmost even when activation
+/// is deferred. The forceful legacy activation grabs key focus on pre-Sonoma
+/// systems and degrades to plain `activate` on 14+.
 fn activate_and_order_front(mtm: MainThreadMarker, window: &NSWindow) {
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
@@ -892,11 +872,15 @@ pub fn open(
 
     controller.rebuild();
 
-    // An Accessory app can't focus a window; flip to Regular to show it, then
-    // restore Accessory in windowWillClose:.
-    controller.remember_frontmost();
+    // An Accessory app can't focus a window; hold the Regular promotion for
+    // the window's lifetime. Dropping the returned handle restores Accessory
+    // and hands focus back to the app the picker took it from.
+    let activation = ForegroundActivation::enter(mtm);
     window.center();
     activate_and_order_front(mtm, &window);
 
-    WaitWindow { controller }
+    WaitWindow {
+        controller,
+        _activation: activation,
+    }
 }

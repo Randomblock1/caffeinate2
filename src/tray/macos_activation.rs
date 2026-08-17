@@ -1,4 +1,3 @@
-#[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn init_tray_app() {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use objc2_foundation::MainThreadMarker;
@@ -11,7 +10,6 @@ pub fn init_tray_app() {
     app.finishLaunching();
 }
 
-#[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn wake_event_loop() {
     use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_core_foundation::CFRunLoop;
@@ -48,9 +46,84 @@ pub fn wake_event_loop() {
     }
 }
 
+/// The activation-policy promotion shared by every foreground surface (the
+/// "Wait for apps…" picker, the upgrade dialog). Main-thread only, like the
+/// policy it guards.
+struct ForegroundState {
+    holders: usize,
+    /// The app to hand activation back to once the last holder drops.
+    previous: Option<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>>,
+}
+
+thread_local! {
+    static FOREGROUND: std::cell::RefCell<ForegroundState> = const {
+        std::cell::RefCell::new(ForegroundState {
+            holders: 0,
+            previous: None,
+        })
+    };
+}
+
+/// RAII promotion of this Accessory (menu-bar) app to a Regular foreground app
+/// so a window or dialog can take key focus. Nesting-safe via a refcount: the
+/// first holder records the app about to lose focus (never this process) and
+/// flips the policy; the last drop flips it back, hands activation to the
+/// recorded app, and wakes the event loop. A dialog opening over the picker
+/// therefore neither demotes the app nor steals the picker's hand-back target.
+pub(crate) struct ForegroundActivation {
+    mtm: objc2_foundation::MainThreadMarker,
+}
+
+impl ForegroundActivation {
+    pub(crate) fn enter(mtm: objc2_foundation::MainThreadMarker) -> Self {
+        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
+
+        FOREGROUND.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.holders == 0 {
+                // Record the hand-back target, skipping ourselves: promoting
+                // while already frontmost must not clobber the real target.
+                state.previous = NSWorkspace::sharedWorkspace()
+                    .frontmostApplication()
+                    .filter(|front| front.processIdentifier() != std::process::id().cast_signed());
+                NSApplication::sharedApplication(mtm)
+                    .setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            }
+            state.holders += 1;
+        });
+        Self { mtm }
+    }
+}
+
+impl Drop for ForegroundActivation {
+    fn drop(&mut self) {
+        use objc2_app_kit::{
+            NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+        };
+
+        FOREGROUND.with(|state| {
+            let mut state = state.borrow_mut();
+            state.holders -= 1;
+            if state.holders > 0 {
+                return;
+            }
+            NSApplication::sharedApplication(self.mtm)
+                .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            // Hand focus back explicitly: flipping Regular -> Accessory while
+            // frontmost otherwise strands keyboard focus until the user clicks
+            // another app.
+            if let Some(previous) = state.previous.take()
+                && !previous.isTerminated()
+            {
+                previous.activateWithOptions(NSApplicationActivationOptions::empty());
+            }
+        });
+        wake_event_loop();
+    }
+}
+
 /// Forward tray/menu events to channels. `tray-icon` and `muda` only deliver
 /// events through `set_event_handler`; `receiver()` is disabled once a handler is set.
-#[cfg(all(target_os = "macos", feature = "tray"))]
 #[must_use]
 pub fn install_tray_event_handlers() -> (
     std::sync::mpsc::Receiver<tray_icon::TrayIconEvent>,
@@ -75,20 +148,35 @@ pub fn install_tray_event_handlers() -> (
     (tray_rx, menu_rx)
 }
 
-/// Keeps `NSWorkspace` launch/terminate observers registered for the app lifetime.
-#[cfg(all(target_os = "macos", feature = "tray"))]
+/// Keeps `NSWorkspace` launch/terminate observers registered while it lives,
+/// and unregisters them on drop. Today the tray holds one for the whole
+/// process, so the drop runs only at exit — the impl exists so the type keeps
+/// the promise its name makes, and a future shorter-lived guard doesn't leave
+/// stacked callbacks registered forever.
 pub struct WorkspaceObserverGuard {
-    _launch:
+    launch:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
-    _terminate:
+    terminate:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
     _launch_block: block2::RcBlock<dyn Fn(std::ptr::NonNull<objc2_foundation::NSNotification>)>,
     _terminate_block: block2::RcBlock<dyn Fn(std::ptr::NonNull<objc2_foundation::NSNotification>)>,
 }
 
+impl Drop for WorkspaceObserverGuard {
+    fn drop(&mut self) {
+        use objc2_app_kit::NSWorkspace;
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // msg_send: `removeObserver:` takes a plain object, and the block
+        // observer is typed as a protocol object rather than AnyObject.
+        unsafe {
+            let _: () = objc2::msg_send![&center, removeObserver: &*self.launch];
+            let _: () = objc2::msg_send![&center, removeObserver: &*self.terminate];
+        }
+    }
+}
+
 /// Register observers for app launch/quit. The returned flag is set (and the
 /// event loop woken) whenever the running-apps set may have changed.
-#[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn install_workspace_observers() -> (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     WorkspaceObserverGuard,
@@ -142,8 +230,8 @@ pub fn install_workspace_observers() -> (
     };
 
     let guard = WorkspaceObserverGuard {
-        _launch: launch_observer,
-        _terminate: terminate_observer,
+        launch: launch_observer,
+        terminate: terminate_observer,
         _launch_block: launch_block,
         _terminate_block: terminate_block,
     };
@@ -156,7 +244,6 @@ pub fn install_workspace_observers() -> (
 /// without waiting out the full interval.
 ///
 /// `None` blocks until an event arrives or [`wake_event_loop`] is called.
-#[cfg(all(target_os = "macos", feature = "tray"))]
 pub fn pump_event_loop(timeout: Option<std::time::Duration>) {
     use objc2_app_kit::{NSApplication, NSEventMask};
     use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode};

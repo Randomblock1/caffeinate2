@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 static INSTANCE_LOCK: OnceLock<Flock<File>> = OnceLock::new();
 
 /// Result of a non-destructive single-instance check.
+#[derive(Debug)]
 pub enum InstanceProbe {
     Available,
     Running,
@@ -35,16 +36,28 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
 }
 
 /// Check whether another tray instance holds the single-instance lock, without
-/// taking ownership: the lock is released immediately, and the lock file's
-/// contents (the owner's PID) are left untouched. Used by the detaching parent
-/// before it spawns a background child whose stderr goes to /dev/null, where
-/// the child's own "already running" message would be invisible.
+/// taking ownership or touching the lock state at all. Used by the detaching
+/// parent so the user sees "already running" in their terminal (the background
+/// child's own message goes only to its log).
+///
+/// Look-don't-touch on purpose: the previous implementation briefly *took* the
+/// exclusive lock and dropped it, and a tray starting during that instant
+/// (login item racing a manual launch) saw the lock held and quit spuriously.
+/// `F_GETLK` only asks the kernel whether a lock would conflict — verified on
+/// Darwin to observe another process's `flock` — so the probe can no longer
+/// make anyone else's acquisition fail.
 pub fn probe() -> InstanceProbe {
     let path = match lock_path() {
         Ok(path) => path,
         Err(error) => return InstanceProbe::Indeterminate(error.to_string()),
     };
-    let file = match open_lock_file(&path) {
+    probe_path(&path)
+}
+
+fn probe_path(path: &Path) -> InstanceProbe {
+    use std::os::fd::AsRawFd;
+
+    let file = match open_lock_file(path) {
         Ok(file) => file,
         Err(error) => {
             return InstanceProbe::Indeterminate(format!(
@@ -53,17 +66,23 @@ pub fn probe() -> InstanceProbe {
             ));
         }
     };
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(flock) => {
-            // Nobody holds the lock; release it (drop unlocks and closes) so
-            // the instance we are about to spawn can take it.
-            drop(flock);
-            InstanceProbe::Available
-        }
-        Err((_, Errno::EWOULDBLOCK)) => InstanceProbe::Running,
-        Err((_, error)) => {
-            InstanceProbe::Indeterminate(format!("could not lock {}: {error}", path.display()))
-        }
+    // SAFETY: zeroed is a valid flock value; the fd is open for the whole call.
+    let mut query: libc::flock = unsafe { std::mem::zeroed() };
+    query.l_type = libc::F_WRLCK;
+    query.l_whence = libc::SEEK_SET as i16;
+    // l_start/l_len stay 0: the whole file, matching what flock() covers.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut query) };
+    if ret == -1 {
+        let error = std::io::Error::last_os_error();
+        return InstanceProbe::Indeterminate(format!(
+            "could not query lock {}: {error}",
+            path.display()
+        ));
+    }
+    if query.l_type == libc::F_UNLCK {
+        InstanceProbe::Available
+    } else {
+        InstanceProbe::Running
     }
 }
 
@@ -137,5 +156,50 @@ pub fn acquire_or_exit() {
     if INSTANCE_LOCK.set(flock).is_err() {
         eprintln!("caffeinate2-tray: single-instance lock already initialized");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_sees_a_held_lock_without_disturbing_it() {
+        // Failures print the actual variant: Indeterminate carries the errno
+        // detail, which matters on a test validating kernel behavior.
+        #[track_caller]
+        fn assert_probe(path: &Path, want_running: bool) {
+            let got = probe_path(path);
+            let ok = matches!(
+                (&got, want_running),
+                (InstanceProbe::Running, true) | (InstanceProbe::Available, false)
+            );
+            assert!(
+                ok,
+                "expected {}, got {got:?}",
+                if want_running { "Running" } else { "Available" }
+            );
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "caffeinate2-probe-test-{}.lock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert_probe(&path, false);
+
+        // A separate descriptor in the same process is a distinct flock owner,
+        // and F_GETLK reports its lock (verified on Darwin).
+        let file = open_lock_file(&path).unwrap();
+        let held = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert_probe(&path, true);
+        // The probe must not have released the holder's lock.
+        assert_probe(&path, true);
+
+        drop(held);
+        assert_probe(&path, false);
+        let _ = std::fs::remove_file(&path);
     }
 }

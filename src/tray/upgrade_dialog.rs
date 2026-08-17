@@ -19,14 +19,14 @@
 
 use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::app;
+use crate::tray::macos_activation::ForegroundActivation;
 use crate::util::duration_parser::format_countdown_minutes;
 use block2::RcBlock;
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationOptions,
-    NSApplicationActivationPolicy, NSModalPanelRunLoopMode, NSModalResponse, NSModalResponseAbort,
-    NSPopUpButton, NSRunningApplication, NSWorkspace,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSModalPanelRunLoopMode,
+    NSModalResponse, NSModalResponseAbort, NSPopUpButton,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSPoint, NSRect, NSRunLoop, NSSize, NSString, NSTimer,
@@ -137,28 +137,19 @@ pub fn ask(
 }
 
 /// Run the alert with the app temporarily promoted to a regular (foreground)
-/// app, so a menu-bar-only process actually gets a focused, frontmost dialog,
-/// then hand activation back the way the picker window does — flipping Regular
-/// back to Accessory while frontmost otherwise strands keyboard focus.
+/// app, so a menu-bar-only process actually gets a focused, frontmost dialog.
+/// The [`ForegroundActivation`] guard restores the policy and hands activation
+/// back on drop — unless the "Wait for apps…" picker still holds the
+/// promotion, in which case the app stays Regular and the picker keeps focus.
 fn run_modal(mtm: MainThreadMarker, alert: &NSAlert) -> NSModalResponse {
+    let _activation = ForegroundActivation::enter(mtm);
     let app = NSApplication::sharedApplication(mtm);
-    let previous: Option<Retained<NSRunningApplication>> =
-        NSWorkspace::sharedWorkspace().frontmostApplication();
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
 
     let ticker = modal_ticker();
     let response = alert.runModal();
     ticker.invalidate();
-
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    if let Some(previous) = previous
-        && !previous.isTerminated()
-    {
-        previous.activateWithOptions(NSApplicationActivationOptions::empty());
-    }
-    crate::tray::macos_activation::wake_event_loop();
     response
 }
 

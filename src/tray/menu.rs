@@ -23,7 +23,6 @@ pub enum MenuCommand {
     Quit,
     ToggleStartAtLogin,
     ToggleUpgradeExternal,
-    OpenWaitForAppsWindow,
     SetMode(SleepMode),
     SetTimeLimit(Option<u64>),
     /// Drop a program from the ignore list, so the watcher upgrades it again.
@@ -41,9 +40,9 @@ impl MenuHandles {
         if event_id == &self.upgrade_external_id {
             return Some(MenuCommand::ToggleUpgradeExternal);
         }
-        if event_id == &self.wait_for_apps_id {
-            return Some(MenuCommand::OpenWaitForAppsWindow);
-        }
+        // `wait_for_apps_id` is deliberately absent: the run loop intercepts
+        // that event before `handle_menu_event` runs (it owns the AppKit
+        // window code), so resolving it here would be dead code.
         for (id, mode, _) in &self.mode_items {
             if event_id == id {
                 return Some(MenuCommand::SetMode(*mode));
@@ -285,12 +284,14 @@ pub fn dispatch_command(
 ) -> MenuAction {
     match command {
         MenuCommand::Quit => return MenuAction::Quit,
-        // The run loop owns the AppKit window code, so it handles this one.
-        MenuCommand::OpenWaitForAppsWindow => return MenuAction::Unhandled,
         MenuCommand::ToggleStartAtLogin => {
             let new_val = !state.menu_snapshot().start_at_login;
             if let Err(e) = state.set_start_at_login(new_val) {
                 eprintln!("{e}");
+                // Under the LaunchAgent, launchd discards stderr — and nobody
+                // is tailing the -d log file while clicking menu items. The
+                // tooltip is the tray's error surface, as in the arms below.
+                state.show_error_tooltip(tray, &e.to_string());
             }
         }
         MenuCommand::ToggleUpgradeExternal => {
@@ -343,6 +344,7 @@ pub fn dispatch_command(
         MenuCommand::SetTimeLimit(secs) => {
             if let Err(e) = state.set_time_limit(*secs) {
                 eprintln!("{e}");
+                state.show_error_tooltip(tray, &e.to_string());
             } else if state.is_on() {
                 state.update_tooltip(tray);
             }

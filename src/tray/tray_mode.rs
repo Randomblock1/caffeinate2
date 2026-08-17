@@ -1,15 +1,13 @@
 use crate::sleep::sleep_mode::SleepMode;
-use crate::tray::app_target::{AppTarget, WatchTarget};
+use crate::tray::app_target::WatchTarget;
 use crate::tray::error::TrayError;
 use crate::util::duration_parser::format_remaining_secs;
 use crate::util::fs_util;
 use serde::{Deserialize, Serialize};
 
 /// Bumped to 2 when the single `wait_for_app` target became the multi-select
-/// `wait_for_apps` list.
-///
-/// Migration is handled by `normalize_legacy`, not the version field (the
-/// loader never gates parsing on it).
+/// `wait_for_apps` list. Recorded for future format changes; the loader never
+/// gates parsing on it.
 pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +62,6 @@ pub struct TrayConfig {
     /// must NOT fall back to the whole-struct `Default`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wait_for_apps: Vec<WatchTarget>,
-    /// Legacy v1 single target. Read-only on load (`skip_serializing`, never
-    /// written back); `normalize_legacy` folds it into `wait_for_apps`. Kept so
-    /// an old `[wait_for_app]` table still deserializes instead of tripping the
-    /// `unwrap_or_default()` fallback and wiping every other setting.
-    #[serde(default, skip_serializing)]
-    pub wait_for_app: Option<AppTarget>,
     /// Watch for low-level sleep assertions from other processes and upgrade
     /// them to Entirely mode while they last. `serde(default)` keeps old
     /// configs (without this key) loadable.
@@ -95,7 +87,6 @@ impl Default for TrayConfig {
             mode: SleepMode::default(),
             time_limit_secs: None,
             wait_for_apps: Vec::new(),
-            wait_for_app: None,
             upgrade_external: false,
             ignored_apps: Vec::new(),
         }
@@ -103,17 +94,6 @@ impl Default for TrayConfig {
 }
 
 impl TrayConfig {
-    /// Fold a legacy v1 single `wait_for_app` target into `wait_for_apps`, then
-    /// clear it so it is never written back. Idempotent; a no-op once migrated.
-    fn normalize_legacy(&mut self) {
-        if let Some(old) = self.wait_for_app.take() {
-            let target = WatchTarget::from_app_target(old);
-            if !self.wait_for_apps.iter().any(|t| t.key() == target.key()) {
-                self.wait_for_apps.push(target);
-            }
-        }
-    }
-
     /// Sort, dedupe (case-insensitively) and drop blank entries from
     /// `ignored_apps`, so a hand-edited config behaves like a menu-edited one
     /// and the **Ignored apps** submenu lists each program exactly once.
@@ -130,8 +110,18 @@ impl TrayConfig {
     pub fn ignores_app(&self, name: &str) -> bool {
         self.ignored_apps
             .iter()
-            .any(|ignored| ignored.eq_ignore_ascii_case(name))
+            .any(|ignored| same_app_name(ignored, name))
     }
+}
+
+/// Case-insensitive app-name equality, using the same Unicode `to_lowercase`
+/// that [`TrayConfig::normalize_ignored_apps`] sorts and dedups with. Every
+/// comparison against `ignored_apps` must go through this: an ASCII-only
+/// comparison treats two names differing in non-ASCII case ("CAFÉ" vs "Café")
+/// as different apps, so such an ignore entry silently never matches.
+#[must_use]
+pub fn same_app_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 ///
@@ -176,7 +166,6 @@ pub fn load_config() -> TrayConfig {
             TrayConfig::default()
         }
     };
-    config.normalize_legacy();
     config.normalize_ignored_apps();
     config
 }
@@ -268,7 +257,7 @@ pub fn format_active_tooltip(
     }
 }
 
-#[cfg(all(test, feature = "tray"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -290,30 +279,6 @@ mod tests {
             toml::from_str("mode = \"display\"\ntime_limit_secs = 1800\n").unwrap();
         assert_eq!(config.mode, SleepMode::Display);
         assert_eq!(config.time_limit_secs, Some(1800));
-    }
-
-    #[test]
-    fn parse_config_migrates_v1_single_app() {
-        let mut config: TrayConfig = toml::from_str(
-            r#"
-mode = "system"
-
-[wait_for_app]
-bundle_id = "com.example.app"
-name = "Example"
-"#,
-        )
-        .unwrap();
-        config.normalize_legacy();
-        // Legacy single target folds into the multi-select list and is dropped.
-        assert_eq!(config.wait_for_app, None);
-        assert_eq!(
-            config.wait_for_apps,
-            vec![WatchTarget::Bundle {
-                bundle_id: "com.example.app".into(),
-                name: "Example".into(),
-            }]
-        );
     }
 
     #[test]
@@ -350,44 +315,6 @@ name = "foo"
     }
 
     #[test]
-    fn migration_preserves_other_settings() {
-        // The legacy `[wait_for_app]` table must not trip the parse fallback and
-        // discard mode/time_limit/upgrade_external.
-        let mut config: TrayConfig = toml::from_str(
-            r#"
-mode = "display"
-time_limit_secs = 1800
-upgrade_external = true
-
-[wait_for_app]
-bundle_id = "com.example.app"
-name = "Example"
-"#,
-        )
-        .unwrap();
-        config.normalize_legacy();
-        assert_eq!(config.mode, SleepMode::Display);
-        assert_eq!(config.time_limit_secs, Some(1800));
-        assert!(config.upgrade_external);
-        assert_eq!(config.wait_for_apps.len(), 1);
-    }
-
-    #[test]
-    fn save_omits_legacy_wait_for_app_key() {
-        let mut config = TrayConfig {
-            wait_for_app: Some(AppTarget {
-                bundle_id: "com.example.app".into(),
-                name: "Example".into(),
-            }),
-            ..TrayConfig::default()
-        };
-        config.normalize_legacy();
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(!serialized.contains("[wait_for_app]"));
-        assert!(serialized.contains("wait_for_apps"));
-    }
-
-    #[test]
     fn parse_config_defaults_upgrade_external_to_false() {
         let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
         assert!(!config.upgrade_external);
@@ -417,6 +344,19 @@ name = "Example"
         assert!(config.ignores_app("Zoom"));
         assert!(config.ignores_app("amphetamine"));
         assert!(!config.ignores_app("Zoo"));
+    }
+
+    #[test]
+    fn ignore_matching_is_unicode_case_insensitive() {
+        // Non-ASCII case pairs must match the same way the dedup folds them;
+        // eq_ignore_ascii_case would treat "CAFÉ" and "Café" as different apps.
+        let mut config: TrayConfig =
+            toml::from_str("ignored_apps = [\"Café Ω Tëst\", \"CAFÉ Ω TËST\"]\n").unwrap();
+        config.normalize_ignored_apps();
+        assert_eq!(config.ignored_apps.len(), 1);
+        assert!(config.ignores_app("café ω tëst"));
+        assert!(config.ignores_app("CAFÉ Ω TËST"));
+        assert!(!config.ignores_app("Cafe Ω Tëst"));
     }
 
     #[test]
