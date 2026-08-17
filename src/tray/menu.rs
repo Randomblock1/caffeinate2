@@ -1,18 +1,18 @@
-use crate::app_target::AppTarget;
-use crate::macos_apps;
-use crate::sleep_mode::SleepMode;
-use crate::tray::state::{AppState, MenuSnapshot};
-use crate::tray_mode::TimeLimitPreset;
+use crate::sleep::sleep_mode::SleepMode;
+use crate::tray::state::{AppState, IgnoredAssertion, MenuSnapshot};
+use crate::tray::tray_mode::TimeLimitPreset;
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::menu::MenuId;
 
 pub struct MenuHandles {
     pub mode_items: Vec<(MenuId, SleepMode, CheckMenuItem)>,
     pub time_limit_items: Vec<(MenuId, Option<u64>, CheckMenuItem)>,
-    pub until_app_off: CheckMenuItem,
-    pub until_app_off_id: MenuId,
-    pub until_app_items: Vec<(MenuId, AppTarget, CheckMenuItem)>,
-    pub choose_app_id: MenuId,
+    pub wait_for_apps_id: MenuId,
+    pub upgrade_external: CheckMenuItem,
+    pub upgrade_external_id: MenuId,
+    /// One entry per program on the user's ignore list; clicking it removes
+    /// that program from the list.
+    pub ignored_app_items: Vec<(MenuId, String)>,
     pub start_at_login: CheckMenuItem,
     pub start_at_login_id: MenuId,
     pub quit_id: MenuId,
@@ -22,11 +22,11 @@ pub struct MenuHandles {
 pub enum MenuCommand {
     Quit,
     ToggleStartAtLogin,
-    ClearWaitForApp,
-    ChooseApp,
-    SelectWaitForApp(AppTarget),
+    ToggleUpgradeExternal,
     SetMode(SleepMode),
     SetTimeLimit(Option<u64>),
+    /// Drop a program from the ignore list, so the watcher upgrades it again.
+    UnignoreApp(String),
 }
 
 impl MenuHandles {
@@ -37,17 +37,12 @@ impl MenuHandles {
         if event_id == &self.start_at_login_id {
             return Some(MenuCommand::ToggleStartAtLogin);
         }
-        if event_id == &self.until_app_off_id {
-            return Some(MenuCommand::ClearWaitForApp);
+        if event_id == &self.upgrade_external_id {
+            return Some(MenuCommand::ToggleUpgradeExternal);
         }
-        if event_id == &self.choose_app_id {
-            return Some(MenuCommand::ChooseApp);
-        }
-        for (id, app, _) in &self.until_app_items {
-            if event_id == id {
-                return Some(MenuCommand::SelectWaitForApp(app.clone()));
-            }
-        }
+        // `wait_for_apps_id` is deliberately absent: the run loop intercepts
+        // that event before `handle_menu_event` runs (it owns the AppKit
+        // window code), so resolving it here would be dead code.
         for (id, mode, _) in &self.mode_items {
             if event_id == id {
                 return Some(MenuCommand::SetMode(*mode));
@@ -58,21 +53,22 @@ impl MenuHandles {
                 return Some(MenuCommand::SetTimeLimit(*secs));
             }
         }
+        for (id, name) in &self.ignored_app_items {
+            if event_id == id {
+                return Some(MenuCommand::UnignoreApp(name.clone()));
+            }
+        }
         None
     }
 }
 
-pub fn running_apps_menu_key(apps: &[AppTarget]) -> Vec<(String, String)> {
-    apps.iter()
-        .map(|a| (a.bundle_id.clone(), a.name.clone()))
-        .collect()
-}
-
-pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu, MenuHandles) {
+pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
     let menu = Menu::new();
     let mut mode_items = Vec::new();
 
     for mode in SleepMode::all() {
+        // `muda` menu items are not `Copy`; clone is required to append the same
+        // item to the menu after building the handle map.
         let item = CheckMenuItem::new(mode.label(), true, snapshot.mode == mode, None);
         let id = item.id().clone();
         mode_items.push((id, mode, item.clone()));
@@ -100,58 +96,51 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
     menu.append(&time_limit_submenu)
         .expect("append time limit submenu");
 
-    let until_app_submenu = Submenu::new("Until app quits", true);
-    let off_item = CheckMenuItem::new("Off", true, snapshot.wait_for_app.is_none(), None);
-    let until_app_off_id = off_item.id().clone();
-    until_app_submenu
-        .append(&off_item)
-        .expect("append until app off");
-
-    // Include the configured target even when it isn't running (e.g. chosen
-    // via the open panel before launch), so the active selection stays
-    // visible and checked instead of the submenu showing nothing selected.
-    let configured_not_running = snapshot.wait_for_app.as_ref().filter(|target| {
-        !running_apps
-            .iter()
-            .any(|app| app.bundle_id == target.bundle_id)
-    });
-
-    let mut until_app_items = Vec::new();
-    if !running_apps.is_empty() || configured_not_running.is_some() {
-        until_app_submenu
-            .append(&PredefinedMenuItem::separator())
-            .expect("separator");
-        let configured = configured_not_running
-            .map(|target| (target.clone(), format!("{} (not running)", target.name)));
-        let running = running_apps
-            .iter()
-            .map(|app| (app.clone(), app.name.clone()));
-        for (app, label) in configured.into_iter().chain(running) {
-            let checked = snapshot
-                .wait_for_app
-                .as_ref()
-                .is_some_and(|w| w.bundle_id == app.bundle_id);
-            let item = CheckMenuItem::new(&label, true, checked, None);
-            let id = item.id().clone();
-            until_app_items.push((id, app, item.clone()));
-            until_app_submenu.append(&item).expect("append running app");
-        }
-    }
-
-    until_app_submenu
-        .append(&PredefinedMenuItem::separator())
-        .expect("separator");
-    let choose_app = MenuItem::new("Choose application…", true, None);
-    let choose_app_id = choose_app.id().clone();
-    until_app_submenu
-        .append(&choose_app)
-        .expect("append choose app");
-
-    menu.append(&until_app_submenu)
-        .expect("append until app submenu");
+    // A single entry opens the multi-select picker window; the count keeps the
+    // current selection visible at a glance.
+    let wait_label = match snapshot.wait_for_apps.len() {
+        0 => "Wait for apps…".to_string(),
+        n => format!("Wait for apps… ({n} selected)"),
+    };
+    let wait_for_apps_item = MenuItem::new(wait_label, true, None);
+    let wait_for_apps_id = wait_for_apps_item.id().clone();
+    menu.append(&wait_for_apps_item)
+        .expect("append wait for apps item");
 
     menu.append(&PredefinedMenuItem::separator())
         .expect("separator");
+
+    // Watches for low-level sleep assertions from other apps and upgrades them
+    // to Entirely mode. muda items have no tooltip, so the label must stand on
+    // its own.
+    let upgrade_external = CheckMenuItem::new(
+        "Upgrade other apps' sleep prevention",
+        true,
+        snapshot.upgrade_external,
+        None,
+    );
+    let upgrade_external_id = upgrade_external.id().clone();
+    menu.append(&upgrade_external)
+        .expect("append upgrade external item");
+
+    // While the watcher is actively upgrading, show which external process(es)
+    // it is upgrading. One app is a single disabled line; several collapse into
+    // an expandable submenu so the top-level menu stays compact.
+    if let Some(apps) = snapshot.upgrading_apps.as_deref() {
+        append_upgrading_status(&menu, apps);
+    }
+
+    // Sleep assertions the watcher saw but is not upgrading (display-only holds
+    // from video players, apps the user ignores), so a blank menu isn't mistaken
+    // for "nothing is keeping the Mac awake."
+    if !snapshot.ignored_assertions.is_empty() {
+        append_ignored_status(&menu, &snapshot.ignored_assertions);
+    }
+
+    // The user's persistent ignore list, editable here: clicking a program drops
+    // it from the list. Shown whether or not it is asserting right now, so an
+    // ignore made months ago is still discoverable (and reversible).
+    let ignored_app_items = append_ignored_apps(&menu, &snapshot.ignored_apps);
 
     let start_at_login = CheckMenuItem::new("Start at login", true, snapshot.start_at_login, None);
     let start_at_login_id = start_at_login.id().clone();
@@ -169,15 +158,96 @@ pub fn build_menu(snapshot: &MenuSnapshot, running_apps: &[AppTarget]) -> (Menu,
         MenuHandles {
             mode_items,
             time_limit_items,
-            until_app_off: off_item,
-            until_app_off_id,
-            until_app_items,
-            choose_app_id,
+            wait_for_apps_id,
+            upgrade_external,
+            upgrade_external_id,
+            ignored_app_items,
             start_at_login,
             start_at_login_id,
             quit_id,
         },
     )
+}
+
+/// Append the watcher's "Upgrading…" status to the menu. These items are purely
+/// informational (disabled, no command), so they carry no `MenuHandles` entry;
+/// the structure is rebuilt via `install_menu` whenever the set changes.
+fn append_upgrading_status(menu: &Menu, apps: &[String]) {
+    match apps {
+        // Upgrading, but no holder exposed a name.
+        [] => {
+            menu.append(&MenuItem::new("Upgrading external app", false, None))
+                .expect("append upgrading status");
+        }
+        [one] => {
+            menu.append(&MenuItem::new(format!("Upgrading {one}"), false, None))
+                .expect("append upgrading status");
+        }
+        many => {
+            let submenu = Submenu::new(format!("Upgrading {} apps", many.len()), true);
+            for name in many {
+                submenu
+                    .append(&MenuItem::new(name, false, None))
+                    .expect("append upgrading app");
+            }
+            menu.append(&submenu).expect("append upgrading submenu");
+        }
+    }
+}
+
+/// Append the watcher's "Ignoring…" status: sleep assertions it saw but chose
+/// not to upgrade, each with a short reason. Like the upgrading status, these
+/// are disabled and carry no `MenuHandles` entry; the structure is rebuilt via
+/// `install_menu` whenever the set changes. One holder is a single line; several
+/// collapse into an expandable submenu so the top-level menu stays compact.
+fn append_ignored_status(menu: &Menu, ignored: &[IgnoredAssertion]) {
+    let line = |a: &IgnoredAssertion| format!("Ignoring {} ({})", a.process_name, a.reason);
+    match ignored {
+        [] => {}
+        [one] => {
+            menu.append(&MenuItem::new(line(one), false, None))
+                .expect("append ignored status");
+        }
+        many => {
+            let submenu = Submenu::new(format!("Ignoring {} assertions", many.len()), true);
+            for assertion in many {
+                submenu
+                    .append(&MenuItem::new(line(assertion), false, None))
+                    .expect("append ignored assertion");
+            }
+            menu.append(&submenu).expect("append ignored submenu");
+        }
+    }
+}
+
+/// Append the **Ignored apps** submenu: the programs the watcher must never
+/// upgrade, each clickable to remove it from the list. Returns the id/name pairs
+/// so [`MenuHandles::resolve`] can map a click back to the program; the submenu
+/// is omitted (and no ids returned) when the list is empty.
+fn append_ignored_apps(menu: &Menu, apps: &[String]) -> Vec<(MenuId, String)> {
+    let mut items = Vec::new();
+    if apps.is_empty() {
+        return items;
+    }
+    let submenu = Submenu::new(format!("Ignored apps ({})", apps.len()), true);
+    // muda items have no tooltip, so the hint has to be a line of its own.
+    submenu
+        .append(&MenuItem::new(
+            "Click an app to stop ignoring it",
+            false,
+            None,
+        ))
+        .expect("append ignored apps hint");
+    submenu
+        .append(&PredefinedMenuItem::separator())
+        .expect("separator");
+    for name in apps {
+        let item = MenuItem::new(name, true, None);
+        items.push((item.id().clone(), name.clone()));
+        submenu.append(&item).expect("append ignored app");
+    }
+    menu.append(&submenu).expect("append ignored apps submenu");
+    items
 }
 
 /// Sync all checkbox items to the current menu snapshot.
@@ -189,25 +259,13 @@ pub fn sync_menu_to_snapshot(handles: &MenuHandles, snapshot: &MenuSnapshot) {
         item.set_checked(*secs == snapshot.time_limit_secs);
     }
     handles
-        .until_app_off
-        .set_checked(snapshot.wait_for_app.is_none());
-    for (_, app, item) in &handles.until_app_items {
-        item.set_checked(
-            snapshot
-                .wait_for_app
-                .as_ref()
-                .is_some_and(|target| target.bundle_id == app.bundle_id),
-        );
-    }
+        .upgrade_external
+        .set_checked(snapshot.upgrade_external);
     handles.start_at_login.set_checked(snapshot.start_at_login);
 }
 
-pub fn install_menu(
-    tray: &tray_icon::TrayIcon,
-    snapshot: &MenuSnapshot,
-    running_apps: &[AppTarget],
-) -> MenuHandles {
-    let (menu, handles) = build_menu(snapshot, running_apps);
+pub fn install_menu(tray: &tray_icon::TrayIcon, snapshot: &MenuSnapshot) -> MenuHandles {
+    let (menu, handles) = build_menu(snapshot);
     tray.set_menu(Some(Box::new(menu)));
     handles
 }
@@ -219,41 +277,60 @@ pub enum MenuAction {
 }
 
 pub fn dispatch_command(
-    command: MenuCommand,
+    command: &MenuCommand,
     handles: &MenuHandles,
     state: &mut AppState,
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
     match command {
         MenuCommand::Quit => return MenuAction::Quit,
-        MenuCommand::ChooseApp => return MenuAction::Unhandled,
         MenuCommand::ToggleStartAtLogin => {
             let new_val = !state.menu_snapshot().start_at_login;
             if let Err(e) = state.set_start_at_login(new_val) {
                 eprintln!("{e}");
+                // Under the LaunchAgent, launchd discards stderr — and nobody
+                // is tailing the -d log file while clicking menu items. The
+                // tooltip is the tray's error surface, as in the arms below.
+                state.show_error_tooltip(tray, &e.to_string());
             }
         }
-        MenuCommand::ClearWaitForApp => {
-            if let Err(e) = state.set_wait_for_app(None) {
-                eprintln!("{e}");
+        MenuCommand::ToggleUpgradeExternal => {
+            let enable = !state.menu_snapshot().upgrade_external;
+            // Enabling may install the privileged helper first, but that now runs
+            // on a background thread (see `set_upgrade_external`), so this returns
+            // promptly; `set_icon` below repaints the tooltip ("installing
+            // helper…" while the install is in flight).
+            match state.set_upgrade_external(enable) {
+                Ok(()) => {
+                    // Poll now so an already-present external assertion is
+                    // upgraded immediately rather than after the next interval.
+                    state.poll_upgrade();
+                    state.set_icon(tray);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    state.set_icon(tray);
+                    state.show_error_tooltip(tray, &e.to_string());
+                }
             }
         }
-        MenuCommand::SelectWaitForApp(app) => {
-            if let Err(e) = state.set_wait_for_app(Some(app)) {
+        MenuCommand::UnignoreApp(name) => {
+            if let Err(e) = state.unignore_app(name) {
                 eprintln!("{e}");
-            } else if state.is_on() {
-                state.invalidate_tooltip();
-                state.update_tooltip(tray);
+                state.show_error_tooltip(tray, &e.to_string());
             }
         }
         MenuCommand::SetMode(mode) => {
+            let mode = *mode;
             // Switching an active session to Entirely can block on the helper
             // install prompt and socket wait; surface progress in the tooltip
             // before the blocking work starts. set_icon below restores it.
             if state.is_on() && mode == SleepMode::Entirely {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                 state.invalidate_tooltip();
-                crate::macos_activation::pump_event_loop(Some(std::time::Duration::from_millis(1)));
+                crate::tray::macos_activation::pump_event_loop(Some(
+                    std::time::Duration::from_millis(1),
+                ));
             }
             match state.set_mode(mode) {
                 Ok(()) => state.set_icon(tray),
@@ -265,8 +342,9 @@ pub fn dispatch_command(
             }
         }
         MenuCommand::SetTimeLimit(secs) => {
-            if let Err(e) = state.set_time_limit(secs) {
+            if let Err(e) = state.set_time_limit(*secs) {
                 eprintln!("{e}");
+                state.show_error_tooltip(tray, &e.to_string());
             } else if state.is_on() {
                 state.update_tooltip(tray);
             }
@@ -287,22 +365,9 @@ pub fn handle_menu_event(
     state: &mut AppState,
     tray: &tray_icon::TrayIcon,
 ) -> MenuAction {
-    match handles.resolve(event_id) {
-        Some(command) => dispatch_command(command, handles, state, tray),
-        None => MenuAction::Unhandled,
-    }
-}
-
-pub fn handle_choose_app(
-    state: &mut AppState,
-    tray: &tray_icon::TrayIcon,
-) -> Option<Vec<AppTarget>> {
-    let choice = macos_apps::choose_app_bundle()?;
-    if let Err(e) = state.set_wait_for_app(Some(choice)) {
-        eprintln!("{e}");
-    } else if state.is_on() {
-        state.invalidate_tooltip();
-        state.update_tooltip(tray);
-    }
-    Some(macos_apps::running_app_choices())
+    handles
+        .resolve(event_id)
+        .map_or(MenuAction::Unhandled, |command| {
+            dispatch_command(&command, handles, state, tray)
+        })
 }

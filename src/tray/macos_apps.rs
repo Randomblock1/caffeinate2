@@ -1,0 +1,34 @@
+//! Bundle lookup and running-app checks (tray).
+
+use crate::tray::app_target::AppTarget;
+use crate::tray::process_enum::file_stem;
+use objc2_app_kit::NSRunningApplication;
+use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSURL};
+
+#[must_use]
+pub fn is_bundle_running(bundle_id: &str) -> bool {
+    debug_assert!(
+        MainThreadMarker::new().is_some(),
+        "is_bundle_running must be called on the main thread"
+    );
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+
+    let bundle_id = NSString::from_str(bundle_id);
+    let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id);
+    apps.iter().any(|app| !app.isTerminated())
+}
+
+#[must_use]
+pub fn bundle_from_app_path(path: &str) -> Option<AppTarget> {
+    let ns_path = NSString::from_str(path);
+    let url = NSURL::fileURLWithPath(&ns_path);
+    let bundle = NSBundle::bundleWithURL(&url)?;
+    let bundle_id = bundle.bundleIdentifier()?.to_string();
+    if bundle_id.is_empty() {
+        return None;
+    }
+    let name = file_stem(path).unwrap_or_else(|| bundle_id.clone());
+    Some(AppTarget { bundle_id, name })
+}

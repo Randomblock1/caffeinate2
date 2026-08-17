@@ -1,6 +1,6 @@
 [package]
 name = "caffeinate2"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 authors = ["Randomblock1 <randomblock1@pm.me>"]
 description = "Caffeinate MacOS utility with more options. Temporarily prevent your system from sleeping."
@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 default-run = "caffeinate2"
 
 [dependencies]
+anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 jiff = "0.2"
 humantime = "2.3"
@@ -21,13 +22,19 @@ nix = { version = "0.31", features = ["user", "event", "fs", "signal", "socket"]
 signal-hook = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = { version = "0.8", optional = true }
+thiserror = "2.0"
+toml = { version = "1.1", optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
-tray-icon = { version = "0.21", optional = true }
-muda = { version = "0.17", optional = true }
+tray-icon = { version = "0.24", optional = true }
+muda = { version = "0.19", optional = true }
 block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
+plist = "1"
+tracing-oslog = "0.3"
 objc2 = "0.6"
 objc2-core-foundation = "0.3.2"
 objc2-io-kit = "0.3"
@@ -37,12 +44,41 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSGraphicsContext",
     "NSWorkspace",
     "NSRunningApplication",
+    # Program-picker window ("Wait for apps…"). NSImage is load-bearing:
+    # NSWorkspace::iconForFile: and NSRunningApplication::icon() are gated on it.
+    "NSWindow",
+    "NSPanel",
     "NSOpenPanel",
+    # Tray-click dialog for an upgraded assertion (ignore / take over), with the
+    # app picker it shows when several apps are being upgraded at once.
+    "NSAlert",
+    "NSPopUpButton",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSTextField",
+    "NSSearchField",
+    "NSSegmentedControl",
+    "NSTableView",
+    "NSTableColumn",
+    "NSTableCellView",
+    "NSUserInterfaceItemIdentification",
+    "NSScrollView",
+    "NSStackView",
+    "NSImage",
+    "NSImageView",
+    # Picker accessibility: mark the decorative row icons as non-elements so
+    # VoiceOver doesn't announce an unlabeled image before every program name.
+    "NSAccessibilityProtocols",
+    "NSColor",
+    "NSCell",
+    "NSLayoutConstraint",
+    "NSLayoutAnchor",
     "objc2-uniform-type-identifiers",
 ] }
-objc2-uniform-type-identifiers = { version = "0.3", optional = true, features = [
-    "UTType",
+objc2-uniform-type-identifiers = { version = "0.3.2", optional = true, default-features = false, features = [
     "UTCoreTypes",
+    "UTType",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString",
@@ -51,6 +87,9 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "NSURL",
     "NSDate",
     "NSRunLoop",
+    # Drives the upgrade dialog from inside its own modal run loop (raise the
+    # panel, and end it on a shutdown signal rather than blocking the process).
+    "NSTimer",
     "NSNotification",
     "NSOperation",
     "block2",
@@ -66,18 +105,18 @@ tray = [
     "dep:muda",
     "dep:block2",
     "dep:objc2-app-kit",
-    "dep:objc2-foundation",
     "dep:objc2-uniform-type-identifiers",
+    "dep:objc2-foundation",
 ]
 full = ["tray", "helper-bin"]
 
 [[bin]]
 name = "caffeinate2"
-path = "src/main.rs"
+path = "src/bin/caffeinate2.rs"
 
 [[bin]]
 name = "sleepdetect"
-path = "src/sleepdetect.rs"
+path = "src/bin/sleepdetect.rs"
 
 [[bin]]
 name = "caffeinate2-tray"
@@ -88,3 +127,7 @@ required-features = ["tray"]
 name = "caffeinate2-helper"
 path = "src/bin/caffeinate2-helper.rs"
 required-features = ["helper-bin"]
+
+[dev-dependencies]
+proptest = "1.11.0"
+stateright = "0.31.0"

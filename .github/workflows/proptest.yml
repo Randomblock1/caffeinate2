@@ -1,0 +1,51 @@
+name: Long property tests
+
+# Weekly rather than nightly: the commit rate doesn't justify a daily run, and
+# the first step skips the job entirely when nothing landed since the last one.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  convergence:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history so the freshness check can count commits by date.
+          fetch-depth: 0
+      - name: Check for commits since the last weekly run
+        id: fresh
+        # One extra day of overlap so a commit landing during the previous run
+        # can never fall between two windows.
+        run: |
+          count=$(git rev-list --count --since='8 days ago' HEAD)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "No commits in the past week; skipping the long run."
+          fi
+      - name: Run the convergence suite with 20k cases per property
+        # Manual dispatch always runs: it is the "run the deep suite now"
+        # escape hatch, most useful exactly when nothing landed recently.
+        if: github.event_name == 'workflow_dispatch' || steps.fresh.outputs.count != '0'
+        # The proptest! macro applies PROPTEST_CASES over the in-source
+        # cases: 128, so no code change is needed to deepen the run. Debug
+        # profile on purpose: the properties are fsync-bound, so release
+        # buys little and skips the debug assertions.
+        env:
+          PROPTEST_CASES: "20000"
+        run: cargo test --features full --test entirely_convergence
+      - name: Upload the regression file on failure
+        # A failing case is minimized into this file; without the upload the
+        # counterexample dies with the runner.
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: proptest-regressions
+          path: tests/entirely_convergence.proptest-regressions
+          if-no-files-found: ignore
