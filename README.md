@@ -32,33 +32,53 @@ From a clone:
 
 `cargo build --release --features full`
 
+The pieces are separate features when you want only one: `--features tray`
+builds the menu bar (`caffeinate2-tray`) and `--features helper-bin` builds
+the entirely-mode helper daemon (`caffeinate2-helper`); `full` is both.
+
+Either `cargo install` also installs `sleepdetect` (a clone build produces it
+in `target/release`) — a small diagnostic that logs when the system actually
+slept, by watching for jumps in a monotonic clock. It takes no arguments; stop
+it with Ctrl+C.
+
 ## Usage
 
 ```plaintext
 Usage: caffeinate2 [OPTIONS] [COMMAND]...
 
 Arguments:
-  [COMMAND]...  Trailing command to run (takes priority over --timeout and --waitfor).
-                Use `--` before the command when needed (see examples below).
+  [COMMAND]...  Trailing command to run (takes priority over `--timeout` and `--waitfor`). End
+                options with `--` when the command could be parsed as flags or arguments, e.g.
+                `caffeinate2 -t 3600 -- hour`
 
 Options:
+      --install-helper      Install the privileged helper for entirely mode (prompts for
+                            administrator authorization; or run with sudo). Cannot be combined with
+                            other options
+      --uninstall-helper    Remove the privileged helper (requires root). Cannot be combined with
+                            other options
+      --status              Show entirely-mode helper status (holders and sleep state). Cannot be
+                            combined with other options
   -v, --verbose             Verbose mode
       --dry-run             Dry run. Don't actually prevent sleep. Useful for testing
-      --drop-root           Drop root privileges in command. You need root to disable sleep entirely, but some programs don't want to run as root
+      --drop-root           Drop root privileges in command. You need root to disable sleep
+                            entirely, but some programs don't want to run as root. Also sets HOME,
+                            USER, LOGNAME, and SHELL to the target user's
       --shell               Run COMMAND through /bin/sh -c instead of executing it directly
   -d, --display             Disable display sleep
   -m, --disk                Disable disk idle sleep
   -i, --system              Disable idle system sleep. [DEFAULT]
   -s, --system-on-ac        Disable system sleep while not on battery
   -e, --entirely            Disable system sleep entirely (ignores lid closing)
-  -u, --user-active         Declare the user is active. If the display is off, this option turns it on and prevents it from going into idle sleep
-  -t, --timeout <DURATION>  Duration to wait before timing out. Bare numbers are seconds; quote
-                            human-readable durations (e.g. "1 hour and 30 minutes"). Use `--`
-                            before a trailing command when it could be confused with flags
-  -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code
-      --install-helper      Install the privileged helper for entirely mode (admin prompt or sudo)
-      --uninstall-helper    Remove the privileged helper (requires root)
-      --status              Show entirely-mode helper status (holders and sleep state)
+  -u, --user-active         Declare the user is active. If the display is off, this option turns it
+                            on and prevents it from going into idle sleep
+  -t, --timeout <DURATION>  Duration to wait before timing out (`-t` / `--timeout`). Takes a single
+                            value: bare numbers are seconds; quote human-readable durations (e.g.
+                            `"1 hour and 30 minutes"`). Use `--` before a trailing command when it
+                            could be confused with flags (e.g. `caffeinate2 -t 3600 -- hour`)
+  -w, --waitfor <PID>       Wait for program with PID X to complete and pass its exit code (another
+                            user's process can be waited on, but its exit code is unreadable;
+                            caffeinate2 then exits 0)
   -h, --help                Print help
   -V, --version             Print version
 ```
@@ -83,7 +103,7 @@ Put `--` before the command when it could be parsed as another option or argumen
 
 ### Timeout and PID
 
-Sleep is disabled for a certain amount of time, or until the program with the specified PID completes. If both are specified, it waits until one of them completes. The `-t` countdown measures awake time: if the Mac sleeps before it elapses (for example the lid is closed, which the default modes don't prevent), the countdown pauses and resumes on wake.
+Sleep is disabled for a certain amount of time, or until the program with the specified PID completes. If both are specified, it waits until one of them completes. The `-t` countdown follows the wall clock: sleep prevention ends at the promised resume time even if the Mac slept in between (for example the lid was closed, which the default modes don't prevent) — a Mac still asleep at that time ends the session within a minute of waking. Combined with `-w`, the timeout instead counts awake time toward the PID wait.
 
 **`-t` / `--timeout` takes one argument:**
 
@@ -103,7 +123,7 @@ caffeinate2 -t "1 hour and 30 minutes"
 caffeinate2 -t 1 hour and 30 minutes
 ```
 
-For PIDs, caffeinate2 waits until the specified program exits, then exits with the same exit code. If the program doesn't exist, it exits immediately with an error.
+For PIDs, caffeinate2 waits until the specified program exits, then exits with the same exit code. If the program doesn't exist, it exits immediately with an error. Another user's process can be waited on, but macOS won't reveal its exit code — caffeinate2 says so and exits 0.
 
 `caffeinate2 -t 600`
 
@@ -133,11 +153,11 @@ This returns control to the shell immediately and keeps the menu bar icon runnin
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
   - **Wait for apps…** — pick one or more running apps, or use the **Choose application** picker (button **Choose**) for any `.app`.
   - **Upgrade other apps' sleep prevention** — see below.
-  - **Ignored apps** — the programs that are never upgraded; click one to stop ignoring it (shown only when the list is non-empty).
+  - **Ignored apps** — the programs that are never upgraded; click one to stop ignoring it (shown only when the list is non-empty *and* the upgrade watcher is on — with the watcher off the list governs nothing, but it stays in `tray.toml` and reappears when the watcher is re-enabled).
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
-When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active. Time limits count awake time: if the Mac sleeps mid-session (for example the lid is closed, which no mode prevents), the countdown pauses and resumes on wake.
+When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active. Time limits follow the wall clock: a 1-hour limit ends an hour after it started even if the Mac slept mid-session (for example the lid was closed, which every mode except Entirely allows) — asleep time counts.
 
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 
@@ -203,7 +223,7 @@ Other helper commands:
 
 **After upgrading caffeinate2**, reinstall the helper: the installed daemon is a copied snapshot, so it keeps running the old version until you run `sudo caffeinate2 --install-helper` again. `caffeinate2 --status` shows when the installed helper's version differs from the binary (the tray also logs a warning at startup).
 
-Helper install also adds `/etc/newsyslog.d/com.randomblock1.caffeinate2.helper.conf` so `/var/log/caffeinate2-helper.log` is rotated.
+The helper logs to the unified system log (subsystem `com.randomblock1.caffeinate2.helper`); view it with Console.app or `log show --predicate 'subsystem == "com.randomblock1.caffeinate2.helper"'`.
 
 ## License
 
