@@ -23,6 +23,12 @@ jobs:
         run: cargo build --verbose
       - name: Build (full)
         run: cargo build --verbose --features full
+      # The user-selectable partial feature sets must at least compile; they
+      # have no separate artifacts, so a check is enough.
+      - name: Check (tray)
+        run: cargo check --features tray
+      - name: Check (helper-bin)
+        run: cargo check --features helper-bin
       - name: Run tests
         run: cargo test --verbose --features full
       - name: Upload Build Artifact
