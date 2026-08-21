@@ -109,7 +109,8 @@ fn handle_upgrade_click(
     tray: &tray_icon::TrayIcon,
     apps: &[String],
 ) {
-    match upgrade_dialog::ask(mtm, apps, state.mode(), state.time_limit_secs()) {
+    let releasing = state.upgrade_releasing();
+    match upgrade_dialog::ask(mtm, apps, state.mode(), state.time_limit_secs(), releasing) {
         UpgradeChoice::KeepUpgrading => return,
         UpgradeChoice::IgnoreAssertion(name) => state.ignore_assertion_once(&name),
         UpgradeChoice::TakeOver => state.take_over_upgrade_session(),

@@ -66,12 +66,16 @@ const SHUTDOWN_RESPONSE: NSModalResponse = NSModalResponseAbort;
 /// non-empty; with several, the dialog carries a picker for which one the
 /// ignore choices apply to. `mode` and `time_limit_secs` are the configured
 /// session settings a take-over would run under, named in the dialog so the
-/// consequence is visible before clicking.
+/// consequence is visible before clicking. `releasing` is set once those
+/// programs have stopped asserting and the hold is inside its release grace
+/// window — the dialog then explains a hold that is already on its way out
+/// rather than one the programs are still asking for.
 pub fn ask(
     mtm: MainThreadMarker,
     apps: &[String],
     mode: SleepMode,
     time_limit_secs: Option<u64>,
+    releasing: bool,
 ) -> UpgradeChoice {
     let Some(first) = apps.first() else {
         return UpgradeChoice::KeepUpgrading;
@@ -84,11 +88,12 @@ pub fn ask(
 
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Informational);
-    alert.setMessageText(&NSString::from_str(&message_text(apps)));
+    alert.setMessageText(&NSString::from_str(&message_text(apps, releasing)));
     alert.setInformativeText(&NSString::from_str(&informative_text(
         apps,
         mode,
         time_limit_secs,
+        releasing,
     )));
 
     // The buttons read right-to-left on screen in the order they are added, so
@@ -219,63 +224,122 @@ fn take_over_title(time_limit_secs: Option<u64>) -> String {
     )
 }
 
-fn message_text(apps: &[String]) -> String {
+fn message_text(apps: &[String], releasing: bool) -> String {
+    // Past the grace window's start the programs are no longer asking for
+    // anything, so "is upgrading" would name the wrong thing entirely: what is
+    // left is caffeinate2's own hold, on its way out.
+    let verb = if releasing {
+        "is still holding"
+    } else {
+        "is upgrading"
+    };
     match apps {
-        [one] => format!("caffeinate2 is upgrading sleep prevention for {one}"),
+        [one] => format!("caffeinate2 {verb} sleep prevention for {one}"),
         many => format!(
-            "caffeinate2 is upgrading sleep prevention for {} apps",
+            "caffeinate2 {verb} sleep prevention for {} apps",
             many.len()
         ),
     }
+}
+
+/// The holders as an indented block, one per line, for the multi-app bodies.
+fn app_list(apps: &[String]) -> String {
+    apps.iter()
+        .map(|app| format!("    {app}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The body of the dialog: what is holding the Mac awake, what caffeinate2 did
 /// about it, and what each button does about that. Long on purpose — this is
 /// the only place the upgrade mechanism is explained inside the app, and it is
 /// shown precisely when the user is asking "why won't this turn off?".
-fn informative_text(apps: &[String], mode: SleepMode, time_limit_secs: Option<u64>) -> String {
-    let mut text = match apps {
-        [one] => format!(
-            "{one} is holding an idle-sleep assertion: it stops the Mac going to sleep on its \
-             own, but still lets it sleep the moment the lid closes.\n\n"
-        ),
-        many => format!(
-            "These {} programs are holding idle-sleep assertions, which stop the Mac going to \
-             sleep on its own but still let it sleep the moment the lid closes:\n\n{}\n\n",
-            many.len(),
-            many.iter()
-                .map(|app| format!("    {app}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
+fn informative_text(
+    apps: &[String],
+    mode: SleepMode,
+    time_limit_secs: Option<u64>,
+    releasing: bool,
+) -> String {
+    let mut text = if releasing {
+        match apps {
+            [one] => format!("{one} has stopped holding its idle-sleep assertion.\n\n"),
+            many => format!(
+                "These {} programs have stopped holding their idle-sleep assertions:\n\n{}\n\n",
+                many.len(),
+                app_list(many)
+            ),
+        }
+    } else {
+        match apps {
+            [one] => format!(
+                "{one} is holding an idle-sleep assertion: it stops the Mac going to sleep on its \
+                 own, but still lets it sleep the moment the lid closes.\n\n"
+            ),
+            many => format!(
+                "These {} programs are holding idle-sleep assertions, which stop the Mac going to \
+                 sleep on its own but still let it sleep the moment the lid closes:\n\n{}\n\n",
+                many.len(),
+                app_list(many)
+            ),
+        }
     };
-    let subject = match apps {
-        [one] => one.clone(),
-        _ => "the last of them".to_string(),
-    };
-    text.push_str(&format!(
-        "caffeinate2 upgraded that to Entirely mode so the Mac stays awake with the lid closed \
-         too, and releases it about 20 seconds after {subject} stops asking.\n\n"
-    ));
+    if releasing {
+        text.push_str(
+            "caffeinate2 upgraded that to Entirely mode, and keeps the hold for about 20 seconds \
+             after the last assertion goes away — programs like this routinely drop theirs for a \
+             moment between turns. Unless one comes back, the hold releases on its own.\n\n",
+        );
+    } else {
+        let subject = match apps {
+            [one] => one.clone(),
+            _ => "the last of them".to_string(),
+        };
+        text.push_str(&format!(
+            "caffeinate2 upgraded that to Entirely mode so the Mac stays awake with the lid closed \
+             too, and releases it about 20 seconds after {subject} stops asking.\n\n"
+        ));
+    }
     // The take-over bullet has to describe the end condition it actually gets:
     // a configured limit ends the hold on a clock, no limit ends it only when
-    // the user says so. Both differ from the upgrade, which ends on whatever
-    // the other program decides.
-    let ends = if time_limit_secs.is_some() {
-        "ending on that schedule instead of when the other program stops asking"
+    // the user says so. Both differ from what the hold does if left alone —
+    // which, once the assertions are gone, is end within seconds.
+    let instead = if releasing {
+        "releasing in the next few seconds"
     } else {
-        "staying on until you switch it off instead of ending when the other program stops asking"
+        "ending when the other program stops asking"
+    };
+    let ends = if time_limit_secs.is_some() {
+        format!("ending on that schedule instead of {instead}")
+    } else {
+        format!("staying on until you switch it off instead of {instead}")
     };
     text.push_str(&format!(
-        "• {} — hold on caffeinate2's own terms in {} mode, {ends}.\n\
-         • {IGNORE_ONCE_TITLE} — stop upgrading the hold it has right now. It keeps its own \
-         weaker assertion, so closing the lid puts the Mac to sleep again.\n\
-         • {} — the same, and never upgrade it again; undo that under Ignored apps in the menu.\n\
-         • Cancel — leave the upgrade running.",
+        "• {} — hold on caffeinate2's own terms in {} mode, {ends}.\n",
         take_over_title(time_limit_secs),
         mode.label(),
+    ));
+    // With the assertions already gone there is no upgrade left to stop, so the
+    // ignore choices do the one thing still available: end the hold now.
+    if releasing {
+        text.push_str(&format!(
+            "• {IGNORE_ONCE_TITLE} — release the hold now instead of waiting out those seconds, \
+             and don't upgrade it if it comes straight back.\n"
+        ));
+    } else {
+        text.push_str(&format!(
+            "• {IGNORE_ONCE_TITLE} — stop upgrading the hold it has right now. It keeps its own \
+             weaker assertion, so closing the lid puts the Mac to sleep again.\n"
+        ));
+    }
+    text.push_str(&format!(
+        "• {} — the same, and never upgrade it again; undo that under Ignored apps in the menu.\n",
         never_upgrade_title(apps),
     ));
+    text.push_str(if releasing {
+        "• Cancel — leave the hold to release on its own."
+    } else {
+        "• Cancel — leave the upgrade running."
+    });
     if apps.len() > 1 {
         text.push_str("\n\nThe two ignore choices apply to the app selected below.");
     }
@@ -300,12 +364,27 @@ mod tests {
     #[test]
     fn message_text_names_one_app_and_counts_several() {
         assert_eq!(
-            message_text(&apps(&["Claude"])),
+            message_text(&apps(&["Claude"]), false),
             "caffeinate2 is upgrading sleep prevention for Claude"
         );
         assert_eq!(
-            message_text(&apps(&["Claude", "Codex"])),
+            message_text(&apps(&["Claude", "Codex"]), false),
             "caffeinate2 is upgrading sleep prevention for 2 apps"
+        );
+    }
+
+    /// Clicking during the release grace window must not be told the program is
+    /// still asking for anything — it stopped, and only caffeinate2's own hold
+    /// is left.
+    #[test]
+    fn message_text_stops_crediting_a_holder_that_went_away() {
+        assert_eq!(
+            message_text(&apps(&["Claude"]), true),
+            "caffeinate2 is still holding sleep prevention for Claude"
+        );
+        assert_eq!(
+            message_text(&apps(&["Claude", "Codex"]), true),
+            "caffeinate2 is still holding sleep prevention for 2 apps"
         );
     }
 
@@ -314,7 +393,7 @@ mod tests {
     /// does — with button names matching the buttons exactly.
     #[test]
     fn informative_text_explains_the_situation_and_every_button() {
-        let text = informative_text(&apps(&["Claude"]), SleepMode::System, Some(1800));
+        let text = informative_text(&apps(&["Claude"]), SleepMode::System, Some(1800), false);
         assert!(text.starts_with("Claude is holding an idle-sleep assertion"));
         assert!(text.contains("lid closes"));
         assert!(text.contains("upgraded that to Entirely mode"));
@@ -337,6 +416,7 @@ mod tests {
             &apps(&["Claude", "Codex", "node"]),
             SleepMode::Entirely,
             None,
+            false,
         );
         assert!(text.starts_with("These 3 programs are holding idle-sleep assertions"));
         assert!(text.contains("    Claude\n    Codex\n    node"));
@@ -345,6 +425,25 @@ mod tests {
         assert!(text.contains("staying on until you switch it off"));
         assert!(text.contains("Never Upgrade Selected App"));
         assert!(text.ends_with("The two ignore choices apply to the app selected below."));
+    }
+
+    /// Through the grace window the body describes a hold that is on its way
+    /// out: nothing is asserting, the buttons act on what is left, and no
+    /// sentence claims the program is still asking.
+    #[test]
+    fn informative_text_describes_a_hold_that_is_releasing() {
+        let text = informative_text(&apps(&["Claude"]), SleepMode::System, None, true);
+        assert!(text.starts_with("Claude has stopped holding its idle-sleep assertion."));
+        assert!(text.contains("keeps the hold for about 20 seconds"));
+        assert!(text.contains("Unless one comes back, the hold releases on its own"));
+        assert!(text.contains("instead of releasing in the next few seconds"));
+        assert!(text.contains("release the hold now instead of waiting out those seconds"));
+        assert!(text.ends_with("• Cancel — leave the hold to release on its own."));
+        assert!(!text.contains("stops asking"));
+
+        let many = informative_text(&apps(&["Claude", "Codex"]), SleepMode::System, None, true);
+        assert!(many.starts_with("These 2 programs have stopped holding their idle-sleep"));
+        assert!(many.contains("    Claude\n    Codex"));
     }
 
     #[test]
