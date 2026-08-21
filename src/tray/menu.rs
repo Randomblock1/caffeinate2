@@ -127,7 +127,7 @@ pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
     // it is upgrading. One app is a single disabled line; several collapse into
     // an expandable submenu so the top-level menu stays compact.
     if let Some(apps) = snapshot.upgrading_apps.as_deref() {
-        append_upgrading_status(&menu, apps);
+        append_upgrading_status(&menu, apps, snapshot.upgrade_releasing);
     }
 
     // Sleep assertions the watcher saw but is not upgrading (display-only holds
@@ -172,19 +172,43 @@ pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
 /// Append the watcher's "Upgrading…" status to the menu. These items are purely
 /// informational (disabled, no command), so they carry no `MenuHandles` entry;
 /// the structure is rebuilt via `install_menu` whenever the set changes.
-fn append_upgrading_status(menu: &Menu, apps: &[String]) {
+///
+/// `releasing` covers the seconds between the external assertions going away
+/// and the hold actually being dropped (see `UPGRADE_CLEAR_GRACE`): the same
+/// programs are named, but they are no longer asking for anything, so the line
+/// says the hold is on its way out. No countdown — `muda` installs a static
+/// `NSMenu`, so the number would be as old as the last rebuild.
+fn append_upgrading_status(menu: &Menu, apps: &[String], releasing: bool) {
     match apps {
         // Upgrading, but no holder exposed a name.
+        [] if releasing => {
+            menu.append(&MenuItem::new(
+                "External app stopped asserting — releasing hold",
+                false,
+                None,
+            ))
+            .expect("append upgrading status");
+        }
         [] => {
             menu.append(&MenuItem::new("Upgrading external app", false, None))
                 .expect("append upgrading status");
         }
         [one] => {
-            menu.append(&MenuItem::new(format!("Upgrading {one}"), false, None))
+            let label = if releasing {
+                format!("{one} stopped asserting — releasing hold")
+            } else {
+                format!("Upgrading {one}")
+            };
+            menu.append(&MenuItem::new(label, false, None))
                 .expect("append upgrading status");
         }
         many => {
-            let submenu = Submenu::new(format!("Upgrading {} apps", many.len()), true);
+            let title = if releasing {
+                format!("{} apps stopped asserting — releasing hold", many.len())
+            } else {
+                format!("Upgrading {} apps", many.len())
+            };
+            let submenu = Submenu::new(title, true);
             for name in many {
                 submenu
                     .append(&MenuItem::new(name, false, None))

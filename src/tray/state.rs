@@ -186,6 +186,11 @@ pub struct MenuSnapshot {
     /// process names (empty when none are known). `None` when the active
     /// session was not started by the watcher. Drives the "Upgrading…" entries.
     pub upgrading_apps: Option<Vec<String>>,
+    /// True while the upgrade session is inside its release grace window: the
+    /// external assertions are gone and the hold ends within seconds unless one
+    /// comes back. The "Upgrading…" entries say so rather than keep naming the
+    /// programs as though they were still asserting.
+    pub upgrade_releasing: bool,
     /// Sleep-relevant external assertions the watcher saw but did not upgrade,
     /// with reasons. Drives the informational "Ignoring…" entries. Empty when
     /// the watcher is off. Independent of any session, so it explains a blank
@@ -311,6 +316,7 @@ impl AppState {
                 .as_ref()
                 .filter(|session| session.started_by_upgrade)
                 .map(|session| session.upgrade_apps.clone()),
+            upgrade_releasing: self.upgrade_releasing(),
             ignored_assertions: if self.config.upgrade_external {
                 self.upgrade_ignored.clone()
             } else {
@@ -384,6 +390,11 @@ impl AppState {
                 .saturating_sub(sleep_aware_now())
                 .min(Duration::from_secs(1))
         });
+
+        // A hold winding down counts its release down in the tooltip, which the
+        // 3s watcher cadence alone would step through in jumps.
+        let releasing = self.upgrade_releasing().then(|| Duration::from_secs(1));
+        let countdown = [countdown, releasing].into_iter().flatten().min();
 
         // Daemon / non-.app targets post no NSWorkspace notification, so a
         // session watching any Executable target must poll like the upgrade
@@ -1145,6 +1156,22 @@ impl AppState {
             .map_or_else(Vec::new, |session| session.upgrade_apps.clone())
     }
 
+    /// Whether an upgrade session is winding down: the assertions it covers are
+    /// gone and [`UPGRADE_CLEAR_GRACE`] is running out. The hold is still live,
+    /// so this changes only what the tray says, not what it holds.
+    pub fn upgrade_releasing(&self) -> bool {
+        self.is_upgrading() && self.upgrade_clear_since.is_some()
+    }
+
+    /// Whole seconds until the grace period releases an upgrade hold, rounded
+    /// up so the tooltip countdown never reads 0 while the hold is still up.
+    /// `None` unless [`AppState::upgrade_releasing`] holds.
+    pub fn upgrade_release_secs(&self) -> Option<u64> {
+        let since = self.upgrade_clear_since.filter(|_| self.is_upgrading())?;
+        let left = UPGRADE_CLEAR_GRACE.saturating_sub(Instant::now().duration_since(since));
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
+
     pub const fn time_limit_secs(&self) -> Option<u64> {
         self.config.time_limit_secs
     }
@@ -1361,41 +1388,48 @@ impl AppState {
         let app_names = holder_names(&upgradeable);
 
         if !present {
-            let needs_clear_grace = self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.started_by_upgrade)
-                || self.upgrade_overridden
-                || self.upgrade_failed;
+            let upgrade_session = self.is_upgrading();
+            let needs_clear_grace =
+                upgrade_session || self.upgrade_overridden || self.upgrade_failed;
             if !needs_clear_grace {
                 self.upgrade_clear_since = None;
                 return false;
             }
             // Debounce: tolerate the agent dropping its assertion momentarily.
             let now = Instant::now();
+            let entering_grace = self.upgrade_clear_since.is_none();
             let since = *self.upgrade_clear_since.get_or_insert(now);
             if now.duration_since(since) >= UPGRADE_CLEAR_GRACE {
                 // Trigger episode is over: clear the manual override and failure
                 // latch so the next episode upgrades normally.
                 self.upgrade_failed = false;
                 self.upgrade_overridden = false;
-                let had_upgrade_session = self
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.started_by_upgrade);
-                if had_upgrade_session {
+                if upgrade_session {
                     // stop_session flags the menu dirty so the entries disappear.
                     self.stop_session();
                 }
                 self.upgrade_clear_since = None;
-                return had_upgrade_session;
+                return upgrade_session;
+            }
+            // The hold outlives the assertions by the grace period; the menu and
+            // tooltip have to switch from "upgrading" to "releasing" for it.
+            if entering_grace && upgrade_session {
+                self.menu_dirty = true;
+                self.last_tooltip = None;
+                return true;
             }
             return false;
         }
 
         // Something external is holding a system-idle assertion.
-        self.upgrade_clear_since = None;
-        match self.session.as_mut() {
+        // A holder that came back inside the grace window puts the entries back
+        // to "upgrading", even when it is the same one the session already names.
+        let left_grace = self.upgrade_clear_since.take().is_some() && self.is_upgrading();
+        if left_grace {
+            self.menu_dirty = true;
+            self.last_tooltip = None;
+        }
+        let changed = match self.session.as_mut() {
             None => {
                 if self.upgrade_failed || self.upgrade_overridden {
                     return false;
@@ -1432,7 +1466,8 @@ impl AppState {
             }
             // A manual session is already preventing sleep; leave it untouched.
             Some(_) => false,
-        }
+        };
+        changed || left_grace
     }
 }
 
@@ -1922,6 +1957,77 @@ mod tests {
             state.upgrade_ignored,
             vec![ignored("Codex", REASON_IGNORED_ONCE)]
         );
+    }
+
+    /// The hold outlives the assertion by `UPGRADE_CLEAR_GRACE`, and the menu
+    /// must stop claiming the program is asserting the moment it stops: the
+    /// entering-grace poll flags a rebuild and reports itself as a change so
+    /// the tooltip repaints too.
+    #[test]
+    fn losing_the_last_holder_switches_the_display_to_releasing() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.session = Some(upgrade_session_for(&["Codex"]));
+        set_live_assertions(&mut state, Vec::new());
+
+        assert!(state.poll_upgrade());
+        assert!(state.upgrade_releasing());
+        assert!(state.menu_dirty);
+        assert!(state.menu_snapshot().upgrade_releasing);
+        // Still holding, and the countdown says for how much longer.
+        assert!(state.session.is_some());
+        assert_eq!(
+            state.upgrade_release_secs(),
+            Some(UPGRADE_CLEAR_GRACE.as_secs())
+        );
+
+        // Nothing new to say on the polls that follow, so no menu churn.
+        state.menu_dirty = false;
+        assert!(!state.poll_upgrade());
+        assert!(!state.menu_dirty);
+    }
+
+    /// A holder that comes back inside the grace window puts the display back
+    /// to "upgrading" — even though the session already names it, so the usual
+    /// name-changed check would see nothing to do.
+    #[test]
+    fn a_holder_returning_within_the_grace_switches_the_display_back() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.session = Some(upgrade_session_for(&["Codex"]));
+        set_live_assertions(&mut state, Vec::new());
+        assert!(state.poll_upgrade());
+        state.menu_dirty = false;
+
+        set_live_assertions(
+            &mut state,
+            vec![assertion(
+                "Codex",
+                AssertionType::PreventUserIdleSystemSleep,
+            )],
+        );
+        assert!(state.poll_upgrade());
+        assert!(!state.upgrade_releasing());
+        assert!(state.upgrade_release_secs().is_none());
+        assert!(state.menu_dirty);
+        assert!(!state.menu_snapshot().upgrade_releasing);
+    }
+
+    /// Only an upgrade session displays as releasing: the same debounce runs
+    /// for the manual-override and failure latches, where there is no hold to
+    /// describe.
+    #[test]
+    fn a_manual_override_grace_is_not_displayed_as_releasing() {
+        let mut state = bare_state();
+        state.config.upgrade_external = true;
+        state.upgrade_overridden = true;
+        set_live_assertions(&mut state, Vec::new());
+
+        assert!(!state.poll_upgrade());
+        assert!(state.upgrade_clear_since.is_some());
+        assert!(!state.upgrade_releasing());
+        assert!(state.upgrade_release_secs().is_none());
+        assert!(!state.menu_dirty);
     }
 
     /// Ignoring one of several holders must not release a hold the others still

@@ -124,11 +124,15 @@ impl AppState {
         } else if self.is_on() {
             let remaining = self.remaining_secs();
             let waiting = self.waiting_for_app_launch();
+            let releasing_in = self.upgrade_release_secs();
             let upgrading = self
                 .session
                 .as_ref()
                 .filter(|session| session.started_by_upgrade)
-                .map(|session| session.upgrade_apps.as_slice());
+                .map(|session| tray_mode::UpgradeStatus {
+                    apps: session.upgrade_apps.as_slice(),
+                    releasing_in,
+                });
             tray_mode::format_active_tooltip(
                 remaining,
                 &self.config.wait_for_apps,

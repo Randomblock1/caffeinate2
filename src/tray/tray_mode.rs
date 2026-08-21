@@ -211,23 +211,39 @@ fn truncate_join<S: AsRef<str>>(names: &[S]) -> String {
     }
 }
 
+/// What the upgrade watcher is doing right now, for the tooltip.
+pub struct UpgradeStatus<'a> {
+    /// The external processes whose assertions the hold covers (empty when none
+    /// of them exposed a name).
+    pub apps: &'a [String],
+    /// Seconds until the hold is released because those processes stopped
+    /// asserting; `None` while their assertions are still live.
+    pub releasing_in: Option<u64>,
+}
+
 /// Build menu bar tooltip text while sleep prevention is active.
 ///
 /// When the session was started by the upgrade watcher, `upgrading` is `Some`
-/// with the names of the external processes whose assertions are being upgraded
-/// (empty when none are known yet), and the other parameters are irrelevant
-/// (upgrade sessions ignore the time limit and app watch). A long list is
-/// truncated so the tooltip stays readable; the full set is shown in the menu.
+/// and the other parameters are irrelevant (upgrade sessions ignore the time
+/// limit and app watch). A long list of names is truncated so the tooltip stays
+/// readable; the full set is shown in the menu.
 pub fn format_active_tooltip(
     remaining_secs: Option<u64>,
     wait_for_apps: &[WatchTarget],
     waiting_for_app_launch: bool,
-    upgrading: Option<&[String]>,
+    upgrading: Option<UpgradeStatus<'_>>,
 ) -> String {
-    if let Some(apps) = upgrading {
-        return match apps {
-            [] => "caffeinate2 (upgrading external app)".to_string(),
-            _ => format!("caffeinate2 (upgrading {})", truncate_join(apps)),
+    if let Some(status) = upgrading {
+        let who = match status.apps {
+            [] => "external app".to_string(),
+            apps => truncate_join(apps),
+        };
+        return match status.releasing_in {
+            // The assertions are already gone; the hold outlives them by the
+            // release grace period, and saying "upgrading" through that window
+            // reads as though the programs were still holding the Mac awake.
+            Some(secs) => format!("caffeinate2 ({who} stopped asserting · releasing in {secs}s)"),
+            None => format!("caffeinate2 (upgrading {who})"),
         };
     }
 
@@ -399,23 +415,30 @@ name = "foo"
         );
     }
 
+    fn upgrading(apps: &[String]) -> Option<UpgradeStatus<'_>> {
+        Some(UpgradeStatus {
+            apps,
+            releasing_in: None,
+        })
+    }
+
     #[test]
     fn format_active_tooltip_shows_upgrade_target() {
         let one = ["Claude Code".to_string()];
         assert_eq!(
-            format_active_tooltip(None, &[], false, Some(&one[..])),
+            format_active_tooltip(None, &[], false, upgrading(&one)),
             "caffeinate2 (upgrading Claude Code)"
         );
         // An upgrade session with no known process names still reads sensibly.
         let none: [String; 0] = [];
         assert_eq!(
-            format_active_tooltip(None, &[], false, Some(&none[..])),
+            format_active_tooltip(None, &[], false, upgrading(&none)),
             "caffeinate2 (upgrading external app)"
         );
         // A handful of apps are listed inline.
         let two = ["Claude Code".to_string(), "Codex".to_string()];
         assert_eq!(
-            format_active_tooltip(None, &[], false, Some(&two[..])),
+            format_active_tooltip(None, &[], false, upgrading(&two)),
             "caffeinate2 (upgrading Claude Code, Codex)"
         );
         // A long list is truncated with a "+N more" suffix.
@@ -427,8 +450,36 @@ name = "foo"
             "E".to_string(),
         ];
         assert_eq!(
-            format_active_tooltip(None, &[], false, Some(&many[..])),
+            format_active_tooltip(None, &[], false, upgrading(&many)),
             "caffeinate2 (upgrading A, B, C +2 more)"
+        );
+    }
+
+    /// Through the release grace window the tooltip has to read as winding
+    /// down: the holders stopped asserting, and the countdown says when the
+    /// hold goes away.
+    #[test]
+    fn format_active_tooltip_counts_down_the_release_grace() {
+        let releasing = |apps, secs| {
+            Some(UpgradeStatus {
+                apps,
+                releasing_in: Some(secs),
+            })
+        };
+        let one = ["Claude Code".to_string()];
+        assert_eq!(
+            format_active_tooltip(None, &[], false, releasing(&one, 14)),
+            "caffeinate2 (Claude Code stopped asserting · releasing in 14s)"
+        );
+        let none: [String; 0] = [];
+        assert_eq!(
+            format_active_tooltip(None, &[], false, releasing(&none, 3)),
+            "caffeinate2 (external app stopped asserting · releasing in 3s)"
+        );
+        let two = ["Claude Code".to_string(), "Codex".to_string()];
+        assert_eq!(
+            format_active_tooltip(None, &[], false, releasing(&two, 20)),
+            "caffeinate2 (Claude Code, Codex stopped asserting · releasing in 20s)"
         );
     }
 }
