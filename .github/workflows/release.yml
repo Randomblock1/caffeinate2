@@ -12,16 +12,32 @@ jobs:
       - uses: actions/checkout@v6
       - name: Get the version
         run: echo version=$(cargo pkgid | cut -d "#" -f2) >> $GITHUB_ENV
+      - name: Check tag matches the crate version
+        # A tag pushed without bumping Cargo.toml would otherwise publish a
+        # release named (and packaged) after the stale crate version. The tag
+        # reaches the shell via the environment, never by template
+        # interpolation into the script (ref names may contain shell syntax).
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ env.version }}
+        run: |
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
       - name: Build
         run: cargo build --verbose --release --features full
       - name: Run tests
         run: cargo test --verbose --release --features full
       - name: Compress
+        # -C so the binaries land in the extraction root as siblings — the
+        # README says to extract them together, and the helper installer
+        # resolves its binaries as siblings of the running executable.
         run: |
-          tar -czvf caffeinate2-${{ env.version }}.tar.gz \
-            target/release/caffeinate2 \
-            target/release/caffeinate2-tray \
-            target/release/caffeinate2-helper
+          tar -C target/release -czvf caffeinate2-${{ env.version }}.tar.gz \
+            caffeinate2 \
+            caffeinate2-tray \
+            caffeinate2-helper
       - name: Create a release
         uses: softprops/action-gh-release@v2
         with:
