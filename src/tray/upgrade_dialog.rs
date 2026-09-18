@@ -285,7 +285,7 @@ fn informative_text(
     };
     if releasing {
         text.push_str(
-            "caffeinate2 upgraded that to Entirely mode, and keeps the hold for about 20 seconds \
+            "caffeinate2 upgraded that to Entirely mode, and keeps the hold for about 5 seconds \
              after the last assertion goes away — programs like this routinely drop theirs for a \
              moment between turns. Unless one comes back, the hold releases on its own.\n\n",
         );
@@ -296,7 +296,7 @@ fn informative_text(
         };
         text.push_str(&format!(
             "caffeinate2 upgraded that to Entirely mode so the Mac stays awake with the lid closed \
-             too, and releases it about 20 seconds after {subject} stops asking.\n\n"
+             too, and releases it about 5 seconds after {subject} stops asking.\n\n"
         ));
     }
     // The take-over bullet has to describe the end condition it actually gets:
@@ -397,7 +397,7 @@ mod tests {
         assert!(text.starts_with("Claude is holding an idle-sleep assertion"));
         assert!(text.contains("lid closes"));
         assert!(text.contains("upgraded that to Entirely mode"));
-        assert!(text.contains("about 20 seconds after Claude stops asking"));
+        assert!(text.contains("about 5 seconds after Claude stops asking"));
         assert!(text.contains("Hold For 30m"));
         assert!(text.contains("in System mode, ending on that schedule"));
         assert!(text.contains(IGNORE_ONCE_TITLE));
@@ -420,7 +420,7 @@ mod tests {
         );
         assert!(text.starts_with("These 3 programs are holding idle-sleep assertions"));
         assert!(text.contains("    Claude\n    Codex\n    node"));
-        assert!(text.contains("about 20 seconds after the last of them stops asking"));
+        assert!(text.contains("about 5 seconds after the last of them stops asking"));
         assert!(text.contains("Hold Until I Stop It"));
         assert!(text.contains("staying on until you switch it off"));
         assert!(text.contains("Never Upgrade Selected App"));
@@ -434,7 +434,7 @@ mod tests {
     fn informative_text_describes_a_hold_that_is_releasing() {
         let text = informative_text(&apps(&["Claude"]), SleepMode::System, None, true);
         assert!(text.starts_with("Claude has stopped holding its idle-sleep assertion."));
-        assert!(text.contains("keeps the hold for about 20 seconds"));
+        assert!(text.contains("keeps the hold for about 5 seconds"));
         assert!(text.contains("Unless one comes back, the hold releases on its own"));
         assert!(text.contains("instead of releasing in the next few seconds"));
         assert!(text.contains("release the hold now instead of waiting out those seconds"));

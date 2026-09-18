@@ -29,8 +29,10 @@ const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Keep an upgrade hold this long after the external assertion disappears.
 /// Agents (Claude Code, Codex, …) routinely drop their assertion for a moment
-/// between turns; the grace period avoids flapping the hold off and on.
-const UPGRADE_CLEAR_GRACE: Duration = Duration::from_secs(20);
+/// between turns; the grace period avoids flapping the hold off and on. Long
+/// enough to ride out those gaps, short enough that a Mac whose agent really
+/// has finished is free to sleep almost at once.
+const UPGRADE_CLEAR_GRACE: Duration = Duration::from_secs(5);
 
 /// Now on a clock that keeps advancing while the system is asleep, as an
 /// opaque offset from an arbitrary epoch. Timed sessions must expire on
