@@ -45,7 +45,7 @@ pub enum UpgradeChoice {
     IgnoreAssertion(String),
     /// Never upgrade this program again (until it is removed from the list).
     IgnoreApp(String),
-    /// Replace the upgrade with caffeinate2's own session (configured mode and
+    /// Replace the upgrade with caffeinate2's own session (configured modes and
     /// time limit).
     TakeOver,
 }
@@ -64,7 +64,7 @@ const SHUTDOWN_RESPONSE: NSModalResponse = NSModalResponseAbort;
 
 /// Ask what to do about the assertion(s) being upgraded. `apps` must be
 /// non-empty; with several, the dialog carries a picker for which one the
-/// ignore choices apply to. `mode` and `time_limit_secs` are the configured
+/// ignore choices apply to. `modes` and `time_limit_secs` are the configured
 /// session settings a take-over would run under, named in the dialog so the
 /// consequence is visible before clicking. `releasing` is set once those
 /// programs have stopped asserting and the hold is inside its release grace
@@ -73,7 +73,7 @@ const SHUTDOWN_RESPONSE: NSModalResponse = NSModalResponseAbort;
 pub fn ask(
     mtm: MainThreadMarker,
     apps: &[String],
-    mode: SleepMode,
+    modes: &[SleepMode],
     time_limit_secs: Option<u64>,
     releasing: bool,
 ) -> UpgradeChoice {
@@ -91,7 +91,7 @@ pub fn ask(
     alert.setMessageText(&NSString::from_str(&message_text(apps, releasing)));
     alert.setInformativeText(&NSString::from_str(&informative_text(
         apps,
-        mode,
+        modes,
         time_limit_secs,
         releasing,
     )));
@@ -256,7 +256,7 @@ fn app_list(apps: &[String]) -> String {
 /// shown precisely when the user is asking "why won't this turn off?".
 fn informative_text(
     apps: &[String],
-    mode: SleepMode,
+    modes: &[SleepMode],
     time_limit_secs: Option<u64>,
     releasing: bool,
 ) -> String {
@@ -314,9 +314,10 @@ fn informative_text(
         format!("staying on until you switch it off instead of {instead}")
     };
     text.push_str(&format!(
-        "• {} — hold on caffeinate2's own terms in {} mode, {ends}.\n",
+        "• {} — hold on caffeinate2's own terms in {} mode{}, {ends}.\n",
         take_over_title(time_limit_secs),
-        mode.label(),
+        SleepMode::label_list(modes),
+        if modes.len() == 1 { "" } else { "s" },
     ));
     // With the assertions already gone there is no upgrade left to stop, so the
     // ignore choices do the one thing still available: end the hold now.
@@ -393,7 +394,7 @@ mod tests {
     /// does — with button names matching the buttons exactly.
     #[test]
     fn informative_text_explains_the_situation_and_every_button() {
-        let text = informative_text(&apps(&["Claude"]), SleepMode::System, Some(1800), false);
+        let text = informative_text(&apps(&["Claude"]), &[SleepMode::System], Some(1800), false);
         assert!(text.starts_with("Claude is holding an idle-sleep assertion"));
         assert!(text.contains("lid closes"));
         assert!(text.contains("upgraded that to Entirely mode"));
@@ -414,7 +415,7 @@ mod tests {
     fn informative_text_lists_every_holder_and_explains_the_popup() {
         let text = informative_text(
             &apps(&["Claude", "Codex", "node"]),
-            SleepMode::Entirely,
+            &[SleepMode::UserActive, SleepMode::Entirely],
             None,
             false,
         );
@@ -422,7 +423,9 @@ mod tests {
         assert!(text.contains("    Claude\n    Codex\n    node"));
         assert!(text.contains("about 5 seconds after the last of them stops asking"));
         assert!(text.contains("Hold Until I Stop It"));
-        assert!(text.contains("staying on until you switch it off"));
+        assert!(
+            text.contains("in User active and Entirely modes, staying on until you switch it off")
+        );
         assert!(text.contains("Never Upgrade Selected App"));
         assert!(text.ends_with("The two ignore choices apply to the app selected below."));
     }
@@ -432,7 +435,7 @@ mod tests {
     /// sentence claims the program is still asking.
     #[test]
     fn informative_text_describes_a_hold_that_is_releasing() {
-        let text = informative_text(&apps(&["Claude"]), SleepMode::System, None, true);
+        let text = informative_text(&apps(&["Claude"]), &[SleepMode::System], None, true);
         assert!(text.starts_with("Claude has stopped holding its idle-sleep assertion."));
         assert!(text.contains("keeps the hold for about 5 seconds"));
         assert!(text.contains("Unless one comes back, the hold releases on its own"));
@@ -441,7 +444,12 @@ mod tests {
         assert!(text.ends_with("• Cancel — leave the hold to release on its own."));
         assert!(!text.contains("stops asking"));
 
-        let many = informative_text(&apps(&["Claude", "Codex"]), SleepMode::System, None, true);
+        let many = informative_text(
+            &apps(&["Claude", "Codex"]),
+            &[SleepMode::System],
+            None,
+            true,
+        );
         assert!(many.starts_with("These 2 programs have stopped holding their idle-sleep"));
         assert!(many.contains("    Claude\n    Codex"));
     }

@@ -69,7 +69,7 @@ pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
     for mode in SleepMode::all() {
         // `muda` menu items are not `Copy`; clone is required to append the same
         // item to the menu after building the handle map.
-        let item = CheckMenuItem::new(mode.label(), true, snapshot.mode == mode, None);
+        let item = CheckMenuItem::new(mode.label(), true, snapshot.modes.contains(&mode), None);
         let id = item.id().clone();
         mode_items.push((id, mode, item.clone()));
         menu.append(&item).expect("append mode item");
@@ -277,7 +277,7 @@ fn append_ignored_apps(menu: &Menu, apps: &[String]) -> Vec<(MenuId, String)> {
 /// Sync all checkbox items to the current menu snapshot.
 pub fn sync_menu_to_snapshot(handles: &MenuHandles, snapshot: &MenuSnapshot) {
     for (_, mode, item) in &handles.mode_items {
-        item.set_checked(snapshot.mode == *mode);
+        item.set_checked(snapshot.modes.contains(mode));
     }
     for (_, secs, item) in &handles.time_limit_items {
         item.set_checked(*secs == snapshot.time_limit_secs);

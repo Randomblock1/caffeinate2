@@ -6,9 +6,10 @@ use crate::util::fs_util;
 use serde::{Deserialize, Serialize};
 
 /// Bumped to 2 when the single `wait_for_app` target became the multi-select
-/// `wait_for_apps` list. Recorded for future format changes; the loader never
-/// gates parsing on it.
-pub const CONFIG_VERSION: u32 = 2;
+/// `wait_for_apps` list, and to 3 when the single `mode` became the
+/// multi-select `modes` list. Recorded for future format changes; the loader
+/// never gates parsing on it.
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeLimitPreset {
@@ -53,8 +54,17 @@ impl TimeLimitPreset {
 pub struct TrayConfig {
     #[serde(default = "default_config_version")]
     pub version: u32,
+    /// The sleep modes a session runs in. Several at once is the point: holding
+    /// Entirely (so the Mac survives the lid closing) alongside User active (so
+    /// the screen stays unlocked) is one selection, not two sessions.
+    /// Normalized by [`TrayConfig::normalize_modes`].
     #[serde(default)]
-    pub mode: SleepMode,
+    pub modes: Vec<SleepMode>,
+    /// The pre-v3 single-`mode` key, read so an existing `tray.toml` keeps its
+    /// selection. Never written back: [`TrayConfig::normalize_modes`] folds it
+    /// into `modes`.
+    #[serde(default, rename = "mode", skip_serializing)]
+    pub legacy_mode: Option<SleepMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_limit_secs: Option<u64>,
     /// Multi-select list of programs the session waits on; empty means no app
@@ -84,7 +94,8 @@ impl Default for TrayConfig {
     fn default() -> Self {
         Self {
             version: default_config_version(),
-            mode: SleepMode::default(),
+            modes: vec![SleepMode::default()],
+            legacy_mode: None,
             time_limit_secs: None,
             wait_for_apps: Vec::new(),
             upgrade_external: false,
@@ -94,6 +105,28 @@ impl Default for TrayConfig {
 }
 
 impl TrayConfig {
+    /// Fold the pre-v3 `mode` key into `modes`, then put the result in
+    /// [`SleepMode::all`] order and dedupe it, so a hand-edited config behaves
+    /// like a menu-edited one and the menu's checkmarks match the file.
+    ///
+    /// An empty selection falls back to the default mode: "on" has to prevent
+    /// something, and a session holding nothing is a state the menu bar cannot
+    /// explain (the icon would read on while the Mac slept anyway).
+    pub fn normalize_modes(&mut self) {
+        if let Some(legacy) = self.legacy_mode.take()
+            && self.modes.is_empty()
+        {
+            self.modes.push(legacy);
+        }
+        self.modes = SleepMode::all()
+            .into_iter()
+            .filter(|mode| self.modes.contains(mode))
+            .collect();
+        if self.modes.is_empty() {
+            self.modes.push(SleepMode::default());
+        }
+    }
+
     /// Sort, dedupe (case-insensitively) and drop blank entries from
     /// `ignored_apps`, so a hand-edited config behaves like a menu-edited one
     /// and the **Ignored apps** submenu lists each program exactly once.
@@ -166,6 +199,7 @@ pub fn load_config() -> TrayConfig {
             TrayConfig::default()
         }
     };
+    config.normalize_modes();
     config.normalize_ignored_apps();
     config
 }
@@ -284,24 +318,59 @@ mod tests {
 
     #[test]
     fn parse_config_defaults_time_limit_to_off() {
-        let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
-        assert_eq!(config.mode, SleepMode::System);
+        let config: TrayConfig = toml::from_str("modes = [\"system\"]\n").unwrap();
+        assert_eq!(config.modes, vec![SleepMode::System]);
         assert_eq!(config.time_limit_secs, None);
     }
 
     #[test]
     fn parse_config_reads_time_limit() {
         let config: TrayConfig =
-            toml::from_str("mode = \"display\"\ntime_limit_secs = 1800\n").unwrap();
-        assert_eq!(config.mode, SleepMode::Display);
+            toml::from_str("modes = [\"display\"]\ntime_limit_secs = 1800\n").unwrap();
+        assert_eq!(config.modes, vec![SleepMode::Display]);
         assert_eq!(config.time_limit_secs, Some(1800));
+    }
+
+    /// A config written before the multi-select menu keeps its mode.
+    #[test]
+    fn pre_v3_single_mode_key_migrates_into_the_list() {
+        let mut config: TrayConfig = toml::from_str("version = 2\nmode = \"entirely\"\n").unwrap();
+        config.normalize_modes();
+        assert_eq!(config.modes, vec![SleepMode::Entirely]);
+        assert_eq!(config.legacy_mode, None);
+        // And it is not written back, so the next load reads only `modes`.
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(!serialized.contains("\nmode ="));
+        assert!(serialized.contains("modes = [\"entirely\"]"));
+    }
+
+    #[test]
+    fn normalize_modes_orders_dedupes_and_never_leaves_an_empty_selection() {
+        let mut config: TrayConfig =
+            toml::from_str("modes = [\"entirely\", \"display\", \"entirely\"]\n").unwrap();
+        config.normalize_modes();
+        assert_eq!(config.modes, vec![SleepMode::Display, SleepMode::Entirely]);
+
+        let mut empty: TrayConfig = toml::from_str("modes = []\n").unwrap();
+        empty.normalize_modes();
+        assert_eq!(empty.modes, vec![SleepMode::default()]);
+    }
+
+    /// `modes` wins over a leftover `mode` key rather than being merged with
+    /// it: the v3 list is the one the menu wrote.
+    #[test]
+    fn an_explicit_mode_list_ignores_the_legacy_key() {
+        let mut config: TrayConfig =
+            toml::from_str("mode = \"disk\"\nmodes = [\"user_active\"]\n").unwrap();
+        config.normalize_modes();
+        assert_eq!(config.modes, vec![SleepMode::UserActive]);
     }
 
     #[test]
     fn parse_config_reads_wait_for_apps_array() {
         let config: TrayConfig = toml::from_str(
             r#"
-mode = "system"
+modes = ["system"]
 
 [[wait_for_apps]]
 kind = "bundle"
@@ -332,20 +401,20 @@ name = "foo"
 
     #[test]
     fn parse_config_defaults_upgrade_external_to_false() {
-        let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
+        let config: TrayConfig = toml::from_str("modes = [\"system\"]\n").unwrap();
         assert!(!config.upgrade_external);
     }
 
     #[test]
     fn parse_config_reads_upgrade_external() {
         let config: TrayConfig =
-            toml::from_str("mode = \"system\"\nupgrade_external = true\n").unwrap();
+            toml::from_str("modes = [\"system\"]\nupgrade_external = true\n").unwrap();
         assert!(config.upgrade_external);
     }
 
     #[test]
     fn parse_config_defaults_ignored_apps_to_empty() {
-        let config: TrayConfig = toml::from_str("mode = \"system\"\n").unwrap();
+        let config: TrayConfig = toml::from_str("modes = [\"system\"]\n").unwrap();
         assert!(config.ignored_apps.is_empty());
         assert!(!config.ignores_app("Zoom"));
     }

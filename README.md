@@ -174,7 +174,7 @@ When a **time limit** is set, left-clicking to start sleep prevention turns it o
 - **Never Upgrade This App** — add it to the ignore list under **Ignored apps**, where clicking it removes it again.
 - **Cancel** — leave the upgrade running.
 
-Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`.
+Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`. The selected mode lives there as `modes = ["system"]`; a file written by an older version, which stored a single `mode`, is read and migrated on the next save.
 
 **Start at login** writes `~/Library/LaunchAgents/com.randomblock1.caffeinate2-tray.plist` and takes effect at the next login (the tray does not start a second instance immediately). Use `-d` for a one-off background launch right now; use the LaunchAgent to start the tray at every login. The menu toggle and these CLI flags use the same LaunchAgent:
 

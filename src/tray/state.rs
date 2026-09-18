@@ -2,7 +2,7 @@ use crate::entirely::error::InstallError;
 use crate::entirely::helper_ipc::HelperClient;
 use crate::entirely::install;
 use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
-use crate::sleep::sleep_mode::{ActiveSleepHold, EnableError, SleepMode};
+use crate::sleep::sleep_mode::{self, ActiveSleepHold, EnableError, SleepMode};
 use crate::tray::app_target::WatchTarget;
 use crate::tray::assertion_watch::{
     ExternalClassification, OBSERVED_TYPES, classify_external_assertions, holder_names,
@@ -71,21 +71,35 @@ fn should_latch_upgrade_failure(error: &EnableError) -> bool {
     matches!(error, EnableError::NotAuthorized(_))
 }
 
+/// Release every hold of a session on a background thread. An entirely-mode
+/// release is a helper RPC bounded by multi-second timeouts (and briefly
+/// retried when the helper is unreachable), so the menu bar must never wait on
+/// it; enables run off-thread for the same reason.
+fn release_holds_off_thread(holds: Vec<ActiveSleepHold>) {
+    thread::spawn(move || {
+        for hold in holds {
+            hold.release_blocking();
+        }
+    });
+}
+
 /// A sleep-prevention enable running on a background thread. Acquiring an
 /// Entirely hold can block for several seconds (the helper install prompt plus
 /// the post-install socket wait), so it must never run on the UI thread; the
 /// worker delivers the acquired hold (or error) back over `rx` and wakes the
 /// event loop, which commits it via [`AppState::poll_pending_enable`].
 struct PendingEnable {
-    mode: SleepMode,
+    /// Every mode this enable is acquiring, in [`SleepMode::all`] order. The
+    /// session commits with all of them or with none.
+    modes: Vec<SleepMode>,
     started_by_upgrade: bool,
     /// External process names to attach to the committed upgrade session.
     /// Refreshed by `poll_upgrade` while the enable is still in flight.
     upgrade_apps: Vec<String>,
-    /// When set, revert `config.mode` (and persist) if this enable fails.
-    /// Used by [`AppState::set_mode`] so a failed mode switch rolls back
-    /// without leaving the tray off or on the wrong mode.
-    rollback_mode: Option<SleepMode>,
+    /// When set, revert `config.modes` (and persist) if this enable fails.
+    /// Used by [`AppState::set_modes`] so a failed mode change rolls back
+    /// without leaving the tray off or on the wrong selection.
+    rollback_modes: Option<Vec<SleepMode>>,
     /// Snapshot of the previous session's "seen a watched app running" latch,
     /// captured when the enable started. Carried onto the committed session so a
     /// two-phase mode switch doesn't reset the latch (which would make the
@@ -103,7 +117,7 @@ struct PendingEnable {
     /// off the UI thread); the entry stays tracked so a re-enable re-attaches
     /// to it instead of stacking a second password dialog.
     cancelled: bool,
-    rx: mpsc::Receiver<Result<ActiveSleepHold, EnableError>>,
+    rx: mpsc::Receiver<Result<Vec<ActiveSleepHold>, EnableError>>,
 }
 
 /// Result of polling the in-flight enable, consumed by the run loop.
@@ -152,15 +166,16 @@ pub enum PendingInstallOutcome {
 
 /// Runtime state while sleep prevention is active.
 struct ActiveTraySession {
-    /// The underlying assertion/lock. Torn down via
-    /// [`ActiveSleepHold::release_blocking`] on a background thread when the
-    /// session is stopped or replaced ([`AppState::stop_session`],
-    /// [`AppState::poll_pending_enable`]); process exit relies on `Drop`.
-    hold: ActiveSleepHold,
-    /// The mode this hold actually enforces. Tracked so a failed mode switch
-    /// rolls `config.mode` back to what is *really* still active, rather than to
-    /// an optimistic `config.mode` a prior in-flight switch already advanced.
-    mode: SleepMode,
+    /// One underlying assertion/lock per selected mode. Torn down via
+    /// [`release_holds_off_thread`] when the session is stopped or replaced
+    /// ([`AppState::stop_session`], [`AppState::poll_pending_enable`]);
+    /// process exit relies on `Drop`.
+    holds: Vec<ActiveSleepHold>,
+    /// The modes these holds actually enforce. Tracked so a failed mode change
+    /// rolls `config.modes` back to what is *really* still active, rather than
+    /// to an optimistic `config.modes` a prior in-flight switch already
+    /// advanced.
+    modes: Vec<SleepMode>,
     /// Deadline for a timed session, as a [`sleep_aware_now`] timestamp so the
     /// limit keeps counting down while the system itself sleeps. `None` for
     /// untimed and upgrade-watcher sessions.
@@ -179,7 +194,9 @@ struct ActiveTraySession {
 /// Menu bar settings used to build the tray menu (no runtime session state).
 #[derive(Debug, Clone)]
 pub struct MenuSnapshot {
-    pub mode: SleepMode,
+    /// Every selected mode, in [`SleepMode::all`] order; never empty. Each menu
+    /// item is checked when its mode appears here.
+    pub modes: Vec<SleepMode>,
     pub time_limit_secs: Option<u64>,
     pub wait_for_apps: Vec<WatchTarget>,
     pub start_at_login: bool,
@@ -305,7 +322,7 @@ impl AppState {
 
     pub fn menu_snapshot(&self) -> MenuSnapshot {
         MenuSnapshot {
-            mode: self.config.mode,
+            modes: self.config.modes.clone(),
             time_limit_secs: self.config.time_limit_secs,
             wait_for_apps: self.config.wait_for_apps.clone(),
             start_at_login: self.start_at_login,
@@ -367,12 +384,13 @@ impl AppState {
         matches!(&self.pending_install, Some(pending) if !pending.cancelled)
     }
 
-    /// The mode of the in-flight enable, if any.
-    const fn pending_mode(&self) -> Option<SleepMode> {
-        match &self.pending_enable {
-            Some(pending) => Some(pending.mode),
-            None => None,
-        }
+    /// Whether the in-flight enable includes Entirely mode — the one whose
+    /// acquire is slow enough (helper install prompt, socket wait) to be worth
+    /// naming in the tooltip.
+    fn pending_includes_entirely(&self) -> bool {
+        self.pending_enable
+            .as_ref()
+            .is_some_and(|pending| pending.modes.contains(&SleepMode::Entirely))
     }
 
     /// How long to wait before the next loop iteration, or `None` to block
@@ -447,12 +465,7 @@ impl AppState {
             self.menu_dirty = true;
         }
         if let Some(session) = self.session.take() {
-            // Release off the UI thread: an entirely-mode release is a helper
-            // RPC bounded by multi-second timeouts (and briefly retried when
-            // the helper is transiently unreachable); the menu bar must not
-            // stall on it. Enable already runs off-thread for the same reason.
-            let hold = session.hold;
-            thread::spawn(move || hold.release_blocking());
+            release_holds_off_thread(session.holds);
         }
         self.last_tooltip = None;
     }
@@ -548,20 +561,22 @@ impl AppState {
     }
 
     pub fn start_session(&mut self) {
-        self.start_session_with(self.config.mode, false, None);
+        self.start_session_with(self.config.modes.clone(), false, None);
     }
 
-    /// Begin acquiring a session in `mode` on a background thread (the helper
-    /// install + socket wait must never block the UI thread). The hold is
-    /// committed to a session by [`AppState::poll_pending_enable`] once the
-    /// worker reports back. Upgrade-watcher sessions (`started_by_upgrade`)
-    /// ignore the configured time limit — they end when the external assertion
-    /// goes away, not on a clock.
+    /// Begin acquiring a session in every mode of `modes` on a background
+    /// thread (the helper install + socket wait must never block the UI
+    /// thread). The holds are committed to a session by
+    /// [`AppState::poll_pending_enable`] once the worker reports back — all of
+    /// them or none, so a mode that fails never leaves a half-selected session
+    /// behind. Upgrade-watcher sessions (`started_by_upgrade`) ignore the
+    /// configured time limit — they end when the external assertion goes away,
+    /// not on a clock.
     pub fn start_session_with(
         &mut self,
-        mode: SleepMode,
+        modes: Vec<SleepMode>,
         started_by_upgrade: bool,
-        rollback_mode: Option<SleepMode>,
+        rollback_modes: Option<Vec<SleepMode>>,
     ) {
         // Capture the current session's "seen a watched app" latch now, so a
         // two-phase mode switch (which keeps the old session alive while the new
@@ -577,16 +592,16 @@ impl AppState {
             .as_ref()
             .is_some_and(|session| !session.started_by_upgrade && session.app_saw_running);
         // Never stack enables; one in-flight request already targets a session.
-        // A cancelled helper-installing enable re-attaches when the mode
-        // matches: its admin dialog is still up (it can't be revoked), so
+        // A cancelled helper-installing enable re-attaches when the
+        // selection matches: its admin dialog is still up (it can't be revoked), so
         // spawning another worker would stack a second password prompt. For
         // any other mode the request is dropped — the entry keeps tracking the
         // dialog until the worker drains.
         if let Some(pending) = self.pending_enable.as_mut() {
-            if pending.cancelled && pending.mode == mode {
+            if pending.cancelled && pending.modes == modes {
                 pending.cancelled = false;
                 pending.started_by_upgrade = started_by_upgrade;
-                pending.rollback_mode = rollback_mode;
+                pending.rollback_modes = rollback_modes;
                 pending.app_saw_seed = app_saw_seed;
                 self.last_tooltip = None;
             }
@@ -597,7 +612,7 @@ impl AppState {
         // would find the helper still missing and spawn a second privileged
         // install — two stacked password prompts for one logical action. Other
         // modes never install, so they may proceed.
-        if mode == SleepMode::Entirely && self.pending_install.is_some() {
+        if modes.contains(&SleepMode::Entirely) && self.pending_install.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -605,21 +620,22 @@ impl AppState {
         // Whether the worker may put up the install's admin dialog. Recorded on
         // the pending entry so the anti-stacking guards (here and in
         // `set_upgrade_external`) can never open a second one over it.
-        let installing_helper = mode == SleepMode::Entirely
+        let installing_helper = modes.contains(&SleepMode::Entirely)
             && install_helper_if_missing
             && !HelperClient::new().is_available();
+        let acquiring = modes.clone();
         thread::spawn(move || {
-            let result = mode.enable_for_tray(install_helper_if_missing);
-            // If the receiver was dropped (the user cancelled), the hold inside
-            // `result` is dropped here, releasing it.
+            let result = sleep_mode::enable_all_for_tray(&acquiring, install_helper_if_missing);
+            // If the receiver was dropped (the user cancelled), the holds inside
+            // `result` are dropped here, releasing them.
             let _ = tx.send(result);
             crate::tray::macos_activation::wake_event_loop();
         });
         self.pending_enable = Some(PendingEnable {
-            mode,
+            modes,
             started_by_upgrade,
             upgrade_apps: Vec::new(),
-            rollback_mode,
+            rollback_modes,
             app_saw_seed,
             installing_helper,
             cancelled: false,
@@ -642,14 +658,14 @@ impl AppState {
         }
     }
 
-    /// Restore `config.mode` to the value captured before an enable that has
-    /// now failed, so the persisted mode doesn't advance past the hold that is
-    /// actually (still) enforced. No-op when the enable carried no rollback.
-    fn rollback_pending_mode(&mut self, pending: &PendingEnable) {
-        if let Some(rollback_mode) = pending.rollback_mode {
-            self.config.mode = rollback_mode;
+    /// Restore `config.modes` to the selection captured before an enable that
+    /// has now failed, so the persisted modes don't advance past the holds that
+    /// are actually (still) enforced. No-op when the enable carried no rollback.
+    fn rollback_pending_modes(&mut self, pending: &PendingEnable) {
+        if let Some(rollback_modes) = pending.rollback_modes.clone() {
+            self.config.modes = rollback_modes;
             if let Err(save_err) = self.save_config() {
-                eprintln!("failed to roll back mode after enable failure: {save_err}");
+                eprintln!("failed to roll back modes after enable failure: {save_err}");
             }
         }
     }
@@ -678,31 +694,27 @@ impl AppState {
         };
         let pending = self.pending_enable.take().expect("pending enable present");
         if cancelled {
-            if let Ok(hold) = result {
-                // Release off the UI thread: an entirely-mode release is a
-                // blocking helper RPC (see `stop_session`).
-                thread::spawn(move || hold.release_blocking());
+            if let Ok(holds) = result {
+                release_holds_off_thread(holds);
             }
             return PendingEnableOutcome::Idle;
         }
         match result {
-            Ok(hold) => {
+            Ok(holds) => {
                 let started_by_upgrade = pending.started_by_upgrade;
                 let previous_started_by_upgrade = self
                     .session
                     .as_ref()
                     .is_some_and(|session| session.started_by_upgrade);
-                // A two-phase mode switch keeps the old session alive until the
-                // new hold commits; release its hold off the UI thread exactly
-                // like `stop_session` (an entirely-mode release is a blocking
-                // helper RPC and must not stall the menu bar).
+                // A two-phase mode change keeps the old session alive until
+                // the new holds commit; release its holds off the UI thread
+                // exactly like `stop_session`.
                 if let Some(previous) = self.session.take() {
-                    let previous_hold = previous.hold;
-                    thread::spawn(move || previous_hold.release_blocking());
+                    release_holds_off_thread(previous.holds);
                 }
                 self.session = Some(ActiveTraySession {
-                    hold,
-                    mode: pending.mode,
+                    holds,
+                    modes: pending.modes,
                     until: if started_by_upgrade {
                         None
                     } else {
@@ -739,7 +751,7 @@ impl AppState {
                 PendingEnableOutcome::Started
             }
             Err(error) => {
-                self.rollback_pending_mode(&pending);
+                self.rollback_pending_modes(&pending);
                 let started_by_upgrade = pending.started_by_upgrade;
                 if started_by_upgrade {
                     if should_latch_upgrade_failure(&error) {
@@ -762,18 +774,35 @@ impl AppState {
         }
     }
 
+    /// Switch the selection to `mode` alone, restarting an active session on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be written, or if the switch is
+    /// blocked by an in-flight helper install (see [`AppState::set_modes`]).
     pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), TrayError> {
-        if mode == self.config.mode {
+        self.set_modes(vec![mode])
+    }
+
+    /// Replace the selected modes with `modes` (already in [`SleepMode::all`]
+    /// order and non-empty), restarting an active session on the new selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be written, or if the change is
+    /// blocked by an in-flight helper install (see the guards below).
+    fn set_modes(&mut self, modes: Vec<SleepMode>) -> Result<(), TrayError> {
+        if modes == self.config.modes {
             return Ok(());
         }
         // A pending helper install blocks an Entirely enable (see the guard in
-        // `start_session_with`). When this switch would start a session,
-        // reject it up front — before the new mode is persisted — instead of
-        // letting that guard silently swallow the enable afterwards: the menu
-        // and config would then claim Entirely while the old hold keeps
+        // `start_session_with`). When this change would start a session,
+        // reject it up front — before the new selection is persisted — instead
+        // of letting that guard silently swallow the enable afterwards: the
+        // menu and config would then claim Entirely while the old holds keep
         // running, and no rollback would ever fire (rollback lives in
         // `poll_pending_enable`, which never arms without a pending enable).
-        if mode == SleepMode::Entirely
+        if modes.contains(&SleepMode::Entirely)
             && self.pending_install.is_some()
             && (self.is_on() || self.is_enabling())
         {
@@ -782,13 +811,13 @@ impl AppState {
         // The sibling hazard: a helper-installing Entirely *enable* in flight
         // (its admin dialog may be up — even a cancelled one, since the dialog
         // can't be revoked). Switching to another mode would persist the new
-        // mode while `start_session_with` drops the request on the occupied
-        // pending slot: config and menu would claim the new mode with no
-        // session (or with the old hold still enforced), no rollback would
-        // ever arm, and manual enables would be silently swallowed until the
-        // dialog resolves. Reject up front; the switch works once it does.
-        // A switch *to* Entirely instead re-attaches to the pending enable.
-        if mode != SleepMode::Entirely
+        // selection while `start_session_with` drops the request on the
+        // occupied pending slot: config and menu would claim it with no session
+        // (or with the old holds still enforced), no rollback would ever arm,
+        // and manual enables would be silently swallowed until the dialog
+        // resolves. Reject up front; the switch works once it does. A switch
+        // *to* Entirely instead re-attaches to the pending enable.
+        if !modes.contains(&SleepMode::Entirely)
             && self
                 .pending_enable
                 .as_ref()
@@ -796,21 +825,21 @@ impl AppState {
         {
             return Err(TrayError::HelperInstallPending);
         }
-        // Roll back to the mode actually being enforced, not to `config.mode`:
-        // a prior in-flight switch may have already advanced `config.mode`
-        // optimistically, so using it would leave the menu/config disagreeing
-        // with the live hold if this switch fails. The live session's mode is
-        // the source of truth; with no live session, the current config is the
-        // best available target.
-        let previous_mode = self
-            .session
-            .as_ref()
-            .map_or(self.config.mode, |session| session.mode);
+        // Roll back to the modes actually being enforced, not to
+        // `config.modes`: a prior in-flight change may have already advanced
+        // `config.modes` optimistically, so using it would leave the
+        // menu/config disagreeing with the live holds if this change fails. The
+        // live session's modes are the source of truth; with no live session,
+        // the current config is the best available target.
+        let previous_modes = self.session.as_ref().map_or_else(
+            || self.config.modes.clone(),
+            |session| session.modes.clone(),
+        );
         // Persist first: build and save the new config, then commit it in RAM
         // only on success, so a failed write never leaves disk and memory
         // disagreeing.
         let mut new_config = self.config.clone();
-        new_config.mode = mode;
+        new_config.modes = modes.clone();
         tray_mode::save_config(&new_config)?;
         self.config = new_config;
 
@@ -828,10 +857,10 @@ impl AppState {
                 // Explicit mode change takes manual control away from the watcher.
                 self.upgrade_overridden = true;
             }
-            // Two-phase mode switch: keep the current session until the new hold
-            // is acquired. On failure, poll_pending_enable rolls config back and
-            // the old session (if any) keeps preventing sleep.
-            self.start_session_with(mode, false, Some(previous_mode));
+            // Two-phase mode change: keep the current session until the new
+            // holds are acquired. On failure, poll_pending_enable rolls config
+            // back and the old session (if any) keeps preventing sleep.
+            self.start_session_with(modes, false, Some(previous_modes));
         }
         Ok(())
     }
@@ -846,9 +875,9 @@ impl AppState {
         // release it inline now — after this returns the process exits and
         // nothing else would ever drain the channel.
         if let Some(pending) = self.pending_enable.take()
-            && let Ok(Ok(hold)) = pending.rx.try_recv()
+            && let Ok(Ok(holds)) = pending.rx.try_recv()
         {
-            drop(hold);
+            drop(holds);
         }
         // Release inline, not via stop_session: the process exits as soon as
         // the caller returns, which would kill stop_session's detached
@@ -1178,9 +1207,9 @@ impl AppState {
         self.config.time_limit_secs
     }
 
-    /// The configured mode — what a session started now would run in.
-    pub const fn mode(&self) -> SleepMode {
-        self.config.mode
+    /// The configured selection — what a session started now would run in.
+    pub fn modes(&self) -> &[SleepMode] {
+        &self.config.modes
     }
 
     /// Ignore `name`'s current assertion: stop upgrading it until it goes away
@@ -1194,7 +1223,7 @@ impl AppState {
     /// — but the alternative is worse: keeping an upgrade hold the user has
     /// just explicitly dismissed, for the seconds the acquire takes. The
     /// in-flight enable is a *manual* one and still commits, so the window is
-    /// bounded by that acquire and ends with the mode the user asked for.
+    /// bounded by that acquire and ends with the modes the user asked for.
     pub fn ignore_assertion_once(&mut self, name: &str) {
         if name.is_empty() {
             return;
@@ -1255,14 +1284,14 @@ impl AppState {
         Ok(())
     }
 
-    /// Hand the upgrade over to a normal caffeinate2 session: the configured mode
+    /// Hand the upgrade over to a normal caffeinate2 session: the configured modes
     /// and time limit take over from the external assertion, so the hold ends on
     /// caffeinate2's clock instead of whenever the other program happens to stop
     /// asserting. The watcher stays out of the way for the rest of this trigger
     /// episode (like a manual left-click-off).
     ///
-    /// Keeping the same hold when the configured mode is the one already in
-    /// force (Entirely, for an upgrade session) avoids a needless
+    /// Keeping the same holds when the configured selection is the one already
+    /// in force (Entirely alone, for an upgrade session) avoids a needless
     /// release/acquire round trip through the privileged helper.
     pub fn take_over_upgrade_session(&mut self) {
         if !self.is_upgrading() {
@@ -1273,10 +1302,15 @@ impl AppState {
         self.menu_dirty = true;
         self.last_tooltip = None;
 
-        if self.session.as_ref().map(|session| session.mode) != Some(self.config.mode) {
-            // Two-phase switch: the current hold keeps preventing sleep until
-            // the new mode's hold commits (see `set_mode`).
-            self.start_session_with(self.config.mode, false, None);
+        if self
+            .session
+            .as_ref()
+            .map(|session| session.modes.as_slice())
+            != Some(self.config.modes.as_slice())
+        {
+            // Two-phase change: the current holds keep preventing sleep until
+            // the new selection's holds commit (see `set_modes`).
+            self.start_session_with(self.config.modes.clone(), false, None);
             return;
         }
 
@@ -1447,7 +1481,7 @@ impl AppState {
                     }
                     return false;
                 }
-                self.start_session_with(SleepMode::Entirely, true, None);
+                self.start_session_with(vec![SleepMode::Entirely], true, None);
                 if let Some(pending) = self.pending_enable.as_mut() {
                     pending.upgrade_apps = app_names;
                 }
@@ -1532,7 +1566,7 @@ mod tests {
         });
         // A manual Entirely enable while the install's admin dialog may be up
         // must not spawn a worker (which would stack a second dialog).
-        state.start_session_with(SleepMode::Entirely, false, None);
+        state.start_session_with(vec![SleepMode::Entirely], false, None);
         assert!(state.pending_enable.is_none());
     }
 
@@ -1556,7 +1590,7 @@ mod tests {
         unsafe { std::env::set_var("HOME", &temp_home) };
 
         let mut state = bare_state();
-        state.config.mode = SleepMode::System;
+        state.config.modes = vec![SleepMode::System];
         let (_tx, rx) = mpsc::channel();
         state.pending_install = Some(PendingInstall {
             rx,
@@ -1566,10 +1600,10 @@ mod tests {
         // without taking a real hold.
         let (_etx, erx) = mpsc::channel();
         state.pending_enable = Some(PendingEnable {
-            mode: SleepMode::System,
+            modes: vec![SleepMode::System],
             started_by_upgrade: false,
             upgrade_apps: Vec::new(),
-            rollback_mode: None,
+            rollback_modes: None,
             app_saw_seed: false,
             installing_helper: false,
             cancelled: false,
@@ -1579,8 +1613,8 @@ mod tests {
             state.set_mode(SleepMode::Entirely),
             Err(TrayError::HelperInstallPending)
         ));
-        // The rejected switch must not have advanced the persisted mode.
-        assert_eq!(state.config.mode, SleepMode::System);
+        // The rejected change must not have advanced the persisted selection.
+        assert_eq!(state.config.modes, vec![SleepMode::System]);
 
         // SAFETY: see the set_var note above.
         unsafe {
@@ -1601,20 +1635,20 @@ mod tests {
             rx,
             cancelled: true,
         });
-        state.start_session_with(SleepMode::Entirely, false, None);
+        state.start_session_with(vec![SleepMode::Entirely], false, None);
         assert!(state.pending_enable.is_none());
     }
 
     /// A pending helper-installing enable, as spawned by a manual Entirely
     /// start with the helper missing.
     fn installing_pending_enable(
-        rx: mpsc::Receiver<Result<ActiveSleepHold, EnableError>>,
+        rx: mpsc::Receiver<Result<Vec<ActiveSleepHold>, EnableError>>,
     ) -> PendingEnable {
         PendingEnable {
-            mode: SleepMode::Entirely,
+            modes: vec![SleepMode::Entirely],
             started_by_upgrade: false,
             upgrade_apps: Vec::new(),
-            rollback_mode: None,
+            rollback_modes: None,
             app_saw_seed: false,
             installing_helper: true,
             cancelled: false,
@@ -1641,7 +1675,7 @@ mod tests {
         unsafe { std::env::set_var("HOME", &temp_home) };
 
         let mut state = bare_state();
-        state.config.mode = SleepMode::Entirely;
+        state.config.modes = vec![SleepMode::Entirely];
         let (_tx, rx) = mpsc::channel();
         state.pending_enable = Some(installing_pending_enable(rx));
         state.set_upgrade_external(true).unwrap();
@@ -1666,7 +1700,7 @@ mod tests {
     #[test]
     fn cancelled_installing_enable_reattaches_instead_of_respawning() {
         let mut state = bare_state();
-        state.config.mode = SleepMode::Entirely;
+        state.config.modes = vec![SleepMode::Entirely];
         let (tx, rx) = mpsc::channel();
         state.pending_enable = Some(installing_pending_enable(rx));
 
@@ -1738,10 +1772,10 @@ mod tests {
         state.config.upgrade_external = true;
         let (_tx, rx) = mpsc::channel();
         state.pending_enable = Some(PendingEnable {
-            mode: SleepMode::Entirely,
+            modes: vec![SleepMode::Entirely],
             started_by_upgrade: true,
             upgrade_apps: vec!["Claude".to_string()],
-            rollback_mode: None,
+            rollback_modes: None,
             app_saw_seed: false,
             installing_helper: false,
             cancelled: false,
@@ -1786,14 +1820,14 @@ mod tests {
         unsafe { std::env::set_var("HOME", &temp_home) };
 
         let mut state = bare_state();
-        state.config.mode = SleepMode::Entirely;
+        state.config.modes = vec![SleepMode::Entirely];
         let (_tx, rx) = mpsc::channel();
         state.pending_enable = Some(installing_pending_enable(rx));
         assert!(matches!(
             state.set_mode(SleepMode::System),
             Err(TrayError::HelperInstallPending)
         ));
-        assert_eq!(state.config.mode, SleepMode::Entirely);
+        assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
 
         // A cancelled installing enable still tracks the dialog and still
         // occupies the slot, so it blocks the switch just the same.
@@ -1802,7 +1836,7 @@ mod tests {
             state.set_mode(SleepMode::Display),
             Err(TrayError::HelperInstallPending)
         ));
-        assert_eq!(state.config.mode, SleepMode::Entirely);
+        assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
 
         // SAFETY: see the set_var note above.
         unsafe {
@@ -1822,8 +1856,8 @@ mod tests {
     fn upgrade_session_latch_is_not_carried_into_next_session() {
         let mut state = bare_state();
         state.session = Some(ActiveTraySession {
-            hold: ActiveSleepHold::Noop,
-            mode: SleepMode::Entirely,
+            holds: vec![ActiveSleepHold::Noop],
+            modes: vec![SleepMode::Entirely],
             until: None,
             app_saw_running: true,
             started_by_upgrade: true,
@@ -1835,14 +1869,14 @@ mod tests {
         let mut pending = installing_pending_enable(rx);
         pending.cancelled = true;
         state.pending_enable = Some(pending);
-        state.start_session_with(SleepMode::Entirely, false, None);
+        state.start_session_with(vec![SleepMode::Entirely], false, None);
         assert!(!state.pending_enable.as_ref().unwrap().app_saw_seed);
 
         // The same latch on a manual session is carried: a two-phase mode
         // switch must not lose it.
         state.session.as_mut().unwrap().started_by_upgrade = false;
         state.pending_enable.as_mut().unwrap().cancelled = true;
-        state.start_session_with(SleepMode::Entirely, false, None);
+        state.start_session_with(vec![SleepMode::Entirely], false, None);
         assert!(state.pending_enable.as_ref().unwrap().app_saw_seed);
     }
 
@@ -1854,7 +1888,7 @@ mod tests {
         let mut state = bare_state();
         state.config.time_limit_secs = Some(60);
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(ActiveSleepHold::Noop)).unwrap();
+        tx.send(Ok(vec![ActiveSleepHold::Noop])).unwrap();
         let mut pending = installing_pending_enable(rx);
         pending.started_by_upgrade = true;
         pending.installing_helper = false;
@@ -1876,8 +1910,8 @@ mod tests {
     fn check_timeout_fires_only_past_the_deadline() {
         let mut state = bare_state();
         state.session = Some(ActiveTraySession {
-            hold: ActiveSleepHold::Noop,
-            mode: SleepMode::System,
+            holds: vec![ActiveSleepHold::Noop],
+            modes: vec![SleepMode::System],
             until: Some(sleep_aware_now() + Duration::from_secs(3600)),
             app_saw_running: false,
             started_by_upgrade: false,
@@ -1923,8 +1957,8 @@ mod tests {
 
     fn upgrade_session_for(apps: &[&str]) -> ActiveTraySession {
         ActiveTraySession {
-            hold: ActiveSleepHold::Noop,
-            mode: SleepMode::Entirely,
+            holds: vec![ActiveSleepHold::Noop],
+            modes: vec![SleepMode::Entirely],
             until: None,
             app_saw_running: false,
             started_by_upgrade: true,
@@ -2079,11 +2113,11 @@ mod tests {
     #[test]
     fn take_over_converts_the_upgrade_session_to_a_timed_manual_one() {
         let mut state = bare_state();
-        state.config.mode = SleepMode::Entirely;
+        state.config.modes = vec![SleepMode::Entirely];
         state.config.time_limit_secs = Some(1800);
         state.session = Some(ActiveTraySession {
-            hold: ActiveSleepHold::Noop,
-            mode: SleepMode::Entirely,
+            holds: vec![ActiveSleepHold::Noop],
+            modes: vec![SleepMode::Entirely],
             until: None,
             app_saw_running: false,
             started_by_upgrade: true,
@@ -2108,10 +2142,10 @@ mod tests {
     #[test]
     fn take_over_with_a_different_mode_switches_in_two_phases() {
         let mut state = bare_state();
-        state.config.mode = SleepMode::Display;
+        state.config.modes = vec![SleepMode::Display];
         state.session = Some(ActiveTraySession {
-            hold: ActiveSleepHold::Noop,
-            mode: SleepMode::Entirely,
+            holds: vec![ActiveSleepHold::Noop],
+            modes: vec![SleepMode::Entirely],
             until: None,
             app_saw_running: false,
             started_by_upgrade: true,
@@ -2123,7 +2157,7 @@ mod tests {
         // The upgrade session still holds while the Display hold is acquired.
         assert!(state.is_upgrading());
         let pending = state.pending_enable.as_ref().expect("enable in flight");
-        assert_eq!(pending.mode, SleepMode::Display);
+        assert_eq!(pending.modes, vec![SleepMode::Display]);
         assert!(!pending.started_by_upgrade);
         assert!(state.upgrade_overridden);
     }
@@ -2176,22 +2210,19 @@ mod tests {
         unsafe { std::env::set_var("HOME", &temp_home) };
 
         let mut state = AppState::new();
-        let original_mode = state.config.mode;
-        let target_mode = if original_mode == SleepMode::Display {
-            SleepMode::System
-        } else {
-            SleepMode::Display
-        };
+        let original_modes = state.config.modes.clone();
+        let target_modes = vec![SleepMode::Disk, SleepMode::UserActive];
+        assert_ne!(target_modes, original_modes);
 
-        state.config.mode = target_mode;
+        state.config.modes = target_modes.clone();
         let (tx, rx) = mpsc::channel();
         tx.send(Err(EnableError::Ipc("mock enable failure".into())))
             .unwrap();
         state.pending_enable = Some(PendingEnable {
-            mode: target_mode,
+            modes: target_modes,
             started_by_upgrade: false,
             upgrade_apps: Vec::new(),
-            rollback_mode: Some(original_mode),
+            rollback_modes: Some(original_modes.clone()),
             app_saw_seed: false,
             installing_helper: false,
             cancelled: false,
@@ -2200,7 +2231,7 @@ mod tests {
 
         let outcome = state.poll_pending_enable();
         assert!(matches!(outcome, PendingEnableOutcome::Failed { .. }));
-        assert_eq!(state.config.mode, original_mode);
+        assert_eq!(state.config.modes, original_modes);
 
         // SAFETY: see the set_var note above.
         unsafe {

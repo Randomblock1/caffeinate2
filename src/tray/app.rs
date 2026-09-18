@@ -50,8 +50,8 @@ fn poll_pending_enable(state: &mut AppState, tray: &tray_icon::TrayIcon, handles
         PendingEnableOutcome::Idle | PendingEnableOutcome::Pending => {}
         PendingEnableOutcome::Started => {
             state.set_icon(tray);
-            // An async mode switch can commit a different mode than the menu
-            // currently shows; re-sync the checkboxes to the committed state.
+            // An async mode change can commit a different selection than the
+            // menu currently shows; re-sync the checkboxes to it.
             sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
         PendingEnableOutcome::Failed {
@@ -66,10 +66,10 @@ fn poll_pending_enable(state: &mut AppState, tray: &tray_icon::TrayIcon, handles
                 eprintln!("{error}");
                 state.show_error_tooltip(tray, &error.to_string());
             }
-            // A failed mode switch rolled `config.mode` back; the menu checkbox
-            // was optimistically moved to the failed target when the command ran
-            // (muda auto-toggles, then dispatch_command re-synced to the target),
-            // so re-sync it to the rolled-back state here.
+            // A failed mode change rolled `config.modes` back; the menu
+            // checkbox was optimistically moved to the failed selection when the
+            // command ran (muda auto-toggles, then dispatch_command re-synced to
+            // it), so re-sync it to the rolled-back state here.
             sync_menu_to_snapshot(handles, &state.menu_snapshot());
         }
     }
@@ -110,7 +110,8 @@ fn handle_upgrade_click(
     apps: &[String],
 ) {
     let releasing = state.upgrade_releasing();
-    match upgrade_dialog::ask(mtm, apps, state.mode(), state.time_limit_secs(), releasing) {
+    let modes = state.modes().to_vec();
+    match upgrade_dialog::ask(mtm, apps, &modes, state.time_limit_secs(), releasing) {
         UpgradeChoice::KeepUpgrading => return,
         UpgradeChoice::IgnoreAssertion(name) => state.ignore_assertion_once(&name),
         UpgradeChoice::TakeOver => state.take_over_upgrade_session(),
@@ -289,7 +290,7 @@ pub fn run() -> Result<(), TrayError> {
                 // flash the wrong state.
                 let turning_on = !state.is_on() && !state.is_enabling();
                 state.show_icon_state(&tray, turning_on);
-                if turning_on && state.menu_snapshot().mode == SleepMode::Entirely {
+                if turning_on && state.modes().contains(&SleepMode::Entirely) {
                     let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                     state.invalidate_tooltip();
                 }

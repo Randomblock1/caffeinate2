@@ -3,7 +3,7 @@
 //! live [`tray_icon::TrayIcon`]; the rest of it is pure state that the run
 //! loop renders through these methods.
 
-use super::{AppState, SleepMode, sleep_aware_now};
+use super::{AppState, sleep_aware_now};
 use crate::tray::error::TrayError;
 use crate::tray::tray_icons;
 use crate::tray::tray_mode;
@@ -116,7 +116,7 @@ impl AppState {
         let tooltip = if self.is_installing() {
             "caffeinate2 (installing helper…)".to_string()
         } else if self.is_enabling() {
-            if self.pending_mode() == Some(SleepMode::Entirely) {
+            if self.pending_includes_entirely() {
                 "caffeinate2 (enabling Entirely mode…)".to_string()
             } else {
                 "caffeinate2 (enabling…)".to_string()

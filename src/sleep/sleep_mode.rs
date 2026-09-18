@@ -97,6 +97,18 @@ impl SleepMode {
         }
     }
 
+    /// Human-readable list of mode labels for UI text: "System",
+    /// "Entirely and User active", "Display, Entirely and User active".
+    #[must_use]
+    pub fn label_list(modes: &[Self]) -> String {
+        let labels: Vec<&str> = modes.iter().map(|mode| mode.label()).collect();
+        match labels.as_slice() {
+            [] => "none".to_string(),
+            [one] => (*one).to_string(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    }
+
     #[must_use]
     pub const fn all() -> [Self; 6] {
         [
@@ -193,6 +205,37 @@ impl SleepMode {
             other => other,
         }
     }
+}
+
+/// Acquire a tray hold for every mode in `modes`, releasing whatever was
+/// already acquired if a later one fails: a tray session runs in all of its
+/// modes or in none, so a partial acquire must never leave behind a hold no
+/// session tracks.
+///
+/// Blocks for as long as the slowest mode takes (Entirely can prompt for the
+/// helper install), so it belongs on the same background thread
+/// [`SleepMode::enable_for_tray`] does.
+///
+/// # Errors
+///
+/// Returns the error of the first mode that could not be enabled.
+pub fn enable_all_for_tray(
+    modes: &[SleepMode],
+    install_helper_if_missing: bool,
+) -> Result<Vec<ActiveSleepHold>, EnableError> {
+    let mut holds = Vec::with_capacity(modes.len());
+    for mode in modes {
+        match mode.enable_for_tray(install_helper_if_missing) {
+            Ok(hold) => holds.push(hold),
+            Err(error) => {
+                for hold in holds {
+                    hold.release_blocking();
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(holds)
 }
 
 /// One active sleep-prevention hold (`IOKit` assertion, periodically-refreshed
@@ -368,6 +411,24 @@ mod tests {
         assert_eq!(
             classify_helper_error(HelperIpcError::new("read failed: timeout".to_string())),
             EnableError::Ipc("read failed: timeout".to_string())
+        );
+    }
+
+    #[test]
+    fn label_list_reads_as_a_sentence() {
+        assert_eq!(SleepMode::label_list(&[]), "none");
+        assert_eq!(SleepMode::label_list(&[SleepMode::System]), "System");
+        assert_eq!(
+            SleepMode::label_list(&[SleepMode::UserActive, SleepMode::Entirely]),
+            "User active and Entirely"
+        );
+        assert_eq!(
+            SleepMode::label_list(&[
+                SleepMode::Display,
+                SleepMode::UserActive,
+                SleepMode::Entirely
+            ]),
+            "Display, User active and Entirely"
         );
     }
 
