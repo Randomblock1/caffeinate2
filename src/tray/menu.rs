@@ -23,7 +23,9 @@ pub enum MenuCommand {
     Quit,
     ToggleStartAtLogin,
     ToggleUpgradeExternal,
-    SetMode(SleepMode),
+    /// Add or remove one sleep mode from the selection; several can be on at
+    /// once, so each mode item is an independent toggle.
+    ToggleMode(SleepMode),
     SetTimeLimit(Option<u64>),
     /// Drop a program from the ignore list, so the watcher upgrades it again.
     UnignoreApp(String),
@@ -45,7 +47,7 @@ impl MenuHandles {
         // window code), so resolving it here would be dead code.
         for (id, mode, _) in &self.mode_items {
             if event_id == id {
-                return Some(MenuCommand::SetMode(*mode));
+                return Some(MenuCommand::ToggleMode(*mode));
             }
         }
         for (id, secs, _) in &self.time_limit_items {
@@ -344,19 +346,28 @@ pub fn dispatch_command(
                 state.show_error_tooltip(tray, &e.to_string());
             }
         }
-        MenuCommand::SetMode(mode) => {
+        MenuCommand::ToggleMode(mode) => {
             let mode = *mode;
-            // Switching an active session to Entirely can block on the helper
-            // install prompt and socket wait; surface progress in the tooltip
-            // before the blocking work starts. set_icon below restores it.
-            if state.is_on() && mode == SleepMode::Entirely {
+            // Any change to an active session re-acquires every mode in the
+            // *new* selection, so the helper install prompt and socket wait are
+            // ahead whenever that selection includes Entirely — including when
+            // the click is on some other mode. Surface progress in the tooltip
+            // before the blocking work starts; set_icon below restores it.
+            // Unchecking Entirely is the one case that does not, so it must not
+            // claim to be enabling what it is taking away.
+            let selected = state.menu_snapshot().modes;
+            let unchecking_entirely =
+                mode == SleepMode::Entirely && selected.contains(&mode) && selected.len() > 1;
+            let will_hold_entirely = !unchecking_entirely
+                && (mode == SleepMode::Entirely || selected.contains(&SleepMode::Entirely));
+            if state.is_on() && will_hold_entirely {
                 let _ = tray.set_tooltip(Some("caffeinate2 (enabling Entirely mode…)"));
                 state.invalidate_tooltip();
                 crate::tray::macos_activation::pump_event_loop(Some(
                     std::time::Duration::from_millis(1),
                 ));
             }
-            match state.set_mode(mode) {
+            match state.toggle_mode(mode) {
                 Ok(()) => state.set_icon(tray),
                 Err(e) => {
                     eprintln!("{e}");

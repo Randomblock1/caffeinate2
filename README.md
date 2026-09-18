@@ -147,9 +147,9 @@ Run `caffeinate2-tray` after installing with `--features full`. To run it in the
 
 This returns control to the shell immediately and keeps the menu bar icon running after the terminal closes. Its stderr is captured, best-effort, to `~/Library/Logs/caffeinate2-tray.log` (appended, never rotated), and is discarded only if that file cannot be opened; run it in the foreground to watch the logs live. Stop it with the tray's **Quit** item or `pkill -x caffeinate2-tray`.
 
-- **Left click:** toggle the selected sleep mode on/off — or, while caffeinate2 is upgrading another app's sleep assertion, open the upgrade dialog (see below).
+- **Left click:** toggle the selected sleep modes on/off — or, while caffeinate2 is upgrading another app's sleep assertion, open the upgrade dialog (see below).
 - **Right-click:** open the menu:
-  - **Mode** — Display, Disk, System, System (on AC), User active, or Entirely.
+  - **Mode** — Display, Disk, System, System (on AC), User active, Entirely. These are independent checkboxes, not a single choice: pick as many as you need and one session holds all of them. **Entirely** plus **User active** is the useful pair for agents — Entirely keeps the Mac awake with the lid shut, User active also keeps the screen from locking so the agent can drive the UI. At least one mode stays selected; clicking the last checked one does nothing.
   - **Time limit** — Off, 15 minutes, 30 minutes, 1 hour, and so on.
   - **Wait for apps…** — pick one or more running apps, or use the **Choose application** picker (button **Choose**) for any `.app`.
   - **Upgrade other apps' sleep prevention** — see below.
@@ -157,7 +157,7 @@ This returns control to the shell immediately and keeps the menu bar icon runnin
   - **Start at login** — toggle the LaunchAgent.
   - **Quit**.
 
-When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active. Time limits follow the wall clock: a 1-hour limit ends an hour after it started even if the Mac slept mid-session (for example the lid was closed, which every mode except Entirely allows) — asleep time counts.
+When a **time limit** is set, left-clicking to start sleep prevention turns it off again after that duration (like `caffeinate2 -t`). Changing the selection while sleep prevention is running re-acquires every selected mode, keeping the old holds until the new ones are in place; if any of them fails, the whole change is rolled back and the previous holds stay. **Wait for apps** keeps prevention on until every instance of *all* the selected apps has exited (it stops once at least one selection has been seen running and then none remain); any selected app that isn't running yet is waited on to launch. With both set, whichever comes first wins. While a time limit is counting down, the minutes remaining (rounded up, e.g. `29m` or `1h 29m`) are shown next to the menu bar icon; the tooltip shows remaining time and/or app status while active. Time limits follow the wall clock: a 1-hour limit ends an hour after it started even if the Mac slept mid-session (for example the lid was closed, which every mode except Entirely allows) — asleep time counts.
 
 **Upgrade other apps' sleep prevention** keeps the Mac awake on behalf of tools that can't. Tools like Claude Code, Codex, and `caffeinate -i` use a low-level assertion that *still allows sleep when the lid closes* — so a long-running agent dies the moment you shut the lid. With this on, caffeinate2 watches for those assertions and temporarily upgrades to **Entirely** mode while one is active.
 
@@ -169,12 +169,12 @@ When a **time limit** is set, left-clicking to start sleep prevention turns it o
 
 **The upgrade dialog.** Left-clicking the icon while an upgrade is active asks what to do with it instead of just switching it off (with several apps upgraded at once, a pop-up in the dialog picks which one the ignore choices apply to):
 
-- **Hold For _30m_** (or **Hold Until I Stop It** with no time limit set) — take over with caffeinate2's own session, using the configured mode and time limit. Useful when you don't know how long the other app will keep asserting but you *do* know how long you need the Mac awake. The watcher stays out of the way until that app's assertion goes away.
+- **Hold For _30m_** (or **Hold Until I Stop It** with no time limit set) — take over with caffeinate2's own session, using the configured modes and time limit. Useful when you don't know how long the other app will keep asserting but you *do* know how long you need the Mac awake. The watcher stays out of the way until that app's assertion goes away.
 - **Ignore This Time** — stop upgrading the assertion it is holding right now. The ignore expires once that app has stopped asserting for about 5 seconds, so the next thing it starts is upgraded again.
 - **Never Upgrade This App** — add it to the ignore list under **Ignored apps**, where clicking it removes it again.
 - **Cancel** — leave the upgrade running.
 
-Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`. The selected mode lives there as `modes = ["system"]`; a file written by an older version, which stored a single `mode`, is read and migrated on the next save.
+Settings are stored in `~/Library/Application Support/caffeinate2/tray.toml`. The selected modes live there as `modes = ["user_active", "entirely"]`; a file written by an older version, which stored a single `mode`, is read and migrated on the next save.
 
 **Start at login** writes `~/Library/LaunchAgents/com.randomblock1.caffeinate2-tray.plist` and takes effect at the next login (the tray does not start a second instance immediately). Use `-d` for a one-off background launch right now; use the LaunchAgent to start the tray at every login. The menu toggle and these CLI flags use the same LaunchAgent:
 

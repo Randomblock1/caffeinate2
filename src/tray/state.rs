@@ -774,14 +774,35 @@ impl AppState {
         }
     }
 
-    /// Switch the selection to `mode` alone, restarting an active session on it.
+    /// Turn `mode` on or off in the selection. Modes stack: Entirely (so the
+    /// Mac survives the lid closing) alongside User active (so the screen stays
+    /// unlocked) is one session holding both, which is why each menu item is an
+    /// independent toggle rather than a radio button.
+    ///
+    /// Unchecking the last remaining mode is a no-op — see
+    /// [`TrayConfig::normalize_modes`] for why an empty selection is not a
+    /// state the menu can offer. The caller re-syncs the checkboxes, so the
+    /// item simply stays checked.
     ///
     /// # Errors
     ///
-    /// Returns an error if the config cannot be written, or if the switch is
-    /// blocked by an in-flight helper install (see [`AppState::set_modes`]).
-    pub fn set_mode(&mut self, mode: SleepMode) -> Result<(), TrayError> {
-        self.set_modes(vec![mode])
+    /// Returns an error if the config cannot be written, or if a helper install
+    /// or helper-installing enable is in flight (see [`AppState::set_modes`]).
+    pub fn toggle_mode(&mut self, mode: SleepMode) -> Result<(), TrayError> {
+        let mut modes = self.config.modes.clone();
+        if modes.contains(&mode) {
+            if modes.len() == 1 {
+                return Ok(());
+            }
+            modes.retain(|selected| *selected != mode);
+        } else {
+            modes.push(mode);
+            modes = SleepMode::all()
+                .into_iter()
+                .filter(|candidate| modes.contains(candidate))
+                .collect();
+        }
+        self.set_modes(modes)
     }
 
     /// Replace the selected modes with `modes` (already in [`SleepMode::all`]
@@ -808,20 +829,19 @@ impl AppState {
         {
             return Err(TrayError::HelperInstallPending);
         }
-        // The sibling hazard: a helper-installing Entirely *enable* in flight
-        // (its admin dialog may be up — even a cancelled one, since the dialog
-        // can't be revoked). Switching to another mode would persist the new
-        // selection while `start_session_with` drops the request on the
-        // occupied pending slot: config and menu would claim it with no session
-        // (or with the old holds still enforced), no rollback would ever arm,
-        // and manual enables would be silently swallowed until the dialog
-        // resolves. Reject up front; the switch works once it does. A switch
-        // *to* Entirely instead re-attaches to the pending enable.
-        if !modes.contains(&SleepMode::Entirely)
-            && self
-                .pending_enable
-                .as_ref()
-                .is_some_and(|pending| pending.installing_helper)
+        // The sibling hazard: a helper-installing *enable* in flight (its admin
+        // dialog may be up — even a cancelled one, since the dialog can't be
+        // revoked). Unless the new selection is exactly the one that enable is
+        // already acquiring — which re-attaches to it — `start_session_with`
+        // drops the request on the occupied pending slot: config and menu would
+        // claim the new selection with no session (or with the old holds still
+        // enforced), no rollback would ever arm, and manual enables would be
+        // silently swallowed until the dialog resolves. Reject up front; the
+        // change works once it does.
+        if self
+            .pending_enable
+            .as_ref()
+            .is_some_and(|pending| pending.installing_helper && pending.modes != modes)
         {
             return Err(TrayError::HelperInstallPending);
         }
@@ -1610,7 +1630,7 @@ mod tests {
             rx: erx,
         });
         assert!(matches!(
-            state.set_mode(SleepMode::Entirely),
+            state.toggle_mode(SleepMode::Entirely),
             Err(TrayError::HelperInstallPending)
         ));
         // The rejected change must not have advanced the persisted selection.
@@ -1824,7 +1844,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         state.pending_enable = Some(installing_pending_enable(rx));
         assert!(matches!(
-            state.set_mode(SleepMode::System),
+            state.toggle_mode(SleepMode::System),
             Err(TrayError::HelperInstallPending)
         ));
         assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
@@ -1833,7 +1853,7 @@ mod tests {
         // occupies the slot, so it blocks the switch just the same.
         state.pending_enable.as_mut().unwrap().cancelled = true;
         assert!(matches!(
-            state.set_mode(SleepMode::Display),
+            state.toggle_mode(SleepMode::Display),
             Err(TrayError::HelperInstallPending)
         ));
         assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
@@ -2162,6 +2182,87 @@ mod tests {
         assert!(state.upgrade_overridden);
     }
 
+    /// Modes stack: selecting a second one keeps the first, and the selection
+    /// stays in menu order however the items were clicked.
+    #[test]
+    fn toggling_modes_accumulates_in_menu_order() {
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::Entirely];
+            state.toggle_mode(SleepMode::UserActive).unwrap();
+            assert_eq!(
+                state.config.modes,
+                vec![SleepMode::UserActive, SleepMode::Entirely]
+            );
+            state.toggle_mode(SleepMode::Entirely).unwrap();
+            assert_eq!(state.config.modes, vec![SleepMode::UserActive]);
+        });
+    }
+
+    /// Unchecking the last mode would leave an "on" state that prevents
+    /// nothing, so it does nothing at all — the menu re-sync puts the
+    /// checkmark back.
+    #[test]
+    fn the_last_selected_mode_cannot_be_unchecked() {
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::System];
+            state.toggle_mode(SleepMode::System).unwrap();
+            assert_eq!(state.config.modes, vec![SleepMode::System]);
+        });
+    }
+
+    /// Changing the selection on a live session re-acquires the whole thing in
+    /// two phases, with the modes actually enforced as the rollback target.
+    #[test]
+    fn changing_modes_on_a_live_session_reacquires_the_whole_selection() {
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::System];
+            state.session = Some(ActiveTraySession {
+                holds: vec![ActiveSleepHold::Noop],
+                modes: vec![SleepMode::System],
+                until: None,
+                app_saw_running: false,
+                started_by_upgrade: false,
+                upgrade_apps: Vec::new(),
+            });
+
+            state.toggle_mode(SleepMode::Display).unwrap();
+
+            let pending = state.pending_enable.as_ref().expect("enable in flight");
+            assert_eq!(pending.modes, vec![SleepMode::Display, SleepMode::System]);
+            assert_eq!(pending.rollback_modes, Some(vec![SleepMode::System]));
+            // The old session keeps preventing sleep until the new holds commit.
+            assert!(state.is_on());
+        });
+    }
+
+    /// A session commits every hold its enable acquired, and records the whole
+    /// selection they enforce.
+    #[test]
+    fn a_multi_mode_enable_commits_every_hold() {
+        let mut state = bare_state();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec![ActiveSleepHold::Noop, ActiveSleepHold::Noop]))
+            .unwrap();
+        let mut pending = installing_pending_enable(rx);
+        pending.installing_helper = false;
+        pending.modes = vec![SleepMode::UserActive, SleepMode::Entirely];
+        state.pending_enable = Some(pending);
+
+        assert!(matches!(
+            state.poll_pending_enable(),
+            PendingEnableOutcome::Started
+        ));
+        let session = state.session.as_ref().expect("session committed");
+        assert_eq!(session.holds.len(), 2);
+        assert_eq!(
+            session.modes,
+            vec![SleepMode::UserActive, SleepMode::Entirely]
+        );
+    }
+
     #[test]
     fn upgrade_failure_latching_rules() {
         assert!(super::should_latch_upgrade_failure(
@@ -2192,6 +2293,31 @@ mod tests {
     /// test threads share the process environment, so concurrent set_var
     /// calls would race.
     static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` with HOME pointed at a throwaway directory, so a test whose
+    /// path persists the config never touches the user's real `tray.toml`.
+    /// `line` (pass `line!()`) keeps concurrent runs of different tests apart.
+    fn with_temp_home<T>(line: u32, body: impl FnOnce() -> T) -> T {
+        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_home = std::env::temp_dir().join(format!(
+            "caffeinate2_state_test_{}_{line}",
+            std::process::id()
+        ));
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
+        // mutates HOME.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        let result = body();
+        // SAFETY: see the set_var note above.
+        unsafe {
+            match prev_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+        result
+    }
 
     #[test]
     fn mode_switch_enable_failure_restores_previous_mode() {
