@@ -218,10 +218,18 @@ fn wait_for_pid_with(
     );
 
     let mut eventlist = [kev];
-    let timeout = timeout.map(timespec_from_duration);
-    let event_count = kq
-        .kevent(&[kev], &mut eventlist, timeout)
-        .map_err(WaitForPidError::Kevent)?;
+    let started = std::time::Instant::now();
+    let event_count = loop {
+        let remaining =
+            timeout.map(|limit| timespec_from_duration(limit.saturating_sub(started.elapsed())));
+        match kq.kevent(&[kev], &mut eventlist, remaining) {
+            // Interrupted, not finished: wait out the time that is left. A
+            // shutdown signal's thread exits the process meanwhile; anything
+            // else (a debugger attaching) must not end or extend the wait.
+            Err(nix::Error::EINTR) => {}
+            result => break result.map_err(WaitForPidError::Kevent)?,
+        }
+    };
 
     if event_count == 0 {
         return Ok(WaitForPidResult::TimedOut);
@@ -290,6 +298,31 @@ mod tests {
         // root test run attaches directly and times out the same way.
         let result = wait_for_pid(1, Some(Duration::from_millis(10)));
         assert!(matches!(result, Ok(WaitForPidResult::TimedOut)));
+    }
+
+    #[test]
+    fn interrupted_pid_wait_resumes_until_timeout() {
+        let signal = signal_hook::consts::SIGUSR2;
+        // Target this test's thread so the signal interrupts kevent rather
+        // than another concurrently running test. The handler does nothing.
+        let registration = unsafe { signal_hook::low_level::register(signal, || {}) }.unwrap();
+        let waiting_thread = unsafe { libc::pthread_self() } as usize;
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::pthread_kill(waiting_thread as libc::pthread_t, signal) }
+        });
+
+        let started = std::time::Instant::now();
+        let result = wait_for_pid(1, Some(Duration::from_millis(200)));
+        let sent = sender.join().unwrap();
+        signal_hook::low_level::unregister(registration);
+        assert_eq!(sent, 0);
+        // A restarted timeout would take 300ms.
+        assert!(started.elapsed() < Duration::from_millis(280));
+        assert!(
+            matches!(result, Ok(WaitForPidResult::TimedOut)),
+            "{result:?}"
+        );
     }
 
     #[test]
