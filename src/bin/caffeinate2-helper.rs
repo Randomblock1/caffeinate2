@@ -90,7 +90,7 @@ fn run() -> anyhow::Result<()> {
         // load-then-fetch_add was a TOCTOU). The matching release happens in
         // ConnectionGuard::drop on the worker thread.
         if active_connections
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 (active < MAX_CONCURRENT_CONNECTIONS).then_some(active + 1)
             })
             .is_err()
