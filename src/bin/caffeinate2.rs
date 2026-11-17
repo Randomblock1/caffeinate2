@@ -226,21 +226,42 @@ fn run_command_mode(
         // while still privileged (before `setuid`). Do all three in `pre_exec`
         // (the group list is resolved in the parent, since `getgrouplist` is not
         // async-signal-safe).
-        Some(groups) => unsafe {
-            child_command.pre_exec(move || {
+        Some(groups) => {
+            let drop_privileges = move || {
+                // Saturating keeps the count at or below `groups.len()`, so the
+                // kernel never reads past the buffer.
                 let ngroups = libc::c_int::try_from(groups.len()).unwrap_or(libc::c_int::MAX);
-                if libc::setgroups(ngroups, groups.as_ptr()) != 0 {
+                // SAFETY: contract of `setgroups(2)`: `gidset` must be valid
+                // for reads of `ngroups` `gid_t`s. `groups` is a `Vec<gid_t>`
+                // owned by this closure, and `ngroups <= groups.len()`.
+                if unsafe { libc::setgroups(ngroups, groups.as_ptr()) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::setgid(gid) != 0 {
+                // SAFETY: `setgid(2)` takes a plain integer and has no memory
+                // preconditions.
+                if unsafe { libc::setgid(gid) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::setuid(uid) != 0 {
+                // SAFETY: `setuid(2)` takes a plain integer and has no memory
+                // preconditions.
+                if unsafe { libc::setuid(uid) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
-            });
-        },
+            };
+            // SAFETY: contract of `CommandExt::pre_exec`: the closure runs in
+            // the forked child before `exec`, so it may only do what is
+            // async-signal-safe there. In particular it must not allocate or
+            // take locks another thread could have held at fork time.
+            // - `setgroups`, `setgid` and `setuid` are async-signal-safe
+            //   syscalls.
+            // - `c_int::try_from(..).unwrap_or(..)`, `Vec::len` and
+            //   `Vec::as_ptr` are pure computations that neither allocate nor
+            //   lock. The group list was built in the parent before the fork.
+            // - `io::Error::last_os_error` reads `errno` into the
+            //   allocation-free `Os` variant.
+            unsafe { child_command.pre_exec(drop_privileges) };
+        }
         None => {
             child_command.uid(uid).gid(gid);
         }

@@ -66,11 +66,19 @@ fn probe_path(path: &Path) -> InstanceProbe {
             ));
         }
     };
-    // SAFETY: zeroed is a valid flock value; the fd is open for the whole call.
+    // SAFETY: `mem::zeroed` requires all-zero bytes to be a valid
+    // `libc::flock`. Every field is an integer (`off_t`, `pid_t`, `c_short`),
+    // and the Reference makes all-zero valid for integers.
     let mut query: libc::flock = unsafe { std::mem::zeroed() };
     query.l_type = libc::F_WRLCK;
     query.l_whence = libc::SEEK_SET as i16;
     // l_start/l_len stay 0: the whole file, matching what flock() covers.
+    // SAFETY: contract of `fcntl(2)` with `F_GETLK`: the third argument must
+    // point to a `struct flock` valid for reads and writes. `&raw mut query`
+    // points to a live, aligned, fully initialized local that nothing else
+    // accesses during the call. The fd belongs to `file`, which stays open
+    // until the end of this function (a stale fd would only produce `EBADF`
+    // anyway).
     let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut query) };
     if ret == -1 {
         let error = std::io::Error::last_os_error();

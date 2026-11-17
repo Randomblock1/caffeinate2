@@ -305,10 +305,20 @@ mod tests {
         let signal = signal_hook::consts::SIGUSR2;
         // Target this test's thread so the signal interrupts kevent rather
         // than another concurrently running test. The handler does nothing.
+        // SAFETY: contract of `signal_hook::low_level::register`: the action
+        // runs inside a signal handler, so it must be async-signal-safe (no
+        // allocation, no locks, no panics). It must not be used for a forbidden
+        // signal. The empty closure does nothing, and SIGUSR2 is not forbidden.
         let registration = unsafe { signal_hook::low_level::register(signal, || {}) }.unwrap();
+        // SAFETY: `pthread_self` takes no arguments and always succeeds.
         let waiting_thread = unsafe { libc::pthread_self() } as usize;
         let sender = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: contract of `pthread_kill(3)`: the target must be a live
+            // thread. `waiting_thread` is this test's thread, which joins
+            // `sender` before returning, so it outlives this call. SIGUSR2 has
+            // a handler installed above (`registration` is only removed after
+            // the join), so delivery cannot terminate the process.
             unsafe { libc::pthread_kill(waiting_thread as libc::pthread_t, signal) }
         });
 

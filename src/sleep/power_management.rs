@@ -9,20 +9,31 @@ use objc2_io_kit::{
     kIOReturnNotFound,
 };
 use std::ffi::c_void;
+use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use std::{fmt, mem::MaybeUninit};
 
-// `IOPMSetSystemPowerSetting` is not exposed by objc2-io-kit, so it is declared
-// here by hand. It is a stable public IOKit C entry point (it is what
-// `pmset disablesleep` ultimately drives); the signature matches the SDK
-// header (`CFStringRef`, `CFBooleanRef`, returning `IOReturn`/`i32`). Toggling
-// it mutates a system-wide power setting and needs root, so it has no unit
+// `IOPMSetSystemPowerSetting` is what `pmset disablesleep` drives. It is
+// private IOKit SPI: the public SDK headers do not declare it, and
+// objc2-io-kit does not bind it, so it is declared here by hand. Toggling it
+// mutates a system-wide power setting and needs root, so it has no unit
 // coverage; `EntirelyCoordinator` owns its lifecycle in production.
+//
+// SAFETY: this declaration asserts the foreign signature. Apple's open-source
+// IOKitUser `pwr_mgt.subproj/IOPMLibPrivate.h` declares
+// `IOReturn IOPMSetSystemPowerSetting(CFStringRef key, CFTypeRef value)`.
+// - `&CFString` / `&CFBoolean` are non-null pointers to CF objects, the same
+//   ABI as `CFStringRef` / `CFTypeRef` (objc2-core-foundation passes CF
+//   objects to C exactly this way in its own bindings).
+// - `IOReturn` is `kern_return_t`, a C `int`, i.e. `i32` on Apple targets.
+// - The function follows the CF "Get"/"Set" convention: it retains anything
+//   it keeps, so borrowing the arguments for the call is enough.
+// Because the symbol is SPI, re-check this against the IOKitUser source when
+// raising the minimum macOS version.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOPMSetSystemPowerSetting(key: &CFString, value: &CFBoolean) -> i32;
@@ -76,14 +87,21 @@ pub fn create_assertion(
     let assertion_name = CFString::from_str("caffeinate2");
     let type_ = CFString::from_str(assertion_type.as_str());
     let level = kIOPMAssertionLevelOn;
-    let mut id = MaybeUninit::uninit();
+    let mut id: u32 = 0;
 
+    // SAFETY: contract of `IOPMAssertionCreateWithName` (objc2-io-kit
+    // `# Safety`): `assertion_type` and `assertion_name` might not allow
+    // `None`, and `assertion_id` must be a valid pointer.
+    // - Both names are `Some` of `CFString`s that live until the end of this
+    //   function, past the call.
+    // - `&raw mut id` points to a live, aligned, initialized local `u32`
+    //   (`IOPMAssertionID`), valid for writes for the whole call, and nothing
+    //   else aliases it.
     let status = unsafe {
-        IOPMAssertionCreateWithName(Some(&type_), level, Some(&assertion_name), id.as_mut_ptr())
+        IOPMAssertionCreateWithName(Some(&type_), level, Some(&assertion_name), &raw mut id)
     };
 
     if status == 0 {
-        let id = unsafe { id.assume_init() };
         if verbose {
             tracing::debug!("Successfully created power management assertion with ID: {id}");
         }
@@ -139,6 +157,12 @@ fn declare_user_activity_once(id: &mut u32, verbose: bool) -> Result<(), u32> {
     let assertion_name = CFString::from_str("caffeinate2");
     // Declaring activity is inherently "active now"; the only choice is the
     // activity type, and Local means a user is physically at this machine.
+    // SAFETY: contract of `IOPMAssertionDeclareUserActivity` (objc2-io-kit
+    // `# Safety`): `assertion_name` might not allow `None`, and
+    // `assertion_id` must be a valid pointer.
+    // - The name is `Some` of a `CFString` that outlives the call.
+    // - `id` is a `&mut u32`, so the derived pointer is non-null, aligned,
+    //   initialized, valid for reads and writes, and unaliased for the call.
     let status = unsafe {
         IOPMAssertionDeclareUserActivity(
             Some(&assertion_name),
@@ -235,8 +259,13 @@ pub fn declare_user_activity(verbose: bool) -> Result<UserActivityHold, u32> {
 /// unavailable (should never happen on a healthy system).
 pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32> {
     let sleep_disabled_bool = if sleep_disabled {
+        // SAFETY: reading an extern static. `kCFBooleanTrue` is an immutable
+        // CoreFoundation constant that objc2-core-foundation types as
+        // `Option<&'static CFBoolean>`. Nothing writes it, so the read cannot
+        // race.
         unsafe { kCFBooleanTrue }
     } else {
+        // SAFETY: as above, for the immutable constant `kCFBooleanFalse`.
         unsafe { kCFBooleanFalse }
     };
     let Some(sleep_disabled_bool) = sleep_disabled_bool else {
@@ -245,6 +274,10 @@ pub fn set_sleep_disabled(sleep_disabled: bool, verbose: bool) -> Result<(), u32
 
     let key = CFString::from_str("SleepDisabled");
 
+    // SAFETY: the declaration above states the foreign signature. Both
+    // arguments are references to live CF objects (`key` is a local
+    // `CFString`; the boolean is a `'static` CF constant) that outlive the
+    // call, which is all the C function requires of them.
     let result = unsafe { IOPMSetSystemPowerSetting(&key, sleep_disabled_bool) };
 
     let code = result.cast_unsigned();
@@ -302,6 +335,10 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
     let self_pid = std::process::id().cast_signed();
 
     let mut raw: *const CFDictionary = std::ptr::null();
+    // SAFETY: contract of `IOPMCopyAssertionsByProcess` (objc2-io-kit
+    // `# Safety`): `assertions_by_pid` must be a valid pointer. `&raw mut raw`
+    // points to a live, aligned, initialized local, valid for writes for the
+    // whole call.
     let status = unsafe { IOPMCopyAssertionsByProcess(&raw mut raw) };
     if status != 0 {
         return Err(status.cast_unsigned());
@@ -310,8 +347,16 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
         // No process holds any assertion.
         return Ok(Vec::new());
     };
-    // IOPMCopyAssertionsByProcess returns a +1 reference; CFRetained releases
-    // it on drop, as the API requires.
+    // SAFETY: contract of `CFRetained::from_raw`: `raw` must point to a valid
+    // object of type `CFDictionary` with a +1 retain count that we own.
+    // - `raw` is non-null (checked above) and was written by a successful
+    //   `IOPMCopyAssertionsByProcess`, whose IOKit docs say the result is a
+    //   CFDictionary the caller "must CFRelease() when done". That is a +1
+    //   reference transferred to us.
+    // - `CFDictionary` here is the untyped (`Opaque`-generic) form, which
+    //   matches any CFDictionary.
+    // Postcondition: `by_pid` owns that reference and releases it exactly once
+    // on drop. `raw` is not used again.
     let by_pid = unsafe { CFRetained::from_raw(raw) };
 
     let true_type_key = CFString::from_str(ASSERTION_TRUE_TYPE_KEY);
@@ -323,13 +368,29 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
     let count = by_pid.count().max(0).cast_unsigned();
     let mut keys: Vec<*const c_void> = vec![std::ptr::null(); count];
     let mut values: Vec<*const c_void> = vec![std::ptr::null(); count];
+    // SAFETY: contract of `CFDictionaryGetKeysAndValues`: the dictionary
+    // generics are of the correct type (the untyped form always is), and
+    // `keys`/`values` must each be valid for writes of `count()` pointers.
+    // - Both buffers hold `count` elements, where `count` is `by_pid.count()`
+    //   (never negative for a CF collection, so `max(0)` is a no-op).
+    // - The count cannot have changed since it was read: `by_pid` is the
+    //   immutable `CFDictionaryRef` that `IOPMCopyAssertionsByProcess` just
+    //   created and handed to us with a +1 reference, and no other code has
+    //   been given a pointer to it, so nothing can mutate it.
+    // Postcondition: `keys[i]`/`values[i]` are borrowed (+0) references,
+    // valid while `by_pid` is alive and unmutated.
     unsafe {
         by_pid.keys_and_values(keys.as_mut_ptr(), values.as_mut_ptr());
     }
 
     let mut found = Vec::new();
     for (key_ptr, value_ptr) in keys.into_iter().zip(values) {
-        let (Some(key), Some(value)) = (cf_ref(&by_pid, key_ptr), cf_ref(&by_pid, value_ptr))
+        // SAFETY: `cf_ref`'s contract: each pointer is null or a live CF
+        // object kept alive by `by_pid`. Both came from `keys_and_values` on
+        // `by_pid` (postcondition above), and `by_pid` is borrowed, so it
+        // stays alive and unmutated for the returned references' lifetime.
+        let (Some(key), Some(value)) =
+            (unsafe { (cf_ref(&*by_pid, key_ptr), cf_ref(&*by_pid, value_ptr)) })
         else {
             continue;
         };
@@ -343,7 +404,15 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
             continue;
         };
         for i in 0..list.count() {
-            let Some(item) = cf_ref(list, unsafe { list.value_at_index(i) }) else {
+            // SAFETY: two operations.
+            // 1. `CFArrayGetValueAtIndex`: the generic must be of the correct
+            //    type (the untyped form always is), and `i` must be in
+            //    `0..count`, which the loop range guarantees. `list` is borrowed
+            //    from the immutable `by_pid`, so its count cannot change.
+            // 2. `cf_ref`: the returned pointer is null or a +0 reference to an
+            //    element `list` keeps alive. `list` is borrowed and unmutated
+            //    for the result's lifetime.
+            let Some(item) = (unsafe { cf_ref(list, list.value_at_index(i)) }) else {
                 continue;
             };
             let Some(dict) = item.downcast_ref::<CFDictionary>() else {
@@ -374,18 +443,39 @@ pub fn external_assertions(types: &[AssertionType]) -> Result<Vec<ExternalAssert
 }
 
 /// Borrow a CoreFoundation object from a raw pointer returned by a CF getter
-/// (null → `None`). CF getters return non-owning references, so the borrow is
-/// only valid while the owning collection is alive. `owner` carries that
-/// collection's lifetime into the returned reference so the borrow checker
-/// enforces the invariant instead of leaving it to convention. `owner` is the
-/// only reference input, so lifetime elision ties the returned borrow to it.
-fn cf_ref<T: ?Sized>(owner: &T, ptr: *const c_void) -> Option<&CFType> {
+/// (null → `None`). `owner` is the only reference input, so lifetime elision
+/// ties the returned borrow to it.
+///
+/// # Safety
+///
+/// The caller must ensure that `ptr` is null, or points to a live CF object
+/// that `owner` keeps alive (a +0 reference from a CF getter on `owner`). The
+/// caller must also ensure `owner` is not mutated while the returned
+/// reference exists, since mutating a CF collection can release the object.
+///
+/// If these hold, the returned reference is valid for its whole lifetime.
+unsafe fn cf_ref<T: ?Sized>(owner: &T, ptr: *const c_void) -> Option<&CFType> {
     let _ = owner;
+    // SAFETY: contract of `NonNull::as_ref`: the pointer must be aligned,
+    // dereferenceable, point to a valid `CFType`, and the pointee must not be
+    // mutated for the returned lifetime except through `UnsafeCell`.
+    // - Non-null: checked by `NonNull::new`.
+    // - Valid, live, aligned CF object for the borrow of `owner`: this
+    //   function's `# Safety` precondition.
+    // - `CFType` is objc2-core-foundation's opaque base type for every CF
+    //   object, so any CF object is a valid `CFType`. Its contents sit behind
+    //   `UnsafeCell`, so CF's internal mutation (such as retain counts) is
+    //   allowed while the shared borrow is live.
     NonNull::new(ptr.cast_mut()).map(|p| unsafe { p.cast::<CFType>().as_ref() })
 }
 
 fn cf_number_i32(number: &CFNumber) -> Option<i32> {
     let mut value: i32 = 0;
+    // SAFETY: contract of `CFNumberGetValue` (objc2-core-foundation
+    // `# Safety`): `value_ptr` must be a valid pointer, and, per the CF docs,
+    // point to storage of the size of `the_type`. `SInt32Type` writes exactly
+    // 4 bytes, and the pointer comes from a live, aligned, unaliased local
+    // `i32`, valid for writes for the call.
     let ok = unsafe {
         number.value(
             CFNumberType::SInt32Type,
@@ -395,16 +485,31 @@ fn cf_number_i32(number: &CFNumber) -> Option<i32> {
     ok.then_some(value)
 }
 
+/// Borrow the value stored under `key` in `dict`, or `None` if it is absent.
+fn dict_value<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> {
+    // SAFETY: two operations.
+    // 1. `CFDictionaryGetValue` (objc2-core-foundation `# Safety`): the
+    //    generics are of the correct type (the untyped form always is), and
+    //    `key` must be a valid pointer. It comes from `&CFString`, a live CF
+    //    object for the call. A live CF object is an acceptable key under
+    //    either kind of key callbacks a CF dictionary can have: CF-type
+    //    callbacks (hash/equal on CF objects) or none (pointer identity).
+    // 2. `cf_ref`: the result is null or a +0 reference to a value `dict`
+    //    keeps alive. `dict` is a shared borrow of an immutable dictionary
+    //    for `'a`, so it is not mutated while the result exists.
+    unsafe { cf_ref(dict, dict.value(std::ptr::from_ref(key).cast())) }
+}
+
 fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
-    let value = cf_ref(dict, unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
-    value
+    dict_value(dict, key)?
         .downcast_ref::<CFString>()
         .map(std::string::ToString::to_string)
 }
 
 fn dict_i32(dict: &CFDictionary, key: &CFString) -> Option<i32> {
-    let value = cf_ref(dict, unsafe { dict.value(std::ptr::from_ref(key).cast()) })?;
-    value.downcast_ref::<CFNumber>().and_then(cf_number_i32)
+    dict_value(dict, key)?
+        .downcast_ref::<CFNumber>()
+        .and_then(cf_number_i32)
 }
 
 #[cfg(test)]

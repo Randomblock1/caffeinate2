@@ -31,8 +31,8 @@ use objc2_app_kit::{
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSPoint, NSRect, NSRunLoop, NSSize, NSString, NSTimer,
 };
-use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// What the user chose. Every variant except [`UpgradeChoice::KeepUpgrading`]
@@ -174,13 +174,15 @@ fn run_modal(mtm: MainThreadMarker, alert: &NSAlert) -> NSModalResponse {
 ///   arrives while the dialog is open still reaches the run loop's teardown
 ///   (which releases the sleep holds) instead of waiting on an answer.
 fn modal_ticker() -> Retained<NSTimer> {
-    let raised = Cell::new(false);
+    // Atomic rather than `Cell` so the block is `Send + Sync`, which the
+    // timer API requires (see the SAFETY note below).
+    let raised = AtomicBool::new(false);
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
         let app = NSApplication::sharedApplication(mtm);
-        if !raised.replace(true)
+        if !raised.swap(true, Ordering::Relaxed)
             && let Some(window) = app.modalWindow()
         {
             window.orderFrontRegardless();
@@ -192,13 +194,24 @@ fn modal_ticker() -> Retained<NSTimer> {
             crate::tray::macos_activation::wake_event_loop();
         }
     });
-    // SAFETY: the block captures only a `Cell<bool>` and re-derives everything
-    // else from `MainThreadMarker::new()`, so it is sound to invoke from any
-    // thread — and the timer is installed on the main thread's run loop, which
-    // is the only place it ever runs.
+    // SAFETY: contract of `timerWithTimeInterval:repeats:block:`
+    // (objc2-foundation `# Safety`): the block must be sendable, i.e. sound to
+    // invoke, and to drop, from any thread, including concurrently.
+    // - The block's only state is an `AtomicBool`, so it is `Send + Sync`.
+    // - It touches AppKit only after `MainThreadMarker::new()` succeeds, so
+    //   off the main thread it returns without doing anything.
+    // - `app::shutdown_requested` and `wake_event_loop` are safe functions
+    //   with no thread requirement.
     let timer = unsafe {
         NSTimer::timerWithTimeInterval_repeats_block(MODAL_TICK.as_secs_f64(), true, &block)
     };
+    // SAFETY: two operations.
+    // 1. Reading the extern static `NSModalPanelRunLoopMode`: an immutable
+    //    AppKit constant (`&'static NSRunLoopMode`) that nothing writes.
+    // 2. `addTimer:forMode:` has no documented preconditions beyond its
+    //    argument types. Its unsafety is the thread requirement of the
+    //    timer's block, which the proof above discharges for any thread. The
+    //    run loop retains the timer until the caller invalidates it.
     unsafe { NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode) };
     timer
 }

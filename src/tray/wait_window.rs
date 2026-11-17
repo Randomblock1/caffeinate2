@@ -100,6 +100,28 @@ struct Ivars {
     mtm: MainThreadMarker,
 }
 
+// SAFETY: `define_class!`'s unsafe attributes and impls each assert a fact
+// objc2 cannot check:
+// - `super(NSObject)`: `NSObject` is a valid superclass with no extra
+//   subclassing requirements, and `WaitController` adds no `Drop` that
+//   relies on AppKit state.
+// - `unsafe impl` of `NSObjectProtocol`, `NSControlTextEditingDelegate`,
+//   `NSTableViewDataSource`, `NSTableViewDelegate` and `NSWindowDelegate`:
+//   `NSObjectProtocol`'s required methods are inherited from `NSObject`, and
+//   the other four protocols declare only `@optional` methods (SDK headers),
+//   so nothing required is missing. Each
+//   implemented method's Rust signature matches the protocol's ObjC one:
+//   `numberOfRowsInTableView:` → `NSInteger`,
+//   `tableView:viewForTableColumn:row:` → nullable `NSView *` (returned +0
+//   per `method_id`), and `windowWillClose:` → `void` with a non-null
+//   `NSNotification *`.
+// - Each `method(...)` action selector takes one object argument (the
+//   sender) and returns `void`, matching AppKit's action signature. The
+//   sender is typed `Option<&T>`, which encodes as `id` and makes no
+//   non-null assumption. These selectors are sent only by the controls built
+//   in this module, each targeted at this controller, with the stated
+//   sender class: no menu item or AppKit responder sends these app-specific
+//   names.
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -115,20 +137,23 @@ define_class!(
 
     impl WaitController {
         #[unsafe(method(searchChanged:))]
-        fn search_changed(&self, sender: &NSSearchField) {
+        fn search_changed(&self, sender: Option<&NSSearchField>) {
+            let Some(sender) = sender else { return };
             *self.ivars().query.borrow_mut() = sender.stringValue().to_string();
             self.ivars().search_pending.set(true);
             *self.ivars().last_search_change.borrow_mut() = Some(Instant::now());
         }
 
         #[unsafe(method(showAllToggled:))]
-        fn show_all_toggled(&self, sender: &NSButton) {
+        fn show_all_toggled(&self, sender: Option<&NSButton>) {
+            let Some(sender) = sender else { return };
             self.ivars().apps_only.set(sender.state() != NSControlStateValueOn);
             self.rebuild();
         }
 
         #[unsafe(method(showSystemToggled:))]
-        fn show_system_toggled(&self, sender: &NSButton) {
+        fn show_system_toggled(&self, sender: Option<&NSButton>) {
+            let Some(sender) = sender else { return };
             self.ivars()
                 .show_system
                 .set(sender.state() == NSControlStateValueOn);
@@ -136,7 +161,8 @@ define_class!(
         }
 
         #[unsafe(method(rowCheckboxToggled:))]
-        fn row_checkbox_toggled(&self, sender: &NSButton) {
+        fn row_checkbox_toggled(&self, sender: Option<&NSButton>) {
+            let Some(sender) = sender else { return };
             let all_index = sender.tag().cast_unsigned();
             let entry = {
                 let all = self.ivars().all.borrow();
@@ -153,7 +179,7 @@ define_class!(
         }
 
         #[unsafe(method(applyClicked:))]
-        fn apply_clicked(&self, _sender: &NSButton) {
+        fn apply_clicked(&self, _sender: Option<&NSButton>) {
             if !self.ivars().decided.replace(true) {
                 let mut targets: Vec<WatchTarget> =
                     self.ivars().checked.borrow().values().cloned().collect();
@@ -167,7 +193,7 @@ define_class!(
         }
 
         #[unsafe(method(cancelClicked:))]
-        fn cancel_clicked(&self, _sender: &NSButton) {
+        fn cancel_clicked(&self, _sender: Option<&NSButton>) {
             if !self.ivars().decided.replace(true) {
                 let _ = self.ivars().tx.send(WaitWindowMsg::Cancel);
             }
@@ -175,12 +201,12 @@ define_class!(
         }
 
         #[unsafe(method(refreshClicked:))]
-        fn refresh_clicked(&self, _sender: &NSButton) {
+        fn refresh_clicked(&self, _sender: Option<&NSButton>) {
             self.refresh();
         }
 
         #[unsafe(method(chooseAppClicked:))]
-        fn choose_app_clicked(&self, _sender: &NSButton) {
+        fn choose_app_clicked(&self, _sender: Option<&NSButton>) {
             self.choose_app();
         }
     }
@@ -250,6 +276,12 @@ impl WaitController {
             window: RefCell::new(None),
             mtm,
         });
+        // SAFETY: `msg_send!` requires the receiver to respond to the
+        // selector with the stated types. `this` is a freshly allocated
+        // `WaitController` with its ivars set, and `NSObject`'s
+        // `- (instancetype)init` takes no arguments and returns the
+        // initialized object (+1, `init` family), which objc2 maps to
+        // `Retained<Self>`.
         unsafe { msg_send![super(this), init] }
     }
 
@@ -394,6 +426,8 @@ impl WaitController {
         panel.setTreatsFilePackagesAsDirectories(false);
         panel.setTitle(Some(&NSString::from_str("Choose application")));
         panel.setPrompt(Some(&NSString::from_str("Choose")));
+        // SAFETY: reading the extern static `UTTypeApplicationBundle`, an
+        // immutable `&'static UTType` constant that nothing writes.
         let app_types = unsafe { NSArray::arrayWithObject(UTTypeApplicationBundle) };
         panel.setAllowedContentTypes(&app_types);
 
@@ -510,6 +544,13 @@ impl WaitController {
             container.addSubview(&image_view);
         }
         let target: &AnyObject = self;
+        // SAFETY: contract of `checkboxWithTitle:target:action:`
+        // (objc2-app-kit `# Safety`): `target` should be of the correct type
+        // and `action` must be a valid selector. `target` is this
+        // `WaitController`, which implements `rowCheckboxToggled:` (see
+        // `define_class!` above), and `sel!` yields a valid selector. AppKit
+        // holds the target weakly (`NSControl.target` is zeroing-weak in the
+        // SDK), so it cannot dangle if the controller is freed first.
         let checkbox = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 &NSString::from_str(&title),
@@ -702,6 +743,16 @@ fn not_running_row(target: WatchTarget, icon_path: String) -> ProgramRow {
 fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &AnyObject) -> f64 {
     let search = NSSearchField::new(mtm);
     search.setFrame(rect(MARGIN, WIN_H - MARGIN - 24.0, INNER_W, 24.0));
+    // SAFETY: `setTarget`/`setAction` (and the `*WithTitle_target_action`
+    // constructors below, which cite this proof) require `target`
+    // to be of the correct type and `action` to be a valid selector
+    // (objc2-app-kit `# Safety`).
+    // - `target` is the `WaitController` (this function's only caller passes
+    //   it), which implements every selector named below (see
+    //   `define_class!`).
+    // - `sel!` yields valid selectors.
+    // - AppKit holds the target zeroing-weak (`NSControl.target` in the SDK
+    //   headers), so it cannot dangle.
     unsafe {
         search.setTarget(Some(target));
         search.setAction(Some(sel!(searchChanged:)));
@@ -711,6 +762,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     content.addSubview(&search);
 
     let toggles_y = WIN_H - MARGIN - 24.0 - 8.0 - 22.0;
+    // SAFETY: as for the search field above: `target` implements
+    // `showAllToggled:`, and `sel!` yields a valid selector.
     let show_all = unsafe {
         NSButton::checkboxWithTitle_target_action(
             &NSString::from_str("Show all programs"),
@@ -721,6 +774,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     };
     show_all.setFrame(rect(MARGIN, toggles_y, 200.0, 22.0));
     content.addSubview(&show_all);
+    // SAFETY: as for the search field above: `target` implements
+    // `showSystemToggled:`, and `sel!` yields a valid selector.
     let show_system = unsafe {
         NSButton::checkboxWithTitle_target_action(
             &NSString::from_str("Show system apps"),
@@ -732,6 +787,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     show_system.setFrame(rect(MARGIN + 210.0, toggles_y, 200.0, 22.0));
     content.addSubview(&show_system);
 
+    // SAFETY: as for the search field above: `target` implements
+    // `applyClicked:`, and `sel!` yields a valid selector.
     let apply = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str("Apply"),
@@ -745,6 +802,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     // Esc → Cancel below.
     apply.setKeyEquivalent(&NSString::from_str("\r"));
     content.addSubview(&apply);
+    // SAFETY: as for the search field above: `target` implements
+    // `cancelClicked:`, and `sel!` yields a valid selector.
     let cancel = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str("Cancel"),
@@ -757,6 +816,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     // Esc triggers Cancel: the Escape character is the button's key equivalent.
     cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
     content.addSubview(&cancel);
+    // SAFETY: as for the search field above: `target` implements
+    // `refreshClicked:`, and `sel!` yields a valid selector.
     let refresh = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str("Refresh"),
@@ -767,6 +828,8 @@ fn install_wait_window_header(mtm: MainThreadMarker, content: &NSView, target: &
     };
     refresh.setFrame(rect(MARGIN, MARGIN, 90.0, 30.0));
     content.addSubview(&refresh);
+    // SAFETY: as for the search field above: `target` implements
+    // `chooseAppClicked:`, and `sel!` yields a valid selector.
     let choose_app = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str("Choose app…"),
@@ -806,6 +869,10 @@ fn install_wait_window_table(
     table.addTableColumn(&column);
     table.setHeaderView(None);
     table.setRowHeight(ROW_HEIGHT);
+    // SAFETY: `setDataSource`/`setDelegate` are weak properties (objc2-app-kit
+    // docs) with no other documented preconditions. `controller` conforms to
+    // both protocols (see `define_class!`), and zeroing-weak storage means a
+    // freed controller reads back as nil rather than dangling.
     unsafe {
         table.setDataSource(Some(ProtocolObject::from_ref(controller)));
         table.setDelegate(Some(ProtocolObject::from_ref(controller)));
@@ -847,6 +914,13 @@ pub fn open(
     let target: &AnyObject = &controller;
 
     let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+    // SAFETY: an `NSWindow` (not an `NSPanel`) starts with
+    // `releasedWhenClosed = YES`, so `close` would send it an extra
+    // `release`. That would over-release an object `Retained` also owns,
+    // which is why objc2 marks this initializer unsafe. The next statement
+    // sets it to `NO` before anything can close the window. Nothing between
+    // the two calls can close the window: no user event is processed and
+    // nothing else holds the window yet.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -857,6 +931,8 @@ pub fn open(
         )
     };
     window.setTitle(&NSString::from_str("Wait for apps"));
+    // SAFETY: `setReleasedWhenClosed` is unsafe only when enabling it (see
+    // above). Disabling it leaves ownership entirely to `Retained`.
     unsafe { window.setReleasedWhenClosed(false) };
     // Follow the user to the active Space; without this the picker opens on
     // a different Space — invisible — when the frontmost app is full-screen.

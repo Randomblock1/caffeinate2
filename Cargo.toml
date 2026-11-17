@@ -95,6 +95,10 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "block2",
 ] }
 
+[lints.clippy]
+# Every unsafe block carries a `// SAFETY:` proof of its contract.
+undocumented_unsafe_blocks = "warn"
+
 [features]
 default = []
 helper-bin = []

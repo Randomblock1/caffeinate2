@@ -69,14 +69,20 @@ pub fn spawn_detached_or_exit() -> ! {
 
     // Start a new session (after fork, before exec) so the child has no
     // controlling terminal and outlives the terminal without seeing SIGHUP.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let new_session = || {
+        // SAFETY: `setsid(2)` takes no arguments and has no memory
+        // preconditions.
+        if unsafe { libc::setsid() } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    // SAFETY: contract of `CommandExt::pre_exec`: the closure runs in the
+    // forked child before `exec`, so it may only do what is async-signal-safe
+    // there (no allocation, no locks). `setsid` is an async-signal-safe
+    // syscall. `io::Error::last_os_error` only reads `errno` into the
+    // allocation-free `Os` variant.
+    unsafe { command.pre_exec(new_session) };
 
     match command.spawn() {
         Ok(mut child) => {

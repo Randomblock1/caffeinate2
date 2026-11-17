@@ -168,6 +168,13 @@ impl Drop for WorkspaceObserverGuard {
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
         // msg_send: `removeObserver:` takes a plain object, and the block
         // observer is typed as a protocol object rather than AnyObject.
+        // SAFETY: `msg_send!` requires the receiver to respond to the
+        // selector with the given argument and return types.
+        // `NSNotificationCenter` declares `- (void)removeObserver:(id)observer`
+        // (Foundation docs). Each argument is a live object reference
+        // (encoded as `id`), and `()` matches `void`. Each observer is one
+        // that `addObserverForName:object:queue:usingBlock:` returned, which
+        // is exactly what its docs say to pass here.
         unsafe {
             let _: () = objc2::msg_send![&center, removeObserver: &*self.launch];
             let _: () = objc2::msg_send![&center, removeObserver: &*self.terminate];
@@ -212,6 +219,20 @@ pub fn install_workspace_observers() -> (
     let center = workspace.notificationCenter();
     let main_queue = NSOperationQueue::mainQueue();
 
+    // SAFETY: contract of
+    // `addObserverForName:object:queue:usingBlock:` (objc2-foundation
+    // `# Safety`): `obj` should be of the correct type, `queue` may have
+    // threading requirements, and the block must be sendable.
+    // - The name is an AppKit `&'static NSNotificationName` extern static.
+    //   Reading it is a read of an immutable constant.
+    // - `obj` is `None` (observe every sender).
+    // - `queue` is the main operation queue, so the block runs on the main
+    //   thread, and that queue has no other requirements.
+    // - Each block's state is an `Arc<AtomicBool>` (`Send + Sync`), and
+    //   `wake_event_loop` is a safe function with no thread requirement. So
+    //   the block is sound to invoke or drop from any thread.
+    // Postcondition: the center retains the copied block and the returned
+    // observer until `removeObserver:` (the guard's `Drop`).
     let launch_observer = unsafe {
         center.addObserverForName_object_queue_usingBlock(
             Some(NSWorkspaceDidLaunchApplicationNotification),
@@ -220,6 +241,8 @@ pub fn install_workspace_observers() -> (
             &launch_block,
         )
     };
+    // SAFETY: same proof as `launch_observer` above, for the terminate
+    // notification name and block.
     let terminate_observer = unsafe {
         center.addObserverForName_object_queue_usingBlock(
             Some(NSWorkspaceDidTerminateApplicationNotification),
@@ -256,6 +279,8 @@ pub fn pump_event_loop(timeout: Option<std::time::Duration>) {
         NSDate::now().dateByAddingTimeInterval(timeout.as_secs_f64())
     });
     let drain = NSDate::distantPast();
+    // SAFETY: reading the extern static `NSDefaultRunLoopMode`, an immutable
+    // Foundation constant (`&'static NSRunLoopMode`) that nothing writes.
     let mode = unsafe { NSDefaultRunLoopMode };
 
     let mut wait_until = &*deadline;

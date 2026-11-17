@@ -19,7 +19,10 @@ fn monotonic_now() -> Duration {
     // A read against a valid timespec pointer does not fail; treat any
     // unexpected error as zero elapsed so a bad reading never fabricates a
     // sleep event.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+    // SAFETY: contract of `clock_gettime(2)`: `tp` must be valid for writes
+    // of one `timespec`. `&raw mut ts` points to a live, aligned, initialized
+    // local that nothing else accesses during the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) } != 0 {
         return Duration::ZERO;
     }
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)

@@ -64,10 +64,22 @@ fn lookup_with_growing_buffer(
 
 #[must_use]
 pub fn user_for_uid(uid: libc::uid_t) -> Option<User> {
+    // SAFETY: `mem::zeroed` requires all-zero bytes to be a valid
+    // `libc::passwd`. Every field is an integer (`uid_t`, `gid_t`, `time_t`)
+    // or a raw pointer, and the Reference makes all-zero valid for both
+    // (a null raw pointer is a valid value).
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     let found = lookup_with_growing_buffer(&mut buf, |buf| {
+        // SAFETY: contract of POSIX `getpwuid_r`: `pwd` and `result` must be
+        // valid for writes, and `buffer` must be valid for writes of
+        // `bufsize` bytes.
+        // - `&raw mut pwd` / `&raw mut result` point to live, aligned locals
+        //   that nothing else accesses during the call.
+        // - `buf.as_mut_ptr()` with `buf.len()` describes exactly the
+        //   `Vec`'s initialized storage, borrowed mutably for the call.
+        // Postcondition on success: `pwd`'s string fields point into `buf`.
         let ret = unsafe {
             libc::getpwuid_r(
                 uid,
@@ -82,29 +94,48 @@ pub fn user_for_uid(uid: libc::uid_t) -> Option<User> {
     if !found {
         return None;
     }
-    let name = unsafe { CStr::from_ptr(pwd.pw_name) }
-        .to_str()
-        .ok()?
-        .to_string();
+    // SAFETY: covers all three calls. `passwd_string_field`'s contract is that each
+    // pointer is null or a NUL-terminated string live for the call.
+    // `lookup_with_growing_buffer` returned `found`, so the final
+    // `getpwuid_r` call succeeded with a non-null `result`. Its postcondition:
+    // the `pw_*` string fields point to NUL-terminated strings inside `buf`.
+    // `buf` is neither resized nor dropped after that call (the helper
+    // returns right after it), and lives until the end of this function.
+    let (name, home, shell) = unsafe {
+        (
+            passwd_string_field(pwd.pw_name),
+            passwd_string_field(pwd.pw_dir),
+            passwd_string_field(pwd.pw_shell),
+        )
+    };
+    // A null, empty, or non-UTF-8 name all read as "" and fail the lookup.
     if name.is_empty() {
         return None;
     }
     Some(User {
         name,
         primary_gid: pwd.pw_gid,
-        home: passwd_string_field(pwd.pw_dir),
-        shell: passwd_string_field(pwd.pw_shell),
+        home,
+        shell,
     })
 }
 
-/// Copy an optional C-string field out of a passwd record `getpwuid_r` filled
-/// in (`ptr` must point into that still-live record/buffer). Null or non-UTF-8
-/// reads as empty — unlike `pw_name`, these fields are informational, so a
-/// missing value shouldn't fail the whole lookup.
-fn passwd_string_field(ptr: *const libc::c_char) -> String {
+/// Copy an optional C-string field out of a passwd record. Null or non-UTF-8
+/// reads as empty.
+///
+/// # Safety
+///
+/// The caller must ensure that `ptr` is null, or points to a NUL-terminated
+/// string that stays live and unmodified for the duration of the call.
+unsafe fn passwd_string_field(ptr: *const libc::c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
+    // SAFETY: contract of `CStr::from_ptr`: `ptr` must be non-null, point to
+    // a NUL-terminated string within one allocation, and the memory must not
+    // be mutated for the returned borrow. Non-null is checked above. The
+    // rest is this function's `# Safety` precondition. The borrow ends
+    // before return, since the string is copied into an owned `String`.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
         .unwrap_or_default()
@@ -113,6 +144,9 @@ fn passwd_string_field(ptr: *const libc::c_char) -> String {
 
 fn gid_for_group(name: &str) -> Option<libc::gid_t> {
     let cname = CString::new(name).ok()?;
+    // SAFETY: `mem::zeroed` requires all-zero bytes to be a valid
+    // `libc::group`. Its fields are a `gid_t` and raw pointers, for which
+    // all-zero is valid.
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
     // A group record carries every member name in `gr_mem`, so `admin` on a
     // directory-bound deployment realistically overflows 4 KiB — exactly the
@@ -120,6 +154,16 @@ fn gid_for_group(name: &str) -> Option<libc::gid_t> {
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::group = std::ptr::null_mut();
     let found = lookup_with_growing_buffer(&mut buf, |buf| {
+        // SAFETY: contract of POSIX `getgrnam_r`: `name` must be a
+        // NUL-terminated string, `grp` and `result` valid for writes, and
+        // `buffer` valid for writes of `bufsize` bytes.
+        // - `cname` is a live `CString`, so it is NUL-terminated.
+        // - `&raw mut grp` / `&raw mut result` point to live, aligned locals
+        //   that nothing else accesses during the call.
+        // - `buf.as_mut_ptr()` with `buf.len()` describes exactly the
+        //   `Vec`'s storage, borrowed mutably for the call.
+        // Only the integer `gr_gid` is read afterwards, so no pointer into
+        // `buf` outlives it.
         let ret = unsafe {
             libc::getgrnam_r(
                 cname.as_ptr(),
@@ -155,6 +199,14 @@ pub fn group_ids_for_user(name: &str, primary_gid: libc::gid_t) -> Option<Vec<li
     loop {
         let mut groups = vec![0_i32; capacity.cast_unsigned() as usize];
         let mut count = capacity;
+        // SAFETY: contract of `getgrouplist(3)`: `name` must be a
+        // NUL-terminated string, and `groups` must be valid for writes of
+        // `*ngroups` entries.
+        // - `cname` is a live `CString`, so it is NUL-terminated.
+        // - `groups` has exactly `capacity` `c_int` entries (`capacity` is in
+        //   `1..=MAX_GROUP_CAPACITY`, so the `usize` conversion is exact), and
+        //   `count == capacity` on entry.
+        // - `&raw mut count` points to a live, aligned local.
         let ret = unsafe {
             libc::getgrouplist(
                 cname.as_ptr(),
