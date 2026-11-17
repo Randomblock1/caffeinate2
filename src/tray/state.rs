@@ -48,7 +48,9 @@ fn sleep_aware_now() -> Duration {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    // SAFETY: contract of `clock_gettime(2)`: `tp` must be valid for writes
+    // of one `timespec`. `&raw mut ts` points to a live, aligned, initialized
+    // local that nothing else accesses during the call.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
     // Cannot fail for a valid clock id and pointer; a zero fallback would
     // instantly expire every deadline, so treat failure as the bug it is.
@@ -1595,55 +1597,37 @@ mod tests {
     /// and menu never claim Entirely while the old hold keeps running.
     #[test]
     fn mode_switch_to_entirely_is_rejected_while_install_is_pending() {
-        // Isolate HOME: on the pass path set_mode rejects before persisting,
+        // Isolate the config: on the pass path set_mode rejects before persisting,
         // but a regression would reach save_config, and that must never touch
         // the real user config from a test.
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp_home = std::env::temp_dir().join(format!(
-            "caffeinate2_state_test_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-
-        let mut state = bare_state();
-        state.config.modes = vec![SleepMode::System];
-        let (_tx, rx) = mpsc::channel();
-        state.pending_install = Some(PendingInstall {
-            rx,
-            cancelled: false,
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::System];
+            let (_tx, rx) = mpsc::channel();
+            state.pending_install = Some(PendingInstall {
+                rx,
+                cancelled: false,
+            });
+            // A pending enable stands in for "the switch would start a session"
+            // without taking a real hold.
+            let (_etx, erx) = mpsc::channel();
+            state.pending_enable = Some(PendingEnable {
+                modes: vec![SleepMode::System],
+                started_by_upgrade: false,
+                upgrade_apps: Vec::new(),
+                rollback_modes: None,
+                app_saw_seed: false,
+                installing_helper: false,
+                cancelled: false,
+                rx: erx,
+            });
+            assert!(matches!(
+                state.toggle_mode(SleepMode::Entirely),
+                Err(TrayError::HelperInstallPending)
+            ));
+            // The rejected change must not have advanced the persisted selection.
+            assert_eq!(state.config.modes, vec![SleepMode::System]);
         });
-        // A pending enable stands in for "the switch would start a session"
-        // without taking a real hold.
-        let (_etx, erx) = mpsc::channel();
-        state.pending_enable = Some(PendingEnable {
-            modes: vec![SleepMode::System],
-            started_by_upgrade: false,
-            upgrade_apps: Vec::new(),
-            rollback_modes: None,
-            app_saw_seed: false,
-            installing_helper: false,
-            cancelled: false,
-            rx: erx,
-        });
-        assert!(matches!(
-            state.toggle_mode(SleepMode::Entirely),
-            Err(TrayError::HelperInstallPending)
-        ));
-        // The rejected change must not have advanced the persisted selection.
-        assert_eq!(state.config.modes, vec![SleepMode::System]);
-
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&temp_home);
     }
 
     #[test]
@@ -1681,37 +1665,19 @@ mod tests {
     /// the watcher commits directly and reuses the helper that enable installs.
     #[test]
     fn upgrade_toggle_during_installing_enable_spawns_no_second_install() {
-        // Isolate HOME: committing the watcher persists the config, and that
+        // Isolate the config: committing the watcher persists the config, and that
         // must never touch the real user config from a test.
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp_home = std::env::temp_dir().join(format!(
-            "caffeinate2_state_test_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-
-        let mut state = bare_state();
-        state.config.modes = vec![SleepMode::Entirely];
-        let (_tx, rx) = mpsc::channel();
-        state.pending_enable = Some(installing_pending_enable(rx));
-        state.set_upgrade_external(true).unwrap();
-        // The watcher turned on without stacking an install over the enable's
-        // admin dialog.
-        assert!(state.config.upgrade_external);
-        assert!(state.pending_install.is_none());
-
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&temp_home);
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::Entirely];
+            let (_tx, rx) = mpsc::channel();
+            state.pending_enable = Some(installing_pending_enable(rx));
+            state.set_upgrade_external(true).unwrap();
+            // The watcher turned on without stacking an install over the enable's
+            // admin dialog.
+            assert!(state.config.upgrade_external);
+            assert!(state.pending_install.is_none());
+        });
     }
 
     /// Left-click cancel, then left-click again, while a helper-installing
@@ -1775,48 +1741,30 @@ mod tests {
     /// the app watch ignores upgrade sessions, and there is no deadline).
     #[test]
     fn disabling_watcher_cancels_inflight_upgrade_enable() {
-        // Isolate HOME: disabling the watcher persists the config, and that
+        // Isolate the config: disabling the watcher persists the config, and that
         // must never touch the real user config from a test.
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp_home = std::env::temp_dir().join(format!(
-            "caffeinate2_state_test_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-
-        let mut state = bare_state();
-        state.config.upgrade_external = true;
-        let (_tx, rx) = mpsc::channel();
-        state.pending_enable = Some(PendingEnable {
-            modes: vec![SleepMode::Entirely],
-            started_by_upgrade: true,
-            upgrade_apps: vec!["Claude".to_string()],
-            rollback_modes: None,
-            app_saw_seed: false,
-            installing_helper: false,
-            cancelled: false,
-            rx,
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.upgrade_external = true;
+            let (_tx, rx) = mpsc::channel();
+            state.pending_enable = Some(PendingEnable {
+                modes: vec![SleepMode::Entirely],
+                started_by_upgrade: true,
+                upgrade_apps: vec!["Claude".to_string()],
+                rollback_modes: None,
+                app_saw_seed: false,
+                installing_helper: false,
+                cancelled: false,
+                rx,
+            });
+            assert!(state.set_upgrade_external(false).is_ok());
+            // Upgrade enables never install the helper, so the cancel drops the
+            // entry outright; a hold the worker delivers later is released by its
+            // failed send.
+            assert!(state.pending_enable.is_none());
+            assert!(!state.config.upgrade_external);
+            assert!(!state.is_on());
         });
-        assert!(state.set_upgrade_external(false).is_ok());
-        // Upgrade enables never install the helper, so the cancel drops the
-        // entry outright; a hold the worker delivers later is released by its
-        // failed send.
-        assert!(state.pending_enable.is_none());
-        assert!(!state.config.upgrade_external);
-        assert!(!state.is_on());
-
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&temp_home);
     }
 
     /// Switching to a non-Entirely mode while a helper-installing enable is in
@@ -1825,47 +1773,29 @@ mod tests {
     /// rollback armed, leaving config claiming a mode nothing enforces.
     #[test]
     fn mode_switch_away_is_rejected_while_installing_enable_is_in_flight() {
-        // Isolate HOME: on the pass path set_mode rejects before persisting,
+        // Isolate the config: on the pass path set_mode rejects before persisting,
         // but a regression would reach save_config, and that must never touch
         // the real user config from a test.
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp_home = std::env::temp_dir().join(format!(
-            "caffeinate2_state_test_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
+        with_temp_home(line!(), || {
+            let mut state = bare_state();
+            state.config.modes = vec![SleepMode::Entirely];
+            let (_tx, rx) = mpsc::channel();
+            state.pending_enable = Some(installing_pending_enable(rx));
+            assert!(matches!(
+                state.toggle_mode(SleepMode::System),
+                Err(TrayError::HelperInstallPending)
+            ));
+            assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
 
-        let mut state = bare_state();
-        state.config.modes = vec![SleepMode::Entirely];
-        let (_tx, rx) = mpsc::channel();
-        state.pending_enable = Some(installing_pending_enable(rx));
-        assert!(matches!(
-            state.toggle_mode(SleepMode::System),
-            Err(TrayError::HelperInstallPending)
-        ));
-        assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
-
-        // A cancelled installing enable still tracks the dialog and still
-        // occupies the slot, so it blocks the switch just the same.
-        state.pending_enable.as_mut().unwrap().cancelled = true;
-        assert!(matches!(
-            state.toggle_mode(SleepMode::Display),
-            Err(TrayError::HelperInstallPending)
-        ));
-        assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
-
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&temp_home);
+            // A cancelled installing enable still tracks the dialog and still
+            // occupies the slot, so it blocks the switch just the same.
+            state.pending_enable.as_mut().unwrap().cancelled = true;
+            assert!(matches!(
+                state.toggle_mode(SleepMode::Display),
+                Err(TrayError::HelperInstallPending)
+            ));
+            assert_eq!(state.config.modes, vec![SleepMode::Entirely]);
+        });
     }
 
     /// An upgrade session's app-watch latch must not leak into the next
@@ -2289,83 +2219,51 @@ mod tests {
         )));
     }
 
-    /// Serializes the tests that repoint HOME at a throwaway dir: parallel
-    /// test threads share the process environment, so concurrent set_var
-    /// calls would race.
-    static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `body` with HOME pointed at a throwaway directory, so a test whose
-    /// path persists the config never touches the user's real `tray.toml`.
-    /// `line` (pass `line!()`) keeps concurrent runs of different tests apart.
+    /// Run `body` with the tray config rooted at a throwaway directory, so a
+    /// test whose path persists the config never touches the user's real
+    /// `tray.toml`. The override is per thread (see
+    /// [`tray_mode::with_test_home`]), so tests stay parallel and the process
+    /// environment is never mutated. `line` (pass `line!()`) keeps the
+    /// directories of different tests apart.
     fn with_temp_home<T>(line: u32, body: impl FnOnce() -> T) -> T {
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_home = std::env::temp_dir().join(format!(
             "caffeinate2_state_test_{}_{line}",
             std::process::id()
         ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-        let result = body();
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let result = tray_mode::with_test_home(&temp_home, body);
         let _ = std::fs::remove_dir_all(&temp_home);
         result
     }
 
     #[test]
     fn mode_switch_enable_failure_restores_previous_mode() {
-        // Point HOME at a throwaway dir so AppState::new() (load_config) and the
+        // Root the tray config at a throwaway dir so AppState::new() (load_config) and the
         // rollback's save_config() operate on an isolated config, never the
         // user's real ~/Library/Application Support/caffeinate2/tray.toml.
-        let _home_serial = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp_home = std::env::temp_dir().join(format!(
-            "caffeinate2_state_test_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized on HOME_TEST_LOCK — no concurrent test reads or
-        // mutates HOME.
-        unsafe { std::env::set_var("HOME", &temp_home) };
+        with_temp_home(line!(), || {
+            let mut state = AppState::new();
+            let original_modes = state.config.modes.clone();
+            let target_modes = vec![SleepMode::Disk, SleepMode::UserActive];
+            assert_ne!(target_modes, original_modes);
 
-        let mut state = AppState::new();
-        let original_modes = state.config.modes.clone();
-        let target_modes = vec![SleepMode::Disk, SleepMode::UserActive];
-        assert_ne!(target_modes, original_modes);
+            state.config.modes = target_modes.clone();
+            let (tx, rx) = mpsc::channel();
+            tx.send(Err(EnableError::Ipc("mock enable failure".into())))
+                .unwrap();
+            state.pending_enable = Some(PendingEnable {
+                modes: target_modes,
+                started_by_upgrade: false,
+                upgrade_apps: Vec::new(),
+                rollback_modes: Some(original_modes.clone()),
+                app_saw_seed: false,
+                installing_helper: false,
+                cancelled: false,
+                rx,
+            });
 
-        state.config.modes = target_modes.clone();
-        let (tx, rx) = mpsc::channel();
-        tx.send(Err(EnableError::Ipc("mock enable failure".into())))
-            .unwrap();
-        state.pending_enable = Some(PendingEnable {
-            modes: target_modes,
-            started_by_upgrade: false,
-            upgrade_apps: Vec::new(),
-            rollback_modes: Some(original_modes.clone()),
-            app_saw_seed: false,
-            installing_helper: false,
-            cancelled: false,
-            rx,
+            let outcome = state.poll_pending_enable();
+            assert!(matches!(outcome, PendingEnableOutcome::Failed { .. }));
+            assert_eq!(state.config.modes, original_modes);
         });
-
-        let outcome = state.poll_pending_enable();
-        assert!(matches!(outcome, PendingEnableOutcome::Failed { .. }));
-        assert_eq!(state.config.modes, original_modes);
-
-        // SAFETY: see the set_var note above.
-        unsafe {
-            match prev_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&temp_home);
     }
 }

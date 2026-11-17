@@ -157,13 +157,42 @@ pub fn same_app_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for `$HOME`, read by [`config_path`] before the
+    /// environment. It is per thread, so parallel tests each get their own
+    /// config without mutating the process environment (which `set_var` may
+    /// only do while no other thread reads it, something a multi-threaded
+    /// test binary cannot promise).
+    static TEST_HOME: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with [`config_path`] rooted at `home` on this thread, restoring
+/// the previous override afterwards (also on panic).
+#[cfg(test)]
+pub(crate) fn with_test_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::path::PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_HOME.set(self.0.take());
+        }
+    }
+    let _restore = Restore(TEST_HOME.replace(Some(home.to_path_buf())));
+    body()
+}
+
 ///
 /// # Errors
 ///
 /// Returns an error if `HOME` is not set.
 pub fn config_path() -> Result<std::path::PathBuf, TrayError> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
+    #[cfg(test)]
+    let home = TEST_HOME.with_borrow(Clone::clone);
+    #[cfg(not(test))]
+    let home = None;
+    let home = home
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
         .ok_or(TrayError::HomeNotSet)?;
     Ok(home
         .join("Library/Application Support/caffeinate2")
