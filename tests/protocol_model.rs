@@ -10,6 +10,14 @@
 //! marker exists to survive, and it is the one thing the operation-granularity
 //! property tests cannot reach.
 //!
+//! The model is a separate copy of the protocol, so on its own it only shows
+//! the design is sound. The [`conformance`] module ties it to the code: it runs
+//! every transition of the single-process model against the real coordinator
+//! and fails if the two disagree, so a change to either one that isn't made to
+//! both shows up as a test failure. The cross-process model has no such check;
+//! its reconcile ownership re-record is pinned by a unit test in
+//! `src/entirely/coordinator.rs` instead.
+//!
 //! Both models ASSUME each flock'd lockfile write is atomic: a crash observes
 //! either the pre-write or the post-write file, never a torn intermediate.
 //! `write_state` earns that assumption with two mitigations — the ownership
@@ -357,7 +365,11 @@ impl Model for Coordinator {
             }
 
             Action::Release(p) => {
-                prune(&mut s);
+                // Mirrors `lockfile::release`, which pins the caller: its own
+                // entry survives the prune even when its process is dead (the
+                // helper's failed-response rollback, or a client that exited
+                // after sending Release), so it counts as removed.
+                s.lockfile.retain(|q| *q == p || s.alive.contains(q));
                 let removed = s.lockfile.remove(&p);
                 let enable = match self.variant {
                     // Fixed: mirrors `lockfile::release`'s `should_enable:
@@ -1372,4 +1384,491 @@ fn cross_process_unconditional_marker_writes_are_caught() {
         "release-immediate counterexample must end at a completed release \
          stranding sleep disabled, got {quick_last:?}"
     );
+}
+
+/// Conformance: replays the single-process model against the real
+/// [`EntirelyCoordinator`](caffeinate2::entirely::coordinator::EntirelyCoordinator).
+///
+/// Everything above checks the protocol *design* on an abstract copy of it,
+/// so on its own it can't notice the code drifting from the model. This
+/// closes that gap: for every state the checker reaches, it replays the path
+/// that led there against the real coordinator, with a real lockfile, a
+/// simulated kernel bit and a simulated process table, and checks after each
+/// operation that the durable state (holder entries, ownership marker, kernel
+/// bit) and the number of kernel toggles match the model's.
+///
+/// The model's mid-operation steps map onto the injected sleep toggle, which
+/// is the only point inside an operation where the real code yields:
+///
+/// * a completed step lets the toggle succeed;
+/// * `FailOp` makes it return an IOKit-style error, so the real rollback runs;
+/// * `Crash` while the toggle is pending panics in place of toggling, and
+///   `Crash` after it (before the marker write) toggles and then panics. The
+///   panic unwinds out of the operation, skipping its remaining steps, and the
+///   coordinator is discarded and rebuilt on the same lockfile, which is a
+///   helper restart;
+/// * a crash at a point with no kernel step left lets the real operation
+///   finish: its remaining model steps change no durable state.
+#[cfg(target_os = "macos")]
+mod conformance {
+    use super::*;
+    use caffeinate2::entirely::coordinator::{EntirelyCoordinator, SleepDisabler};
+    use caffeinate2::entirely::lockfile::{ProcessChecker, ProcessId, ProcessStartTime};
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, Once};
+
+    /// Panic payload for a simulated helper SIGKILL, so the panic hook can
+    /// stay quiet about the thousands of intentional ones.
+    struct SimulatedCrash;
+
+    fn silence_simulated_crashes() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let default_hook = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                if !info.payload().is::<SimulatedCrash>() {
+                    default_hook(info);
+                }
+            }));
+        });
+    }
+
+    /// What the injected sleep toggle does for the operation being replayed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Toggle {
+        Succeed,
+        Fail,
+        CrashBefore,
+        CrashAfter,
+    }
+
+    /// The real coordinator plus the simulated world its seams read.
+    struct Real {
+        lock_path: PathBuf,
+        kernel_disabled: Arc<AtomicBool>,
+        alive: Arc<Mutex<BTreeSet<Pid>>>,
+        toggle: Arc<Mutex<Toggle>>,
+        toggle_calls: Arc<AtomicUsize>,
+        coordinator: EntirelyCoordinator,
+    }
+
+    fn process_id(p: Pid) -> ProcessId {
+        ProcessId {
+            pid: i32::from(p),
+            start_time: ProcessStartTime {
+                seconds: 10,
+                microseconds: 0,
+            },
+        }
+    }
+
+    impl Real {
+        fn new(lock_path: PathBuf) -> Self {
+            let kernel_disabled = Arc::new(AtomicBool::new(false));
+            let alive = Arc::new(Mutex::new(BTreeSet::new()));
+            let toggle = Arc::new(Mutex::new(Toggle::Succeed));
+            let toggle_calls = Arc::new(AtomicUsize::new(0));
+            let coordinator =
+                Self::build(&lock_path, &kernel_disabled, &alive, &toggle, &toggle_calls);
+            Real {
+                lock_path,
+                kernel_disabled,
+                alive,
+                toggle,
+                toggle_calls,
+                coordinator,
+            }
+        }
+
+        fn build(
+            lock_path: &std::path::Path,
+            kernel_disabled: &Arc<AtomicBool>,
+            alive: &Arc<Mutex<BTreeSet<Pid>>>,
+            toggle: &Arc<Mutex<Toggle>>,
+            toggle_calls: &Arc<AtomicUsize>,
+        ) -> EntirelyCoordinator {
+            let (kernel, toggle, calls) = (
+                kernel_disabled.clone(),
+                toggle.clone(),
+                toggle_calls.clone(),
+            );
+            let disabler: SleepDisabler = Arc::new(move |state, _verbose| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let behavior = *toggle.lock().unwrap();
+                match behavior {
+                    Toggle::Succeed => {
+                        kernel.store(state, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    Toggle::Fail => Err(0xE000_02C1u32),
+                    Toggle::CrashBefore => panic::panic_any(SimulatedCrash),
+                    Toggle::CrashAfter => {
+                        kernel.store(state, Ordering::SeqCst);
+                        panic::panic_any(SimulatedCrash)
+                    }
+                }
+            });
+            let alive = alive.clone();
+            let checker: Arc<ProcessChecker> = Arc::new(move |pid, start_time| {
+                start_time == process_id(0).start_time
+                    && u8::try_from(pid).is_ok_and(|p| alive.lock().unwrap().contains(&p))
+            });
+            EntirelyCoordinator::with_options(false, lock_path.to_path_buf(), disabler, checker)
+        }
+
+        /// A helper SIGKILL and restart: the in-memory coordinator is gone and
+        /// a fresh one rediscovers everything from the lockfile.
+        fn restart(&mut self) {
+            self.coordinator = Self::build(
+                &self.lock_path,
+                &self.kernel_disabled,
+                &self.alive,
+                &self.toggle,
+                &self.toggle_calls,
+            );
+        }
+
+        /// An independent copy of this world on its own lockfile, run by a
+        /// fresh coordinator. The coordinator's only in-memory state is the
+        /// hold epochs used by the helper's failed-response rollback, which no
+        /// modeled operation reads, so the copy behaves like the original.
+        fn fork(&self, lock_path: PathBuf) -> Self {
+            if self.lock_path.exists() {
+                std::fs::copy(&self.lock_path, &lock_path).unwrap();
+            }
+            let fork = Real::new(lock_path);
+            fork.kernel_disabled.store(
+                self.kernel_disabled.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            fork.alive
+                .lock()
+                .unwrap()
+                .clone_from(&self.alive.lock().unwrap());
+            fork
+        }
+
+        /// (holder entries, ownership marker) as persisted in the lockfile.
+        fn lockfile(&self) -> (BTreeSet<Pid>, bool) {
+            let text = std::fs::read_to_string(&self.lock_path).unwrap_or_default();
+            let holders = text
+                .lines()
+                .filter_map(|line| line.trim().parse::<ProcessId>().ok())
+                .map(|id| Pid::try_from(id.pid).expect("only model pids are written"))
+                .collect();
+            let marker = text.lines().any(|line| line.trim() == "!disabled");
+            (holders, marker)
+        }
+    }
+
+    /// Whether the step out of `pending` calls the kernel (the same set the
+    /// model offers `FailOp` for).
+    fn calls_kernel(pending: &Pending) -> bool {
+        matches!(
+            pending,
+            Pending::HoldToggle { first: true, .. }
+                | Pending::ReleaseToggle { enable: true, .. }
+                | Pending::ReconcileToggle {
+                    effect: Effect::Disable | Effect::Enable
+                }
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Ok,
+        Err,
+        Crashed,
+    }
+
+    /// Runs the model action at `steps[i]` against the real coordinator: a
+    /// single action, or a whole operation through to the next quiescent
+    /// state. Returns the index of the model state to compare against.
+    fn run_action(
+        real: &mut Real,
+        steps: &[(State, Option<Action>)],
+        i: usize,
+    ) -> Result<usize, String> {
+        let action = steps[i].1.clone().expect("an action to run");
+        match action {
+            Action::Kill(p) => {
+                real.alive.lock().unwrap().remove(&p);
+                Ok(i + 1)
+            }
+            Action::Crash => {
+                real.restart();
+                Ok(i + 1)
+            }
+            Action::StepOp | Action::FailOp => {
+                Err(format!("step {i}: {action:?} with no operation in flight"))
+            }
+            Action::Hold(_)
+            | Action::Release(_)
+            | Action::StartReconcile
+            | Action::StartStartup => {
+                // The operation runs until the model is quiescent again; the
+                // step that gets it there decides how it ended.
+                let mut end = i + 1;
+                while steps[end].0.pending != Pending::None {
+                    end += 1;
+                }
+                let (last_pending_state, last_step) = &steps[end - 1];
+                let last_step = last_step.clone().expect("a step ended the operation");
+                let expected_calls = steps[i + 1..end]
+                    .iter()
+                    .filter(|(s, _)| calls_kernel(&s.pending))
+                    .count();
+                let toggle = match last_step {
+                    Action::StepOp => Toggle::Succeed,
+                    Action::FailOp => Toggle::Fail,
+                    Action::Crash if calls_kernel(&last_pending_state.pending) => {
+                        Toggle::CrashBefore
+                    }
+                    Action::Crash => Toggle::CrashAfter,
+                    ref other => return Err(format!("step {i}: operation ended by {other:?}")),
+                };
+                *real.toggle.lock().unwrap() = toggle;
+                real.toggle_calls.store(0, Ordering::SeqCst);
+
+                let coordinator = &real.coordinator;
+                let alive = &real.alive;
+                let result = panic::catch_unwind(AssertUnwindSafe(|| match action {
+                    Action::Hold(p) => {
+                        alive.lock().unwrap().insert(p);
+                        coordinator.hold(process_id(p)).map(drop)
+                    }
+                    Action::Release(p) => coordinator.release(process_id(p)),
+                    Action::StartReconcile => coordinator.reconcile(),
+                    Action::StartStartup => coordinator.reconcile_startup(),
+                    _ => unreachable!(),
+                }));
+                let outcome = match result {
+                    Ok(Ok(())) => Outcome::Ok,
+                    Ok(Err(_)) => Outcome::Err,
+                    Err(payload) if payload.is::<SimulatedCrash>() => Outcome::Crashed,
+                    Err(payload) => panic::resume_unwind(payload),
+                };
+                let expected = match (&last_step, expected_calls) {
+                    (Action::FailOp, _) => Outcome::Err,
+                    (Action::Crash, n) if n > 0 => Outcome::Crashed,
+                    _ => Outcome::Ok,
+                };
+                if outcome != expected {
+                    return Err(format!(
+                        "step {i}: {action:?} ended {outcome:?}, model expects {expected:?}"
+                    ));
+                }
+                let calls = real.toggle_calls.load(Ordering::SeqCst);
+                if calls != expected_calls {
+                    return Err(format!(
+                        "step {i}: {action:?} toggled the kernel {calls} time(s), \
+                         model expects {expected_calls}"
+                    ));
+                }
+                if last_step == Action::Crash {
+                    real.restart();
+                }
+                Ok(end)
+            }
+        }
+    }
+
+    /// Compares the real durable state with the model's.
+    fn check(real: &Real, model: &State) -> Result<(), String> {
+        let (holders, marker) = real.lockfile();
+        let kernel = real.kernel_disabled.load(Ordering::SeqCst);
+        if holders == model.lockfile && marker == model.marker && kernel == model.kernel_disabled {
+            return Ok(());
+        }
+        Err(format!(
+            "real code has holders {holders:?}, marker {marker}, kernel disabled {kernel}; \
+             model has holders {:?}, marker {}, kernel disabled {}",
+            model.lockfile, model.marker, model.kernel_disabled
+        ))
+    }
+
+    /// Replays a whole model path, checking after every action.
+    fn replay(real: &mut Real, steps: &[(State, Option<Action>)]) -> Result<(), String> {
+        let mut i = 0;
+        while steps[i].1.is_some() {
+            let next = run_action(real, steps, i)?;
+            check(real, &steps[next].0).map_err(|why| format!("after step {i}: {why}"))?;
+            i = next;
+        }
+        Ok(())
+    }
+
+    /// Every way the model can leave quiescent state `state`: each action,
+    /// and for an operation, each way its steps can play out until the model
+    /// is quiescent again. Each is a path fragment ending in that state.
+    fn transitions(model: &Coordinator, state: &State) -> Vec<Vec<(State, Option<Action>)>> {
+        fn extend(
+            model: &Coordinator,
+            path: Vec<(State, Option<Action>)>,
+            state: State,
+            out: &mut Vec<Vec<(State, Option<Action>)>>,
+        ) {
+            let mut actions = Vec::new();
+            if state.pending != Pending::None {
+                model.actions(&state, &mut actions);
+            }
+            if actions.is_empty() {
+                let mut path = path;
+                path.push((state, None));
+                out.push(path);
+                return;
+            }
+            for action in actions {
+                if let Some(next) = model.next_state(&state, action.clone()) {
+                    let mut path = path.clone();
+                    path.push((state.clone(), Some(action)));
+                    extend(model, path, next, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut actions = Vec::new();
+        model.actions(state, &mut actions);
+        for action in actions {
+            if let Some(next) = model.next_state(state, action.clone()) {
+                extend(model, vec![(state.clone(), Some(action))], next, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Replays `steps` to a quiescent state, then runs every transition out
+    /// of it on a copy of the real state. Returns how many transitions ran and
+    /// a description of each divergence.
+    fn check_state_and_transitions(
+        model: &Coordinator,
+        steps: &[(State, Option<Action>)],
+    ) -> (usize, Vec<String>) {
+        let describe = |path: &[(State, Option<Action>)]| -> Vec<Action> {
+            path.iter().filter_map(|(_, a)| a.clone()).collect()
+        };
+        let mut failures = Vec::new();
+        let lock_path = temp_lock_path();
+        let mut real = Real::new(lock_path.clone());
+        let replayed = replay(&mut real, steps);
+        let mut run = 0;
+        match replayed {
+            Err(why) => failures.push(format!("{why}\n  path: {:?}", describe(steps))),
+            Ok(()) => {
+                for transition in transitions(model, &steps.last().unwrap().0) {
+                    run += 1;
+                    let fork_path = temp_lock_path();
+                    let mut fork = real.fork(fork_path.clone());
+                    let result = run_action(&mut fork, &transition, 0).and_then(|end| {
+                        check(&fork, &transition[end].0)
+                            .map_err(|why| format!("after the last step: {why}"))
+                    });
+                    let _ = std::fs::remove_file(&fork_path);
+                    if let Err(why) = result {
+                        let mut path = describe(steps);
+                        path.extend(describe(&transition));
+                        failures.push(format!("{why}\n  path: {path:?}"));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&lock_path);
+        (run, failures)
+    }
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_lock_path() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "caffeinate2_conformance_{}_{}.lock",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Every transition of the fixed single-process model must play out the
+    /// same way in the real coordinator. The checker finds every reachable
+    /// state with one path to it; each quiescent state's path is replayed,
+    /// then every way out of that state is run on a copy of the real state.
+    /// Replaying only the recorded paths would test each state once but miss
+    /// transitions into it from elsewhere, which is where a wrong release
+    /// decision showed up.
+    #[test]
+    fn real_coordinator_follows_the_model() {
+        silence_simulated_crashes();
+        let model = Coordinator {
+            variant: Variant::Fixed,
+            pids: vec![1, 2, 3],
+        };
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorder = paths.clone();
+        Coordinator {
+            variant: Variant::Fixed,
+            pids: vec![1, 2, 3],
+        }
+        .checker()
+        .visitor(move |path: stateright::Path<State, Action>| {
+            recorder.lock().unwrap().push(path.into_vec());
+        })
+        .spawn_bfs()
+        .join();
+        let paths = std::mem::take(&mut *paths.lock().unwrap());
+
+        let quiescent: Vec<_> = paths
+            .iter()
+            .filter(|steps| steps.last().unwrap().0.pending == Pending::None)
+            .collect();
+        let states = quiescent.len();
+        // Each replay is fsync-bound, and every state uses its own lockfiles,
+        // so the states are spread across threads.
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let (transitions_run, mut failures) = std::thread::scope(|scope| {
+            let model = &model;
+            let handles: Vec<_> = quiescent
+                .chunks(states.div_ceil(workers).max(1))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut run = 0;
+                        let mut failures = Vec::new();
+                        for steps in chunk {
+                            let (n, mut f) = check_state_and_transitions(model, steps);
+                            run += n;
+                            failures.append(&mut f);
+                        }
+                        (run, failures)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).fold(
+                (0, Vec::new()),
+                |(run, mut all), (n, mut f)| {
+                    all.append(&mut f);
+                    (run + n, all)
+                },
+            )
+        });
+        eprintln!(
+            "Conformance: {states} model states, {transitions_run} transitions out of them \
+             run against the real coordinator, {} diverged.",
+            failures.len()
+        );
+        assert!(states > 100, "too few states reached: {states}");
+        failures.sort_by_key(String::len);
+        assert!(
+            failures.is_empty(),
+            "the real coordinator diverged from the model {} time(s); shortest:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
