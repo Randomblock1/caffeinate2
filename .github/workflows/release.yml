@@ -5,11 +5,22 @@ on:
     tags:
       - "*.*.*"
 
+# Third-party actions are pinned to full commit SHAs (tag in the trailing
+# comment): a tag can be moved to different code, and this job publishes the
+# binary that later runs as a root daemon.
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      # Create the release and upload its assets.
+      contents: write
+      # Sign and store the build provenance attestation.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Get the version
         run: echo version=$(cargo pkgid | cut -d "#" -f2) >> $GITHUB_ENV
       - name: Check tag matches the crate version
@@ -25,23 +36,40 @@ jobs:
             echo "Tag $TAG does not match Cargo.toml version $VERSION" >&2
             exit 1
           fi
+      # --locked: build exactly the dependency versions in Cargo.lock, the
+      # ones CI tested, rather than whatever resolves on the day.
       - name: Build
-        run: cargo build --verbose --release --features full
+        run: cargo build --locked --verbose --release --features full
       - name: Run tests
-        run: cargo test --verbose --release --features full
+        run: cargo test --locked --verbose --release --features full
       - name: Compress
         # -C so the binaries land in the extraction root as siblings — the
         # README says to extract them together, and the helper installer
         # resolves its binaries as siblings of the running executable.
         run: |
-          tar -C target/release -czvf caffeinate2-${{ env.version }}.tar.gz \
+          tar -C target/release -czvf "caffeinate2-$version.tar.gz" \
             caffeinate2 \
             caffeinate2-tray \
             caffeinate2-helper
+      - name: Checksum
+        run: shasum -a 256 "caffeinate2-$version.tar.gz" > "caffeinate2-$version.tar.gz.sha256"
+      - name: Attest build provenance
+        # Lets anyone check that the tarball, and each binary extracted from
+        # it, was built by this workflow from this repository:
+        #   gh attestation verify <file> --repo randomblock1/caffeinate2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            caffeinate2-${{ env.version }}.tar.gz
+            target/release/caffeinate2
+            target/release/caffeinate2-tray
+            target/release/caffeinate2-helper
       - name: Create a release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: ${{ env.version }}
-          files: caffeinate2-${{ env.version }}.tar.gz
+          files: |
+            caffeinate2-${{ env.version }}.tar.gz
+            caffeinate2-${{ env.version }}.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -9,30 +9,37 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+# Actions are pinned to full commit SHAs (tag in the trailing comment), like
+# the release workflow.
 jobs:
   build:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --features full -- -D warnings
+        run: cargo clippy --locked --all-targets --features full -- -D warnings
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
       - name: Build (full)
-        run: cargo build --verbose --features full
+        run: cargo build --locked --verbose --features full
       # The user-selectable partial feature sets must at least compile; they
       # have no separate artifacts, so a check is enough.
       - name: Check (tray)
-        run: cargo check --features tray
+        run: cargo check --locked --features tray
       - name: Check (helper-bin)
-        run: cargo check --features helper-bin
+        run: cargo check --locked --features helper-bin
       - name: Run tests
-        run: cargo test --verbose --features full
+        run: cargo test --locked --verbose --features full
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: debug build
           path: |

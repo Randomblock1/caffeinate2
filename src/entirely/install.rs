@@ -32,7 +32,10 @@ const CLI_BINARY_HINT: &str = "install caffeinate2 with --features full, use the
     bundle, or place caffeinate2 in the same directory as caffeinate2-helper";
 
 fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf, InstallError> {
-    let exe = std::env::current_exe().map_err(InstallError::from)?;
+    // Resolve symlinks first, so a binary reached through a symlinked bin
+    // directory (Homebrew links into its Cellar) finds its real sibling, which
+    // the helper copy then opens without following symlinks.
+    let exe = running_binary()?;
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name == binary_name {
         return Ok(exe);
@@ -49,6 +52,13 @@ fn resolve_sibling_binary(binary_name: &str, build_hint: &str) -> Result<PathBuf
             exe.display()
         )))
     }
+}
+
+/// The running executable with symlinks resolved.
+fn running_binary() -> Result<PathBuf, InstallError> {
+    let exe = std::env::current_exe().map_err(InstallError::from)?;
+    fs::canonicalize(&exe)
+        .map_err(|e| InstallError::msg(format!("could not resolve {}: {e}", exe.display())))
 }
 
 ///
@@ -169,6 +179,10 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     // then only ever executes a binary in a tree no non-root user controls.
     ensure_secure_install_dir(parent)?;
 
+    // Validate and read the new binary before touching the installed one, so
+    // a refused source leaves the working helper in place.
+    let contents = read_helper_source(source_helper, running_binary_owner()?)?;
+
     // Reinstall path: stop any loaded helper before replacing its binary, and
     // unlink the old file so the copy gets a fresh inode. Overwriting a running
     // executable in place invalidates its code signature and the kernel kills
@@ -195,7 +209,7 @@ pub fn install_helper(source_helper: &Path) -> Result<(), InstallError> {
     // symlink planted at the destination cannot redirect the privileged write
     // and the installed binary is never momentarily owned or writable by a
     // non-root user.
-    install_helper_binary(source_helper, &dest)?;
+    install_helper_binary(&contents, &dest)?;
 
     let plist = helper_plist_content(&dest);
     // launchctl refuses a system LaunchDaemon plist that is group/world-writable
@@ -312,22 +326,101 @@ fn create_secure_dir(path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// Largest helper binary the installer will read. A release build is under
+/// 2 MiB; the cap only bounds what a planted file can make root read.
+const MAX_HELPER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// First four bytes of the Mach-O formats a helper build can produce: a thin
+/// 64-bit image (little-endian `MH_MAGIC_64`) or a universal binary
+/// (big-endian `FAT_MAGIC` / `FAT_MAGIC_64`).
+const MACH_O_MAGICS: [[u8; 4]; 3] = [
+    [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe],
+    [0xca, 0xfe, 0xba, 0xbf],
+];
+
+/// Read the helper binary the installer is about to copy into place as root.
+///
+/// The file sits in a user-writable directory, so its *content* cannot be
+/// trusted here (see the README's Security section). What these checks stop is
+/// the installer being turned into a root file reader: a planted symlink or
+/// FIFO, or another account's file, cannot be copied out world-readable to
+/// `/Library/PrivilegedHelperTools`. Requires a regular file, opened without
+/// following a symlink, owned by root or by `expected_owner` (whoever owns the
+/// running caffeinate2), at most [`MAX_HELPER_BYTES`], that starts with a
+/// Mach-O header.
+fn read_helper_source(source: &Path, expected_owner: u32) -> Result<Vec<u8>, InstallError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let refuse = |why: String| {
+        InstallError::msg(format!(
+            "refusing to install helper from {}: {why}",
+            source.display()
+        ))
+    };
+    // O_NONBLOCK so a FIFO planted at the path can't hang the open; it is
+    // then rejected as not a regular file. It changes nothing for a regular
+    // file's reads.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(source)
+        .map_err(|e| refuse(format!("could not open it without following symlinks: {e}")))?;
+    let meta = file.metadata().map_err(InstallError::from)?;
+    if !meta.file_type().is_file() {
+        return Err(refuse("not a regular file".to_string()));
+    }
+    if meta.uid() != 0 && meta.uid() != expected_owner {
+        return Err(refuse(format!(
+            "owned by uid {}, expected root or uid {expected_owner} (the owner of the running \
+             caffeinate2)",
+            meta.uid()
+        )));
+    }
+    if meta.len() > MAX_HELPER_BYTES {
+        return Err(refuse(format!(
+            "{} bytes is over the {MAX_HELPER_BYTES}-byte limit",
+            meta.len()
+        )));
+    }
+    let mut contents = Vec::new();
+    // Bounded even if the file grows between the fstat and the read.
+    file.take(MAX_HELPER_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(InstallError::from)?;
+    if contents.len() as u64 > MAX_HELPER_BYTES {
+        return Err(refuse(
+            "it grew past the size limit while being read".to_string(),
+        ));
+    }
+    if !MACH_O_MAGICS
+        .iter()
+        .any(|magic| contents.starts_with(magic))
+    {
+        return Err(refuse("not a Mach-O executable".to_string()));
+    }
+    Ok(contents)
+}
+
+/// Owner uid of the running binary, which the helper source must match unless
+/// it is root-owned (see [`read_helper_source`]).
+fn running_binary_owner() -> Result<u32, InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = running_binary()?;
+    Ok(fs::metadata(&exe).map_err(InstallError::from)?.uid())
+}
+
 /// Copy the helper binary to `dest` without following symlinks and pin it to
 /// root:wheel 0o755 through the open fd, so a symlink planted at `dest` cannot
 /// redirect the privileged write and the binary is never owned or writable by a
 /// non-root user.
-fn install_helper_binary(source: &Path, dest: &Path) -> Result<(), InstallError> {
+fn install_helper_binary(contents: &[u8], dest: &Path) -> Result<(), InstallError> {
     use nix::sys::stat::{Mode, fchmod};
     use nix::unistd::{Gid, Uid, fchown};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::fs::OpenOptionsExt;
-
-    let mut contents = Vec::new();
-    fs::File::open(source)
-        .map_err(InstallError::from)?
-        .read_to_end(&mut contents)
-        .map_err(InstallError::from)?;
 
     // create_new => O_CREAT|O_EXCL; O_NOFOLLOW rejects a symlink at dest. The
     // caller unlinks any prior binary first, so O_EXCL gets a fresh inode.
@@ -338,7 +431,7 @@ fn install_helper_binary(source: &Path, dest: &Path) -> Result<(), InstallError>
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(dest)
         .map_err(InstallError::from)?;
-    file.write_all(&contents).map_err(InstallError::from)?;
+    file.write_all(contents).map_err(InstallError::from)?;
     file.sync_all().map_err(InstallError::from)?;
     fchown(file.as_fd(), Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
         .map_err(|e| InstallError::msg(format!("could not set helper owner: {e}")))?;
@@ -473,14 +566,51 @@ pub fn uninstall_helper() -> Result<(), InstallError> {
     Ok(())
 }
 
+/// What [`install_helper_privileged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOutcome {
+    Installed,
+    /// The running helper already matches the binary on disk byte for byte,
+    /// so nothing was copied and no password was asked for.
+    AlreadyCurrent,
+}
+
+/// Whether the installed helper is exactly what an install would produce:
+/// the binary matches `wanted` byte for byte, the plist matches, and the
+/// daemon answers with this binary's version. Everything read here is
+/// world-readable, so the check needs no privileges.
+///
+/// Each install copies a user-writable file into a root daemon, so skipping
+/// a reinstall that would change nothing removes one chance for a tampered
+/// file to get in (and a needless password prompt).
+fn helper_is_current(wanted: &[u8]) -> bool {
+    let plist_current = fs::read_to_string(HELPER_PLIST_PATH)
+        .is_ok_and(|plist| plist == helper_plist_content(Path::new(HELPER_INSTALL_PATH)));
+    let binary_current = fs::read(HELPER_INSTALL_PATH).is_ok_and(|installed| installed == wanted);
+    plist_current
+        && binary_current
+        && helper_ipc::HelperClient::new()
+            .status()
+            .is_ok_and(|status| !status.is_stale())
+}
+
 ///
 /// # Errors
 ///
 /// Returns an error if privileged installation fails or is cancelled.
-pub fn install_helper_privileged() -> Result<(), InstallError> {
+pub fn install_helper_privileged() -> Result<InstallOutcome, InstallError> {
+    let source = resolve_helper_source()?;
+    // Run the source checks here too, before any password prompt: a refused
+    // source should say so up front, not after the user has authenticated.
+    // Not a security boundary (the root install re-checks the file itself).
+    let wanted = read_helper_source(&source, running_binary_owner()?)?;
+    if helper_is_current(&wanted) {
+        return Ok(InstallOutcome::AlreadyCurrent);
+    }
+
     if nix::unistd::Uid::effective().is_root() {
-        let source = resolve_helper_source()?;
-        return install_helper(&source);
+        install_helper(&source)?;
+        return Ok(InstallOutcome::Installed);
     }
 
     let cli = resolve_cli_binary()?;
@@ -496,7 +626,7 @@ pub fn install_helper_privileged() -> Result<(), InstallError> {
         .status()
         .map_err(InstallError::from)?;
     if status.success() {
-        Ok(())
+        Ok(InstallOutcome::Installed)
     } else {
         Err(InstallError::msg(
             "administrator authorization failed or was cancelled",
@@ -758,6 +888,71 @@ mod tests {
         let result = ensure_secure_install_dir(Path::new("usr/local/libexec/caffeinate2"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("absolute path"));
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("caffeinate2_install_{}_{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn own_uid() -> u32 {
+        nix::unistd::getuid().as_raw()
+    }
+
+    #[test]
+    fn helper_source_accepts_an_owned_mach_o_binary() {
+        // The test binary itself is a Mach-O owned by whoever built it.
+        let exe = std::env::current_exe().unwrap();
+        let contents = read_helper_source(&exe, own_uid()).unwrap();
+        assert_eq!(contents, fs::read(&exe).unwrap());
+    }
+
+    #[test]
+    fn helper_source_rejects_a_file_owned_by_someone_else() {
+        let exe = std::env::current_exe().unwrap();
+        let message = read_helper_source(&exe, own_uid() + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("owned by uid"), "{message}");
+    }
+
+    #[test]
+    fn helper_source_rejects_non_mach_o_content() {
+        let dir = scratch_dir("text");
+        let path = dir.join("caffeinate2-helper");
+        fs::write(&path, "root-only secret\n").unwrap();
+        let message = read_helper_source(&path, own_uid())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not a Mach-O"), "{message}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn helper_source_rejects_a_symlink() {
+        let dir = scratch_dir("link");
+        let path = dir.join("caffeinate2-helper");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &path).unwrap();
+        let message = read_helper_source(&path, own_uid())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("without following symlinks"), "{message}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn helper_source_rejects_a_fifo_without_hanging() {
+        let dir = scratch_dir("fifo");
+        let path = dir.join("caffeinate2-helper");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let message = read_helper_source(&path, own_uid())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not a regular file"), "{message}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

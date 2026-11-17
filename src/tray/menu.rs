@@ -1,3 +1,4 @@
+use crate::entirely::helper_ipc::HolderProcess;
 use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::state::{AppState, IgnoredAssertion, MenuSnapshot};
 use crate::tray::tray_mode::TimeLimitPreset;
@@ -139,6 +140,11 @@ pub fn build_menu(snapshot: &MenuSnapshot) -> (Menu, MenuHandles) {
         append_ignored_status(&menu, &snapshot.ignored_assertions);
     }
 
+    // Entirely-mode holds taken by anything other than this tray. Any process
+    // running as an administrator can take one without a prompt, so it must
+    // not be silent.
+    append_other_holders(&menu, &snapshot.other_holders);
+
     // The user's persistent ignore list, editable here: clicking a program drops
     // it from the list. Shown whether or not it is asserting right now, so an
     // ignore made months ago is still discoverable (and reversible).
@@ -242,6 +248,42 @@ fn append_ignored_status(menu: &Menu, ignored: &[IgnoredAssertion]) {
                     .expect("append ignored assertion");
             }
             menu.append(&submenu).expect("append ignored submenu");
+        }
+    }
+}
+
+/// Append the "Also keeping the Mac awake" status: Entirely-mode holders other
+/// than this tray. Disabled and informational like the lines above; one holder
+/// is a single line, several collapse into a submenu.
+fn append_other_holders(menu: &Menu, holders: &[HolderProcess]) {
+    let line = |holder: &HolderProcess| {
+        if holder.name.is_empty() {
+            format!("pid {}", holder.pid)
+        } else {
+            format!("{} (pid {})", holder.name, holder.pid)
+        }
+    };
+    match holders {
+        [] => {}
+        [one] => {
+            menu.append(&MenuItem::new(
+                format!("Also keeping the Mac awake: {}", line(one)),
+                false,
+                None,
+            ))
+            .expect("append other holder");
+        }
+        many => {
+            let submenu = Submenu::new(
+                format!("Also keeping the Mac awake: {} processes", many.len()),
+                true,
+            );
+            for holder in many {
+                submenu
+                    .append(&MenuItem::new(line(holder), false, None))
+                    .expect("append other holder");
+            }
+            menu.append(&submenu).expect("append other holders submenu");
         }
     }
 }

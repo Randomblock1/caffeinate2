@@ -1,3 +1,4 @@
+use crate::entirely::helper_ipc::{HelperClient, HolderProcess};
 use crate::sleep::sleep_mode::SleepMode;
 use crate::tray::error::TrayError;
 use crate::tray::menu::{
@@ -21,6 +22,38 @@ use tray_icon::{TrayIconBuilder, TrayIconEvent};
 /// Longest the main event pump will block when otherwise idle, so an
 /// off-main-thread shutdown signal is noticed promptly (see the pump call site).
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often to ask the helper who holds Entirely mode, for the menu's
+/// "Also keeping the Mac awake" entries. A hold changes nothing a user notices
+/// until the lid closes, so a slow cadence is enough to make it visible.
+const HOLDER_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Poll the helper's holder list off the main thread (each poll is a socket
+/// RPC), sending it only when it changes and waking the run loop to apply it.
+/// An unreachable helper or failed query reads as no holders. Ends when the
+/// receiver is gone; otherwise it dies with the process.
+fn spawn_holder_poller() -> mpsc::Receiver<Vec<HolderProcess>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let client = HelperClient::new();
+        let mut last: Option<Vec<HolderProcess>> = None;
+        loop {
+            let holders = client
+                .status()
+                .map(|status| status.processes)
+                .unwrap_or_default();
+            if last.as_ref() != Some(&holders) {
+                if tx.send(holders.clone()).is_err() {
+                    return;
+                }
+                crate::tray::macos_activation::wake_event_loop();
+                last = Some(holders);
+            }
+            thread::sleep(HOLDER_POLL_INTERVAL);
+        }
+    });
+    rx
+}
 
 /// Set by the signal thread when SIGINT/SIGTERM arrives. A flag rather than a
 /// channel because more than the run loop has to see it: a modal dialog runs
@@ -156,7 +189,7 @@ pub fn run() -> Result<(), TrayError> {
     // silently misses fixes until the older side (helper or this binary) is
     // updated. Off the main thread: it is a socket RPC.
     thread::spawn(|| {
-        use crate::entirely::helper_ipc::{HelperClient, HelperStatus};
+        use crate::entirely::helper_ipc::HelperStatus;
         let client = HelperClient::new();
         if client.is_available()
             && let Ok(status) = client.status()
@@ -209,6 +242,7 @@ pub fn run() -> Result<(), TrayError> {
     crate::tray::macos_activation::wake_event_loop();
 
     let mut handles = initial_handles;
+    let holder_updates = spawn_holder_poller();
 
     'main: loop {
         if shutdown_requested() {
@@ -313,8 +347,13 @@ pub fn run() -> Result<(), TrayError> {
             window.refresh();
         }
 
+        while let Ok(holders) = holder_updates.try_recv() {
+            state.set_helper_holders(holders);
+        }
+
         // The watcher changes the menu's structure (the "Upgrading…" entries)
-        // outside of any user action, so rebuild when it flags a change.
+        // outside of any user action, and so does the holder poller; rebuild
+        // when either flags a change.
         if state.take_menu_dirty() {
             handles = install_menu(&tray, &state.menu_snapshot());
         }

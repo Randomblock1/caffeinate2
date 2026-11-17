@@ -10,11 +10,25 @@ use std::path::Path;
 
 pub(crate) const LOCK_FILE_MODE: u32 = 0o600;
 
-/// Cap the lockfile we'll read into memory. Entries are tiny (a pid plus a
-/// start time), so even thousands of live holders stay well under this; a file
-/// larger than this is corrupt or hostile, so we refuse it rather than reading
-/// it unbounded into a String.
-const MAX_LOCKFILE_BYTES: u64 = 64 * 1024;
+/// Cap the lockfile we'll read into memory; a larger file is corrupt or
+/// hostile, so we refuse it rather than reading it unbounded into a String.
+///
+/// Writes can never get near it: [`MAX_HOLDERS`] bounds a snapshot to about
+/// 40 KiB, and [`write_state`] refuses anything over this cap. The headroom
+/// above that exists for recovery: helpers before the holder cap enforced a
+/// 64 KiB read limit but wrote without one, so a holder flood could leave a
+/// file just over 64 KiB that every later operation refused to read, stranding
+/// sleep disabled for good. Such a file is under this cap, so it reads, its
+/// dead holders prune, and the ownership marker drives the re-enable.
+const MAX_LOCKFILE_BYTES: u64 = 128 * 1024;
+
+/// Most distinct holder processes the lockfile records. An authorized client
+/// could otherwise spawn processes that each take a hold until the snapshot
+/// outgrew [`MAX_LOCKFILE_BYTES`]. A holder line is at most 39 bytes (`i32`
+/// pid, `u64` seconds, six-digit microseconds, two colons, newline), so
+/// 1024 of them plus the marker and generation lines stay under 40 KiB. Real
+/// use is a handful: one per running CLI or tray session.
+pub(crate) const MAX_HOLDERS: usize = 1024;
 
 /// Sentinel line recording that caffeinate2 owns the current sleep disable —
 /// i.e. it called `pmset disablesleep`/IOKit to disable sleep and has not yet
@@ -200,6 +214,16 @@ fn write_state(file: &mut Flock<File>, state: &LockfileState) -> Result<(), std:
     for p in &state.holders {
         content.push_str(&format!("{p}\n"));
     }
+    // Never write a snapshot that read_state would refuse: every later
+    // operation would fail on it, wedging sleep in whatever state it is in.
+    // MAX_HOLDERS keeps real snapshots far below this, so tripping it means
+    // the cap was bypassed; failing this one write is the safe outcome.
+    if content.len() as u64 > MAX_LOCKFILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "lockfile snapshot is {} bytes, exceeding the {MAX_LOCKFILE_BYTES}-byte limit; refusing to write",
+            content.len()
+        )));
+    }
     // In-place overwrite: the flock is pinned to this inode (see
     // open_validated_lockfile), so the atomic temp-file+rename idiom is not
     // available. A shrinking snapshot is instead padded with blank lines —
@@ -303,6 +327,10 @@ pub(crate) struct AcquireOutcome {
 
 /// Register `current_proc` as a holder.
 ///
+/// Refuses a *new* holder once [`MAX_HOLDERS`] live ones are recorded (dead
+/// entries are pruned first, so only live processes count); re-asserting an
+/// existing entry always succeeds. A refusal writes nothing.
+///
 /// When it is the first holder, the ownership marker is set in the *same* write
 /// that adds the holder — before the caller toggles sleep — so a crash between
 /// this write and the actual disable still leaves durable evidence to reconcile
@@ -323,6 +351,11 @@ pub(crate) fn acquire(
         process_checker,
         Some(current_proc),
         |state| {
+            if !state.holders.contains(current_proc) && state.holders.len() >= MAX_HOLDERS {
+                return Err(std::io::Error::other(format!(
+                    "too many entirely-mode holders ({MAX_HOLDERS} live processes); refusing a new hold"
+                )));
+            }
             let first_holder = state.holders.is_empty();
             let prior_owns_disable = state.owns_disable;
             let newly_inserted = state.holders.insert(*current_proc);
@@ -472,6 +505,8 @@ pub(crate) fn clear_owns_disable_if_current(
 pub(crate) struct PruneOutcome {
     /// Live holders remaining after pruning dead/malformed entries.
     pub live: usize,
+    /// Those live holders, sorted by pid, for status reporting.
+    pub holders: Vec<ProcessId>,
     /// Whether caffeinate2 owns the current sleep disable (the durable marker).
     pub owns_disable: bool,
     /// Ownership generation observed by this prune; a re-enable decided from
@@ -495,11 +530,14 @@ pub(crate) fn prune_lockfile(
     let mut state = read_state(&mut file)?;
     prune_stale_holders(&mut state.holders, verbose, process_checker, None);
     let live = state.holders.len();
+    let mut holders: Vec<ProcessId> = state.holders.iter().copied().collect();
+    holders.sort_by_key(|holder| holder.pid);
     let owns_disable = state.owns_disable;
     let disable_generation = state.disable_generation;
     write_state(&mut file, &state)?;
     Ok(PruneOutcome {
         live,
+        holders,
         owns_disable,
         disable_generation,
     })
@@ -768,6 +806,77 @@ mod tests {
         assert!(result.is_err());
         let message = result.unwrap_err().to_string();
         assert!(message.contains("exceeding"), "{message}");
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn holder_cap_refuses_new_holders_but_not_existing_ones() {
+        let lock_path = temp_lock_path();
+        let process_checker = |_pid: i32, _start_time: ProcessStartTime| true;
+        // The longest possible holder line, so this also proves the cap keeps
+        // the file inside the read limit.
+        let holder = |pid: i32| ProcessId {
+            pid: i32::MAX - pid,
+            start_time: ProcessStartTime {
+                seconds: u64::MAX,
+                microseconds: 999_999,
+            },
+        };
+        for pid in 0..i32::try_from(MAX_HOLDERS).unwrap() {
+            acquire(false, &lock_path, &process_checker, &holder(pid)).unwrap();
+        }
+
+        let over = i32::try_from(MAX_HOLDERS).unwrap();
+        let message = acquire(false, &lock_path, &process_checker, &holder(over))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("too many"), "{message}");
+        // A refused acquire writes nothing.
+        assert_eq!(read_entries(&lock_path).len(), MAX_HOLDERS);
+        // An existing holder can still re-assert.
+        let outcome = acquire(false, &lock_path, &process_checker, &holder(0)).unwrap();
+        assert!(!outcome.newly_inserted);
+        assert!(std::fs::metadata(&lock_path).unwrap().len() <= MAX_LOCKFILE_BYTES / 2);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn holder_cap_counts_only_live_holders() {
+        let lock_path = temp_lock_path();
+        let all_alive = |_pid: i32, _start_time: ProcessStartTime| true;
+        for pid in 1..=i32::try_from(MAX_HOLDERS).unwrap() {
+            acquire(false, &lock_path, &all_alive, &proc(pid, 1)).unwrap();
+        }
+        // Once the flood exits, a new holder gets in again.
+        let all_dead = |_pid: i32, _start_time: ProcessStartTime| false;
+        acquire(false, &lock_path, &all_dead, &proc(99_999, 1)).unwrap();
+        assert_eq!(read_entries(&lock_path), vec![proc(99_999, 1)]);
+
+        std::fs::remove_file(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn file_left_oversized_by_an_uncapped_helper_recovers() {
+        // An older helper capped reads at 64 KiB but not writes, so a holder
+        // flood left a file just past 64 KiB that it could never read again.
+        let lock_path = temp_lock_path();
+        let mut content = format!("{DISABLE_MARKER}\n{GENERATION_PREFIX}1\n");
+        let mut pid = 10_000;
+        while content.len() <= 64 * 1024 {
+            content.push_str(&format!("{}\n", proc(pid, 1_763_412_345)));
+            pid += 1;
+        }
+        std::fs::write(&lock_path, &content).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Every flood process has exited: the prune empties the holder set and
+        // the marker still records that sleep needs re-enabling.
+        let all_dead = |_pid: i32, _start_time: ProcessStartTime| false;
+        let outcome = prune_lockfile(false, &lock_path, &all_dead).unwrap();
+        assert_eq!(outcome.live, 0);
+        assert!(outcome.owns_disable);
 
         std::fs::remove_file(&lock_path).unwrap();
     }

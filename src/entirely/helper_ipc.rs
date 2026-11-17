@@ -23,6 +23,14 @@ const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
 /// Each request is a short RPC on its own connection, so holds survive helper
 /// restarts: the lockfile is the source of truth and the helper reaps holders
 /// whose processes have died.
+///
+/// The peer pid is a liveness key, not an identity. On macOS `LOCAL_PEERPID`
+/// reports the process that last *wrote* to the connection, so a client can
+/// hand its socket to another process (fork, fd passing) and have that one
+/// finish the request. An authorized client can therefore pin a hold to, or
+/// release the hold of, any process it can get to write on its socket, and
+/// status names are best-effort. Authorization does not depend on the pid: it
+/// uses `LOCAL_PEERCRED`, whose uid is fixed when the connection is made.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum HelperRequest {
@@ -43,10 +51,24 @@ pub enum HelperResponse {
         /// shipped reports one, so a response without it is malformed, not a
         /// compatibility case.
         version: String,
+        /// The live holder processes. Defaulted because helpers that predate
+        /// the list report only the count; older clients ignore the field.
+        #[serde(default)]
+        processes: Vec<HolderProcess>,
     },
     Error {
         message: String,
     },
+}
+
+/// One live entirely-mode holder, as reported by `Status`. The pid is the
+/// connection's last writer (see [`HelperRequest`]), so treat it and the name
+/// as best-effort, not proof of who asked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HolderProcess {
+    pub pid: i32,
+    /// The process name, or empty when the helper could not read it.
+    pub name: String,
 }
 
 /// Decoded `Status` response.
@@ -56,6 +78,8 @@ pub struct HelperStatus {
     pub sleep_disabled: bool,
     /// The helper daemon's crate version.
     pub version: String,
+    /// The live holder processes; empty from a helper too old to report them.
+    pub processes: Vec<HolderProcess>,
 }
 
 impl HelperStatus {
@@ -154,10 +178,12 @@ impl HelperResponse {
                 holders,
                 sleep_disabled,
                 version,
+                processes,
             } => Ok(HelperStatus {
                 holders,
                 sleep_disabled,
                 version,
+                processes,
             }),
             other => Err(HelperIpcError::new(format!(
                 "unexpected response for status: {other:?}"
@@ -670,10 +696,12 @@ fn serve_connection_inner(
     };
 
     // Hold is the privileged operation (it can set the system-wide
-    // SleepDisabled setting) and is gated on the peer's identity. Release
-    // stays open: it only acts on the peer's own process identity, so a
-    // client can never release another process's hold, and gating it would
-    // strand the holds of users whose grant was later revoked. Status is
+    // SleepDisabled setting) and is gated on the peer's uid. Release stays
+    // open: it acts on the peer pid's entry, and gating it would strand the
+    // holds of users whose grant was later revoked. That pid is the
+    // connection's last writer, not a verified identity (see HelperRequest),
+    // so a client can release a hold of any process it gets to write on its
+    // socket; ending a sleep hold early is the most that buys. Status is
     // read-only and open to everyone.
     //
     // Set when the coordinator commits a Hold. The always-on audit entry for a
@@ -751,6 +779,14 @@ fn serve_connection_inner(
                 holders: status.holders,
                 sleep_disabled: status.sleep_disabled,
                 version: HelperStatus::BINARY_VERSION.to_string(),
+                processes: status
+                    .holder_ids
+                    .iter()
+                    .map(|id| HolderProcess {
+                        pid: id.pid,
+                        name: libproc::proc_pid::name(id.pid).unwrap_or_default(),
+                    })
+                    .collect(),
             },
             Err(e) => HelperResponse::Error {
                 message: e.to_string(),
@@ -884,6 +920,15 @@ mod tests {
         let mut guard = HelperHoldGuard::try_acquire(&client).unwrap();
         let status = client.status().unwrap();
         assert_eq!((status.holders, status.sleep_disabled), (1, true));
+        // The holder is this test process, reported with its name.
+        assert_eq!(
+            status.processes,
+            vec![HolderProcess {
+                pid: std::process::id().cast_signed(),
+                name: libproc::proc_pid::name(std::process::id().cast_signed()).unwrap(),
+            }]
+        );
+        assert!(!status.processes[0].name.is_empty());
         guard.release().unwrap();
         server.join().unwrap();
 
@@ -1263,9 +1308,32 @@ mod tests {
             holders: 2,
             sleep_disabled: true,
             version: HelperStatus::BINARY_VERSION.to_string(),
+            processes: vec![
+                HolderProcess {
+                    pid: 41,
+                    name: "caffeinate2".to_string(),
+                },
+                HolderProcess {
+                    pid: 42,
+                    name: String::new(),
+                },
+            ],
         };
         let decoded = decode::<HelperResponse>(&try_encode(&resp).unwrap()).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    /// Helpers before the holder list report only the count; their Status
+    /// still decodes, with an empty list.
+    #[test]
+    fn status_without_processes_decodes_as_empty() {
+        let old = r#"{"kind":"status","holders":1,"sleep_disabled":true,"version":"0.9.0"}"#;
+        let status = decode::<HelperResponse>(old)
+            .unwrap()
+            .into_status()
+            .unwrap();
+        assert_eq!(status.holders, 1);
+        assert!(status.processes.is_empty());
     }
 
     /// Every helper that ever shipped reports its version, so a Status
@@ -1285,6 +1353,7 @@ mod tests {
             holders: 0,
             sleep_disabled: false,
             version: version.to_string(),
+            processes: Vec::new(),
         };
 
         assert!(status("999.0.0").helper_is_newer());
@@ -1307,6 +1376,7 @@ mod tests {
             holders: 3,
             sleep_disabled: false,
             version: "0.9.0".to_string(),
+            processes: Vec::new(),
         };
         assert_eq!(
             resp.into_status().unwrap(),
@@ -1314,6 +1384,7 @@ mod tests {
                 holders: 3,
                 sleep_disabled: false,
                 version: "0.9.0".to_string(),
+                processes: Vec::new(),
             }
         );
     }

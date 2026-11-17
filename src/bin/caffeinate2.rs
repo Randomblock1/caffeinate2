@@ -530,13 +530,16 @@ fn run_timed_wait_mode(
 #[cfg(target_os = "macos")]
 fn run_maintenance(command: MaintenanceCommand) {
     match command {
-        MaintenanceCommand::InstallHelper => {
-            if let Err(e) = install::install_helper_privileged() {
+        MaintenanceCommand::InstallHelper => match install::install_helper_privileged() {
+            Ok(install::InstallOutcome::Installed) => println!("Installed caffeinate2 helper."),
+            Ok(install::InstallOutcome::AlreadyCurrent) => {
+                println!("caffeinate2 helper is already installed and up to date; nothing to do.");
+            }
+            Err(e) => {
                 eprintln!("Error: {e}");
                 process::exit(1);
             }
-            println!("Installed caffeinate2 helper.");
-        }
+        },
         MaintenanceCommand::UninstallHelper => {
             if !nix::unistd::Uid::effective().is_root() {
                 eprintln!("Error: --uninstall-helper must run as root (try sudo).");
@@ -554,6 +557,15 @@ fn run_maintenance(command: MaintenanceCommand) {
                 Ok(status) => {
                     println!("Helper: running");
                     println!("Entirely-mode holders: {}", status.holders);
+                    // Empty from a helper too old to report them.
+                    for process in &status.processes {
+                        let name = if process.name.is_empty() {
+                            "(name unavailable)"
+                        } else {
+                            process.name.as_str()
+                        };
+                        println!("  pid {:<7} {name}", process.pid);
+                    }
                     println!(
                         "System sleep disabled by helper: {}",
                         if status.sleep_disabled { "yes" } else { "no" }

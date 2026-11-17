@@ -1,5 +1,5 @@
 use crate::entirely::error::InstallError;
-use crate::entirely::helper_ipc::HelperClient;
+use crate::entirely::helper_ipc::{HelperClient, HolderProcess};
 use crate::entirely::install;
 use crate::sleep::power_management::{self, AssertionType, ExternalAssertion};
 use crate::sleep::sleep_mode::{self, ActiveSleepHold, EnableError, SleepMode};
@@ -221,6 +221,10 @@ pub struct MenuSnapshot {
     /// currently holding an assertion. Drives the editable **Ignored apps**
     /// submenu (each entry removes itself when clicked).
     pub ignored_apps: Vec<String>,
+    /// Entirely-mode holders other than this tray (CLI sessions, other
+    /// programs), as the helper reports them. Drives the informational
+    /// "Also keeping the Mac awake" entries.
+    pub other_holders: Vec<HolderProcess>,
 }
 
 #[allow(clippy::struct_excessive_bools)] // session/watch flags are independent toggles
@@ -294,6 +298,10 @@ pub struct AppState {
     /// because another holder is left) would otherwise be untestable.
     scan_assertions: fn(&[AssertionType]) -> Result<Vec<ExternalAssertion>, u32>,
     is_system_pid: fn(i32) -> bool,
+    /// Entirely-mode holders other than this tray, from the helper's latest
+    /// Status (see [`Self::set_helper_holders`]). Shown in the menu so a hold
+    /// some other process took is visible rather than silent.
+    other_holders: Vec<HolderProcess>,
 }
 
 impl AppState {
@@ -319,6 +327,22 @@ impl AppState {
             app_watch_running: None,
             scan_assertions: power_management::external_assertions,
             is_system_pid: process_enum::is_system_pid,
+            other_holders: Vec::new(),
+        }
+    }
+
+    /// Record the holders the helper last reported, dropping this tray's own
+    /// entry, and flag a menu rebuild when the set changed. An unreachable
+    /// helper reports as empty: with no helper, nothing holds Entirely mode.
+    pub fn set_helper_holders(&mut self, holders: Vec<HolderProcess>) {
+        let own_pid = std::process::id().cast_signed();
+        let others: Vec<HolderProcess> = holders
+            .into_iter()
+            .filter(|holder| holder.pid != own_pid)
+            .collect();
+        if others != self.other_holders {
+            self.other_holders = others;
+            self.menu_dirty = true;
         }
     }
 
@@ -352,6 +376,7 @@ impl AppState {
             } else {
                 Vec::new()
             },
+            other_holders: self.other_holders.clone(),
         }
     }
 
@@ -1102,7 +1127,8 @@ impl AppState {
     fn spawn_pending_install(&mut self) {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = install::install_helper_privileged();
+            // Either outcome leaves a current helper running.
+            let result = install::install_helper_privileged().map(|_| ());
             let _ = tx.send(result);
             crate::tray::macos_activation::wake_event_loop();
         });
@@ -1562,7 +1588,39 @@ mod tests {
             // `SYSTEM_PID` (see `system_assertion`).
             scan_assertions: |_| Ok(Vec::new()),
             is_system_pid: |pid| pid == SYSTEM_PID,
+            other_holders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn helper_holders_drop_own_entry_and_flag_menu_only_on_change() {
+        let mut state = bare_state();
+        let holder = |pid: i32, name: &str| HolderProcess {
+            pid,
+            name: name.to_string(),
+        };
+        let own = holder(std::process::id().cast_signed(), "caffeinate2-tray");
+
+        // Only this tray holds: nothing to show, nothing to rebuild.
+        state.set_helper_holders(vec![own.clone()]);
+        assert!(!state.take_menu_dirty());
+        assert!(state.menu_snapshot().other_holders.is_empty());
+
+        state.set_helper_holders(vec![own.clone(), holder(4242, "caffeinate2")]);
+        assert!(state.take_menu_dirty());
+        assert_eq!(
+            state.menu_snapshot().other_holders,
+            vec![holder(4242, "caffeinate2")]
+        );
+
+        // The same report again changes nothing.
+        state.set_helper_holders(vec![own, holder(4242, "caffeinate2")]);
+        assert!(!state.take_menu_dirty());
+
+        // The helper went away or the holder exited.
+        state.set_helper_holders(Vec::new());
+        assert!(state.take_menu_dirty());
+        assert!(state.menu_snapshot().other_holders.is_empty());
     }
 
     /// Pin the assertions the watcher will "see" for the rest of the test. A

@@ -14,6 +14,15 @@ Almost ready for 1.0.0.
 
 Download the latest release binary from [the releases page](https://github.com/randomblock1/caffeinate2/releases/latest).
 
+Each release carries a SHA-256 checksum and a GitHub build attestation. Before installing, check that the tarball, and the helper you are about to run as root, were built by this repository's release workflow (needs the [GitHub CLI](https://cli.github.com)):
+
+```sh
+shasum -a 256 -c caffeinate2-VERSION.tar.gz.sha256
+gh attestation verify caffeinate2-VERSION.tar.gz --repo randomblock1/caffeinate2
+tar -xzf caffeinate2-VERSION.tar.gz
+gh attestation verify caffeinate2-helper --repo randomblock1/caffeinate2
+```
+
 ### Homebrew
 
 _This won't be available until version 1.0.0._
@@ -22,11 +31,13 @@ _This won't be available until version 1.0.0._
 
 CLI only (default):
 
-`cargo install caffeinate2`
+`cargo install --locked caffeinate2`
 
 Menu bar + privileged helper:
 
-`cargo install caffeinate2 --features full`
+`cargo install --locked caffeinate2 --features full`
+
+`--locked` builds the exact dependency versions the release was tested with.
 
 From a clone:
 
@@ -206,7 +217,7 @@ Entirely mode (`-e` / tray **Entirely**) disables system sleep even when the lid
 1. Tray: select **Entirely** and approve the administrator dialog when prompted, or
 2. CLI: `sudo caffeinate2 --install-helper`
 
-Helper install requires `caffeinate2-helper` next to `caffeinate2`: use `cargo install caffeinate2 --features full`, build with `--features full`, or extract the GitHub release bundle (all three binaries together).
+Helper install requires `caffeinate2-helper` next to `caffeinate2`: use `cargo install --locked caffeinate2 --features full`, build with `--features full`, or extract the GitHub release bundle (all three binaries together).
 
 After that, `caffeinate2 -e` and tray Entirely use the helper without further passwords.
 
@@ -219,11 +230,31 @@ The grant takes effect on the user's next attempt (no logout needed). Denied req
 Other helper commands:
 
 - Remove the helper: `sudo caffeinate2 --uninstall-helper` (refuses while entirely-mode sessions are still active)
-- Check helper state (running, how many holds, sleep disabled, version): `caffeinate2 --status`
+- Check helper state (running, which processes hold it, sleep disabled, version): `caffeinate2 --status`
 
-**After upgrading caffeinate2**, reinstall the helper: the installed daemon is a copied snapshot, so it keeps running the old version until you run `sudo caffeinate2 --install-helper` again. `caffeinate2 --status` shows when the installed helper's version differs from the binary (the tray also logs a warning at startup).
+**After upgrading caffeinate2**, reinstall the helper: the installed daemon is a copied snapshot, so it keeps running the old version until you run `sudo caffeinate2 --install-helper` again. When the helper on disk already matches the installed one, `--install-helper` says so and stops without asking for a password. `caffeinate2 --status` shows when the installed helper's version differs from the binary (the tray also logs a warning at startup).
+
+**Seeing who holds it:** any process running as an administrator can take an Entirely hold without a prompt. `caffeinate2 --status` lists each holder's pid and name, and the menu bar shows an **Also keeping the Mac awake** line for any holder other than itself. Names are best-effort: they identify the process that sent the request, which its sender can arrange.
 
 The helper logs to the unified system log (subsystem `com.randomblock1.caffeinate2.helper`); view it with Console.app or `log show --predicate 'subsystem == "com.randomblock1.caffeinate2.helper"'`.
+
+## Security
+
+caffeinate2 is a developer tool for single-user Macs where the user is an administrator. The privileged helper is the only part that runs as root, and it is built to do one thing: set or clear the system `SleepDisabled` setting on behalf of authorized callers.
+
+**What the design protects against:**
+
+- **Turning the helper into general root access.** It accepts three fixed requests (hold, release, status) carrying no data, and runs nothing it is sent. Its binary, plist and directories are root-owned, so no other account can replace them.
+- **Accounts that are not allowed.** Holds require root, an administrator, or the `caffeinate2` group, checked against the kernel-reported user ID of the caller.
+- **Sleep stuck off for good.** Holds are tied to live processes and reaped when they exit, ownership of the disable is recorded on disk so it survives crashes and reboots, and the number of holders is capped so the record can't be flooded.
+
+**What it does not protect against:**
+
+- **Malware already running as you, at install time.** `--install-helper` copies `caffeinate2-helper` from where you installed it (for example `~/.cargo/bin`), which your account can write to. Code running as you could replace that file before you approve the password prompt, and the replacement would become a root daemon. The installer checks that the file is a real Mach-O executable owned by you or root, not a symlink, but it cannot tell your build from a tampered one. The same code could equally fake a `sudo` prompt, so this is the same trust you give any tool you install with administrator rights. To narrow it: verify release downloads (see [GitHub Releases](#github-releases)), and reinstall the helper only when you have upgraded caffeinate2.
+- **Malware running as you, after install.** Any process running as an administrator can take a hold and keep the Mac awake, including with the lid closed. It cannot do more than that through the helper; `caffeinate2 --status` and the menu bar show who holds.
+- **Root, physical access, or a compromised kernel.**
+
+The binaries are ad-hoc signed, not signed with a paid Apple Developer ID, so macOS cannot vouch for them; the checksum and attestation on each release fill that gap for downloads.
 
 ## License
 

@@ -29,10 +29,12 @@ fn helper_lock_path() -> PathBuf {
 
 const CLI_FALLBACK_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntirelyStatus {
     pub holders: usize,
     pub sleep_disabled: bool,
+    /// The live holder processes, sorted by pid (`holders` of them).
+    pub holder_ids: Vec<ProcessId>,
 }
 
 /// Outcome of a committed [`EntirelyCoordinator::hold`], for callers that may
@@ -409,6 +411,7 @@ impl EntirelyCoordinator {
             live: holders,
             owns_disable,
             disable_generation,
+            ..
         } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
@@ -504,9 +507,9 @@ impl EntirelyCoordinator {
         let _ops = self.lock_ops();
         let lockfile::PruneOutcome {
             live: holders,
+            holders: holder_ids,
             owns_disable,
             disable_generation,
-            ..
         } = lockfile::prune_lockfile(
             inner.verbose,
             &inner.lock_file_path,
@@ -543,6 +546,7 @@ impl EntirelyCoordinator {
             // state; a transient external change can briefly make it stale until
             // the next reconcile.
             sleep_disabled: holders > 0 || owns_disable,
+            holder_ids,
         })
     }
 
