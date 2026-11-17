@@ -864,6 +864,64 @@ mod tests {
         let _ = std::fs::remove_file(&lock_path);
     }
 
+    /// Pins the real-code half of the cross-process fix modeled in
+    /// `tests/protocol_model.rs` (`MarkerWrite::Guarded`): in the CLI fallback
+    /// another process can release the last holder and clear the ownership
+    /// marker between reconcile's prune and its disable toggle. Reconcile must
+    /// then re-record ownership, or the disable it just applied is owned by
+    /// nobody and strands sleep off once the holders drain. The model can't
+    /// catch this regressing in the code, since it doesn't run the code.
+    #[test]
+    fn reconcile_rerecords_ownership_cleared_during_its_disable() {
+        let lock_path = temp_lock_path();
+        let _ = std::fs::remove_file(&lock_path);
+        let process_checker: Arc<ProcessChecker> = Arc::new(process_util::default_process_checker);
+        let holder =
+            process_util::process_id_from_pid(std::process::id() as i32).expect("own process id");
+        lockfile::acquire(false, &lock_path, process_checker.as_ref(), &holder).unwrap();
+        assert!(owns_disable(&lock_path));
+
+        // The disable toggle stands in for the window after the prune: a
+        // concurrent process releases the holder and validly clears the marker.
+        let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sleep_disabler: SleepDisabler = {
+            let lock_path = lock_path.clone();
+            let process_checker = process_checker.clone();
+            let raced = raced.clone();
+            Arc::new(move |state, _verbose| {
+                if state && !raced.swap(true, Ordering::SeqCst) {
+                    let outcome =
+                        lockfile::release(false, &lock_path, process_checker.as_ref(), &holder)
+                            .unwrap();
+                    lockfile::clear_owns_disable_if_current(
+                        false,
+                        &lock_path,
+                        process_checker.as_ref(),
+                        outcome.disable_generation,
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+        };
+        let coordinator = EntirelyCoordinator::with_options(
+            false,
+            lock_path.clone(),
+            sleep_disabler,
+            process_checker,
+        );
+
+        coordinator.reconcile().unwrap();
+        assert!(raced.load(Ordering::SeqCst), "the race never ran");
+        assert!(holder_lines(&lock_path).is_empty());
+        assert!(
+            owns_disable(&lock_path),
+            "reconcile applied a disable but left it owned by nobody"
+        );
+
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
     /// A dead client's epoch entry must be pruned by a reconcile pass, so the
     /// in-memory map cannot grow without bound over a long-lived daemon.
     #[test]
